@@ -65,7 +65,10 @@ def test_brand_accents_are_green_not_turquoise(name: str) -> None:
   rgb = foreground.get_truecolor()
   assert rgb.green > rgb.red
   assert rgb.green - rgb.blue >= 25
-  assert palette.styles['ui.selected'].bgcolor == color.Color.parse('#1e3207')
+  selected = palette.styles['ui.selected'].bgcolor
+  assert selected is not None
+  surface = selected.get_truecolor()
+  assert surface.green > max(surface.red, surface.blue)
 
 
 @pytest.mark.parametrize(
@@ -189,7 +192,7 @@ def test_information_is_blue_not_another_brand_green(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-  ('name', 'background'), [('dark', '282828'), ('light', 'eeeeee')]
+  ('name', 'background'), [('dark', '282828'), ('light', 'e8e8e8')]
 )
 def test_composer_and_user_message_have_the_same_background(
   name: str, background: str
@@ -593,9 +596,16 @@ def test_unavailable_theme_keeps_saved_preference() -> None:
   }) == themes.effective('dark')
 
 
+def test_startup_preference_keeps_custom_theme_before_extensions_load() -> None:
+  settings = {
+    'extensions': {'builtin/themes': {'config': {'name': 'custom:light'}}}
+  }
+  assert themes.preference(settings) == 'custom:light'
+
+
 def test_unknown_theme_falls_back_without_changing_settings() -> None:
   settings = {'name': 'not-a-theme', 'extra': True}
-  assert themes.configured(settings) == 'dark'
+  assert themes.configured(settings) == themes.AUTO
   assert settings == {'name': 'not-a-theme', 'extra': True}
 
 

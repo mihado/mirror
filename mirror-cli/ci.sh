@@ -145,8 +145,24 @@ if (($#)); then
 else
   test_paths=(src tests extensions)
 fi
-# Tests bypass the launcher; keep its gRPC fork handlers disabled here too.
-# Report the stuck test and its stacks before the enclosing CI job times out.
-env -u OPENROUTER_API_KEY PYTHONDONTWRITEBYTECODE=1 GRPC_ENABLE_FORK_SUPPORT=0 \
-  "$VENV_DIR/bin/pytest" -v -p no:cacheprovider \
-  -o faulthandler_timeout=120 -o faulthandler_exit_on_timeout=true "${test_paths[@]}"
+collected=0
+run_pytest() {
+  local status=0
+  # Tests bypass the launcher; keep its gRPC fork handlers disabled here too.
+  # Report the stuck test and its stacks before the enclosing CI job times out.
+  env -u OPENROUTER_API_KEY PYTHONDONTWRITEBYTECODE=1 GRPC_ENABLE_FORK_SUPPORT=0 \
+    "$VENV_DIR/bin/pytest" -v -p no:cacheprovider "$@" \
+    -o faulthandler_timeout=120 -o faulthandler_exit_on_timeout=true "${test_paths[@]}" || status=$?
+  # Exit 5 means the pass's marker selected none of the given tests.
+  ((status == 5)) && return
+  ((status == 0)) || exit "$status"
+  collected=1
+}
+# Spread the tests over one pytest-xdist worker per CPU, then run alone the
+# tests whose timing bounds miss under that contention.
+run_pytest -n auto -m 'not no_xdist'
+run_pytest -m no_xdist
+if ((!collected)); then
+  echo 'error: no tests collected' >&2
+  exit 5
+fi

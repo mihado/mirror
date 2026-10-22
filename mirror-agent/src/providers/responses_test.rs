@@ -14,6 +14,7 @@ fn provider() -> ResponsesClient {
             api_key: "test-key".to_string(),
             base_url: "http://test/v1".to_string(),
             prompt_cache_key: Some("session-1".to_string()),
+            websocket: None,
         },
         super::super::http_client(None).expect("test HTTP client configuration is valid"),
     )
@@ -257,6 +258,107 @@ fn assistant_replay_preserves_provider_items() {
                 "arguments": "{\"cmd\":\"ls\"}",
             }),
         ]
+    );
+}
+
+#[test]
+fn assistant_replay_keeps_interleaved_item_order() {
+    let output = vec![
+        json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "first"}),
+        json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "ls", "arguments": "{}"}),
+        json!({"type": "reasoning", "id": "rs_2", "encrypted_content": "second"}),
+        json!({"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "pwd", "arguments": "{}"}),
+    ];
+    let message = build_assistant_message(output.clone()).expect("valid output builds a message");
+
+    let items = serialize_assistant(&message, 1).expect("assistant message serializes");
+
+    assert_eq!(items, output);
+}
+
+#[tokio::test]
+async fn stream_uses_the_websocket_when_one_is_configured() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("connection");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("upgrade");
+        let request = socket.next().await.expect("request").expect("frame");
+        let events = [
+            json!({"type": "response.output_text.delta", "delta": "Hi"}),
+            json!({"type": "response.completed", "response": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "content": [{"type": "output_text", "text": "Hi"}],
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            }}),
+        ];
+        for event in events {
+            socket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .expect("send");
+        }
+        request
+    });
+    let client = super::super::http_client(None).expect("test HTTP client configuration is valid");
+    let provider = ResponsesClient::new(
+        ResponsesConfig {
+            model: "gpt-test".to_string(),
+            api_key: "test-key".to_string(),
+            base_url: format!("http://{address}/v1"),
+            prompt_cache_key: None,
+            websocket: Some(ResponsesWebSocket::spawn(client.clone(), None)),
+        },
+        client,
+    );
+
+    let events = provider
+        .stream(CompletionRequest {
+            messages: vec![chat_record::Message::User(UserMessage {
+                checkpoint: None,
+                content: "hello".to_string(),
+            })],
+            tools: Vec::new(),
+            max_tokens: None,
+            inference: None,
+        })
+        .collect::<Vec<_>>()
+        .await;
+    let request = server.await.expect("server");
+
+    assert_matches!(request, Message::Text(text) if text.as_str().contains("\"type\":\"response.create\""));
+    assert_matches!(
+        events.as_slice(),
+        [
+            Ok(StreamEvent::Content(content)),
+            Ok(StreamEvent::OutputTokens(1)),
+            Ok(StreamEvent::Final(completion)),
+        ] if content.content == "Hi" && completion.message.content.as_deref() == Some("Hi")
+    );
+    let completion = match events.last() {
+        Some(Ok(StreamEvent::Final(completion))) => completion,
+        other => panic!("expected a final completion, got {other:?}"),
+    };
+    assert_eq!(
+        completion
+            .message
+            .provider_fields
+            .as_ref()
+            .and_then(|fields| fields.fields.get("transport"))
+            .map(prost_to_json),
+        Some(json!({"kind": "websocket", "incremental": false, "reason": "new_connection"}))
     );
 }
 

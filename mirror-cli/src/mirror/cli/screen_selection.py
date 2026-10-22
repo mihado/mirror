@@ -10,11 +10,11 @@ from typing import override
 from prompt_toolkit import data_structures, mouse_events
 from prompt_toolkit.application import current
 from prompt_toolkit.key_binding import key_bindings
-from prompt_toolkit.layout import containers, controls, layout
+from prompt_toolkit.layout import containers, controls
 from prompt_toolkit.layout import mouse_handlers as _mouse_handlers
 from prompt_toolkit.layout import screen as _screen
 
-from mirror.cli import terminal
+from mirror.cli import row_renderer, terminal
 
 
 def _cell_changed(
@@ -47,6 +47,11 @@ class HoverControl(controls.UIControl):
 class ScreenSelection(containers.DynamicContainer):
   """Select displayed cells while retaining stationary clicks and wheel handlers."""
 
+  scroll_handler: (
+    Callable[[mouse_events.MouseEvent], key_bindings.NotImplementedOrNone]
+    | None
+  ) = None
+
   def __init__(
     self, content: containers.Container, copy: Callable[[str], None]
   ) -> None:
@@ -62,6 +67,7 @@ class ScreenSelection(containers.DynamicContainer):
     self._end: data_structures.Point | None = None
     self._mouse_position: data_structures.Point | None = None
     self._pointer = False
+    self._hover_controls: tuple[HoverControl, ...] = ()
 
   def _update_pointer(self) -> None:
     position = self._mouse_position
@@ -79,11 +85,8 @@ class ScreenSelection(containers.DynamicContainer):
         output.flush()
 
   def _clear_hover(self) -> None:
-    for container in layout.walk(self):
-      if isinstance(container, containers.Window) and isinstance(
-        container.content, HoverControl
-      ):
-        container.content.clear_hover()
+    for control in self._hover_controls:
+      control.clear_hover()
 
   def clear(self, *, keep_hover: bool = False) -> None:
     """End selection without changing the terminal clipboard."""
@@ -111,7 +114,7 @@ class ScreenSelection(containers.DynamicContainer):
     erase_bg: bool,
     z_index: int | None,
   ) -> None:
-    child_handlers = _mouse_handlers.MouseHandlers()
+    child_handlers = row_renderer.MouseHandlers()
     super().write_to_screen(
       screen, child_handlers, write_position, parent_style, erase_bg, z_index
     )
@@ -142,6 +145,15 @@ class ScreenSelection(containers.DynamicContainer):
     self._position = position
     self._screen = target
     self._handlers = child_handlers
+    hover_controls = tuple(
+      window.content
+      for window in target.visible_windows
+      if isinstance(window.content, HoverControl)
+    )
+    for control in self._hover_controls:
+      if control not in hover_controls:
+        control.clear_hover()
+    self._hover_controls = hover_controls
     snapshot = self._snapshot
     if snapshot is not None:
       # Styles also identify click targets whose labels can remain unchanged.
@@ -168,6 +180,21 @@ class ScreenSelection(containers.DynamicContainer):
       position.ypos + position.height,
       self.mouse_handler,
     )
+
+  def _capture(self) -> _screen.Screen | None:
+    # Freeze the clicked area before later stream updates move the content.
+    # The renderer can then reuse its buffers without changing selected text.
+    if self._screen is None:
+      return None
+    snapshot = _screen.Screen()
+    position = self._position
+    for y in range(position.ypos, position.ypos + position.height):
+      snapshot.data_buffer[y].update({
+        x: cell
+        for x, cell in self._screen.data_buffer[y].items()
+        if position.xpos <= x < position.xpos + position.width
+      })
+    return snapshot
 
   def _cells(self) -> Iterator[tuple[int, int]]:
     if self._start is None or self._end is None:
@@ -204,6 +231,14 @@ class ScreenSelection(containers.DynamicContainer):
     self, event: mouse_events.MouseEvent
   ) -> key_bindings.NotImplementedOrNone:
     """Defer a left click until release; a moved gesture selects instead."""
+    if self.scroll_handler is not None and event.event_type in (
+      mouse_events.MouseEventType.SCROLL_UP,
+      mouse_events.MouseEventType.SCROLL_DOWN,
+    ):
+      self.clear()
+      if self.scroll_handler(event) is not NotImplemented:
+        # The scroll handler scheduled its damage; suppress the binding's redraw.
+        return NotImplemented
     self._mouse_position = event.position
     if (
       event.modifiers
@@ -224,7 +259,7 @@ class ScreenSelection(containers.DynamicContainer):
       )
     if event.event_type == mouse_events.MouseEventType.MOUSE_DOWN:
       self.clear(keep_hover=True)
-      self._snapshot = self._screen
+      self._snapshot = self._capture()
       self._pressed = event
       self._start = self._end = self._point(event.position)
     elif self._pressed is not None:

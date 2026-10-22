@@ -217,6 +217,8 @@ async fn publishes_committed_entries_and_keeps_ephemeral_events_out_of_history()
     assert_eq!(committed, context.entries()[1..]);
     assert_eq!(committed[0].sequence, Some(2));
     assert!(!committed[0].id.is_empty());
+    let turn_id = committed[0].turn_id.clone().expect("turn ID");
+    assert!(uuid::Uuid::parse_str(&turn_id).is_ok());
 
     context
         .push(AgentEvent::CompactionStarted)
@@ -240,6 +242,7 @@ async fn publishes_committed_entries_and_keeps_ephemeral_events_out_of_history()
     assert_eq!(context.entries().len(), 3);
     assert_eq!(*committed, context.entries()[2]);
     assert_eq!(committed.sequence, Some(3));
+    assert_eq!(committed.turn_id, Some(turn_id));
     assert_eq!(tokens_per_second, Some(42.0));
 }
 

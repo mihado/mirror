@@ -35,7 +35,7 @@ def _content(state: state.State) -> formatted_text.StyleAndTextTuples:
     duration = state.activity.completed_duration
     if duration is None:
       return []
-    label = '<1s' if duration < 1 else f'{duration:.0f}s'
+    label = '<1s' if duration < 1 else rendering.format_duration(duration)
     return [
       (
         f'class:activity class:{state.activity.spinner_color.value}',

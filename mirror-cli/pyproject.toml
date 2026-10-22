@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mirror"
-version = "0.1.0"
+version = "0.1.1"
 description = "A terminal coding agent from Reflection AI."
 readme = "README.md"
 license = "Apache-2.0"
@@ -67,10 +67,20 @@ cache-keys = [
 ]
 
 [dependency-groups]
-dev = ["pyright[nodejs]", "pytest", "pytest-asyncio", "freezegun", "pyte"]
+dev = [
+  "pyright[nodejs]",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-xdist",
+  "freezegun",
+  "pyte",
+]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
+markers = [
+  "no_xdist: runs in ci.sh's serial pass, alone, because its timing bounds miss under xdist",
+]
 
 [tool.ruff]
 target-version = "py312"

@@ -39,10 +39,12 @@ async def test_escape_preserves_editor_alt_bindings_without_delay(
   dispatched_actions: list[actions.Action],
 ) -> None:
   dispatched: list[actions.Action] = []
+  interrupts: list[None] = []
   mapping = keymap.Keymap(
     lambda: [(keymap.Binding(('escape',), actions.InterruptRequested()),)],
     dispatched.append,
     dismiss=lambda: None,
+    on_escape_interrupt=lambda: interrupts.append(None),
   )
   composer = buffer.Buffer()
   composer.text = 'one two'
@@ -65,6 +67,7 @@ async def test_escape_preserves_editor_alt_bindings_without_delay(
     assert composer.text == text
     assert composer.cursor_position == cursor
     assert dispatched == dispatched_actions
+    assert len(interrupts) == len(dispatched_actions)
     await app.cancel_and_wait_for_background_tasks()
 
 
@@ -264,13 +267,20 @@ async def test_interrupt_remapping_replaces_defaults(
 
 
 @pytest.mark.asyncio
-async def test_disabling_interrupt_does_not_disable_escape_dismissal() -> None:
+@pytest.mark.parametrize(
+  'remappings', [(), (keymap.Remapping(actions.InterruptRequested(), ()),)]
+)
+async def test_escape_dismissal_does_not_report_interrupt(
+  remappings: tuple[keymap.Remapping, ...],
+) -> None:
+  interrupts: list[None] = []
   dispatched: list[actions.Action] = []
   mapping = keymap.Keymap(
     lambda: [(keymap.Binding(('escape',), actions.InterruptRequested()),)],
     dispatched.append,
     dismiss=actions.CloseSelector,
-    remappings=(keymap.Remapping(actions.InterruptRequested(), ()),),
+    on_escape_interrupt=lambda: interrupts.append(None),
+    remappings=remappings,
   )
   app = application.Application[None](
     key_bindings=mapping.bindings,
@@ -282,6 +292,7 @@ async def test_disabling_interrupt_does_not_disable_escape_dismissal() -> None:
     parser.feed_and_flush('\x1b')
     app.key_processor.process_keys()
     assert dispatched == [actions.CloseSelector()]
+    assert interrupts == []
     await app.cancel_and_wait_for_background_tasks()
 
 

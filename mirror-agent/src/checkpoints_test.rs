@@ -587,6 +587,173 @@ async fn jj_capture_includes_large_new_files_when_auto_tracking_is_disabled() {
 }
 
 #[tokio::test]
+async fn fork_git_preserves_files_and_parent_staging() {
+    let directory = tempfile::tempdir().expect("temporary repositories");
+    let root = directory.path().join("source");
+    let child = directory.path().join("child");
+    fs::create_dir(&root).expect("source");
+    git(&root, &["init", "--quiet"]);
+    fs::write(root.join("tracked"), "base").expect("file");
+    fs::write(root.join("deleted"), "base").expect("file");
+    fs::create_dir(root.join("excluded")).expect("sparse directory");
+    fs::write(root.join("excluded/file"), "sparse file").expect("sparse file");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "--quiet", "-m", "base"]);
+    git(&root, &["sparse-checkout", "set", "--cone", "included"]);
+    fs::write(root.join("tracked"), "staged").expect("staged edit");
+    git(&root, &["add", "."]);
+    fs::write(root.join("tracked"), "working").expect("unstaged edit");
+    fs::remove_file(root.join("deleted")).expect("delete");
+    let index = fs::read(root.join(".git/index")).expect("parent index");
+    let head = git(&root, &["rev-parse", "HEAD"]);
+
+    Checkpoints::new(root.clone())
+        .fork(&child, "child")
+        .await
+        .expect("fork");
+
+    assert_eq!(
+        fs::read_to_string(child.join("tracked")).expect("child file"),
+        "working"
+    );
+    assert!(!child.join("deleted").exists());
+    assert!(!root.join("excluded/file").exists());
+    assert_eq!(
+        fs::read_to_string(child.join("excluded/file")).expect("expanded sparse file"),
+        "sparse file"
+    );
+    assert_eq!(git(&child, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(git(&child, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read(root.join(".git/index")).expect("parent index"),
+        index
+    );
+    fs::write(child.join("tracked"), "child edit").expect("independent child");
+    assert_eq!(
+        fs::read_to_string(root.join("tracked")).expect("parent file"),
+        "working"
+    );
+}
+
+#[tokio::test]
+async fn fork_git_leaves_non_sparse_repository_configuration_unchanged() {
+    let directory = tempfile::tempdir().expect("temporary repositories");
+    let root = directory.path().join("source");
+    fs::create_dir(&root).expect("source");
+    git(&root, &["init", "--quiet"]);
+    fs::write(root.join("file"), "new").expect("working file");
+    let config = fs::read(root.join(".git/config")).expect("source config");
+
+    Checkpoints::new(root.clone())
+        .fork(&directory.path().join("child"), "child")
+        .await
+        .expect("fork");
+
+    assert_eq!(
+        fs::read(root.join(".git/config")).expect("source config"),
+        config
+    );
+}
+
+#[tokio::test]
+async fn fork_jj_remains_independent_when_parent_working_commit_changes() {
+    let directory = tempfile::tempdir().expect("temporary repositories");
+    let root = directory.path().join("source");
+    let child = directory.path().join("child");
+    fs::create_dir(&root).expect("source");
+    jj(&root, &["git", "init", "--no-colocate"]);
+    fs::write(root.join("tracked"), "base").expect("base file");
+    fs::write(root.join("deleted"), "base").expect("base file");
+    fs::write(root.join("excluded"), "sparse file").expect("sparse file");
+    jj(&root, &["new"]);
+    fs::remove_file(root.join("deleted")).expect("delete before saved head");
+    fs::write(root.join("tracked"), "stored").expect("stored edit");
+    jj(&root, &["sparse", "set", "--clear", "--add", "tracked"]);
+    let head = jj_head(&root);
+    fs::write(root.join("tracked"), "snapshot").expect("unsaved edit");
+    fs::create_dir(root.join("cwd")).expect("empty cwd");
+    let cwd = Checkpoints::new(root.join("cwd"))
+        .fork(&child, "child")
+        .await
+        .expect("fork");
+
+    assert_eq!(cwd, fs::canonicalize(child.join("cwd")).expect("child cwd"));
+    assert_eq!(jj_head(&root), head);
+    assert!(!root.join("excluded").exists());
+    assert_eq!(
+        fs::read_to_string(child.join("excluded")).expect("expanded sparse file"),
+        "sparse file"
+    );
+    fs::write(root.join("tracked"), "later parent edit").expect("parent diverges");
+    fs::write(root.join("parent-only"), "later").expect("parent addition");
+    jj(&root, &["status"]);
+    jj(&child, &["status"]);
+    jj(&child, &["workspace", "update-stale"]);
+
+    assert_eq!(
+        fs::read_to_string(child.join("tracked")).expect("child snapshot"),
+        "snapshot"
+    );
+    assert!(!child.join("parent-only").exists());
+    assert!(!child.join("deleted").exists());
+    fs::write(child.join("tracked"), "child edit").expect("child diverges");
+    jj(&child, &["status"]);
+    jj(&root, &["status"]);
+    assert_eq!(
+        fs::read_to_string(root.join("tracked")).expect("parent unchanged"),
+        "later parent edit"
+    );
+}
+
+#[tokio::test]
+async fn fork_jj_rejects_conflicted_trees_before_creating_a_workspace() {
+    let directory = tempfile::tempdir().expect("temporary repositories");
+    let root = directory.path().join("source");
+    let child = directory.path().join("child");
+    fs::create_dir(&root).expect("source");
+    jj(&root, &["git", "init", "--no-colocate"]);
+    fs::write(root.join("file"), "left").expect("left");
+    jj(&root, &["bookmark", "create", "left"]);
+    jj(&root, &["new", "root()"]);
+    fs::write(root.join("file"), "right").expect("right");
+    jj(&root, &["bookmark", "create", "right"]);
+    jj(&root, &["new", "left", "right"]);
+    let head = jj_head(&root);
+    let contents = fs::read(root.join("file")).expect("conflicted file");
+
+    assert_matches!(
+        Checkpoints::new(root.clone()).fork(&child, "child").await,
+        Err(CheckpointError::Fork(_))
+    );
+
+    assert!(!child.exists());
+    assert_eq!(jj_head(&root), head);
+    assert_eq!(
+        fs::read(root.join("file")).expect("parent conflict"),
+        contents
+    );
+}
+
+#[tokio::test]
+async fn fork_never_overwrites_an_existing_destination() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let child = directory.path().join("child");
+    fs::create_dir(&child).expect("existing destination");
+    fs::write(child.join("keep"), "keep").expect("existing file");
+    assert_matches!(
+        Checkpoints::new(directory.path().to_path_buf())
+            .fork(&child, "child")
+            .await,
+        Err(CheckpointError::Fork(_))
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("keep")).expect("existing file"),
+        "keep"
+    );
+}
+
+#[tokio::test]
 async fn broken_jj_workspace_reports_failure_instead_of_skipping_capture() {
     let directory = tempfile::tempdir().expect("workspace");
     fs::create_dir(directory.path().join(".jj")).expect("invalid jj marker");

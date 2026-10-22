@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
 use async_stream::try_stream;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -17,6 +19,7 @@ use mirror_protocol::StreamToolCall;
 use mirror_protocol::ToolCall;
 use mirror_protocol::Usage;
 use reqwest::Client;
+use ring::digest;
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::Map;
@@ -32,6 +35,16 @@ use super::StreamEvent;
 
 /// The Messages API version pinned in the `anthropic-version` header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// The completion ceiling for a request that sets none.
+const DEFAULT_MAX_TOKENS: u32 = 32_000;
+
+/// The beta that accepts `thinking.block_binding` and reports `input_transformations`.
+const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// The `provider_fields` key holding a digest of the prompt a turn's thinking
+/// was produced after.
+const THINKING_PREFIX_FIELD: &str = "thinking_prefix";
 
 /// A streaming model backed by the Anthropic Messages endpoint.
 #[derive(Debug)]
@@ -54,7 +67,8 @@ impl AnthropicMessages {
         Self { config, client }
     }
 
-    fn request_body(&self, request: CompletionRequest) -> Result<Value, LlmError> {
+    /// The request body, and the digest of the prompt its response follows.
+    fn request_body(&self, request: CompletionRequest) -> Result<(Value, String), LlmError> {
         let effort = request
             .inference
             .as_ref()
@@ -69,20 +83,8 @@ impl AnthropicMessages {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let messages = request
-            .messages
-            .iter()
-            .filter(|message| !matches!(message, chat_record::Message::System(_)))
-            .map(serialize_message)
-            .collect::<Result<Vec<_>, _>>()?;
         // Anthropic requires an explicit completion ceiling on every request.
-        let max_tokens = request.max_tokens.unwrap_or(4096);
-        let mut body = Map::from_iter([
-            ("model".to_string(), json!(self.config.model)),
-            ("max_tokens".to_string(), json!(max_tokens)),
-            ("stream".to_string(), Value::Bool(true)),
-            ("messages".to_string(), Value::Array(messages)),
-        ]);
+        let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         // A breakpoint on the last stable block (tools render before system, so
         // the system block ends the shared prefix) caches tools plus system.
         let mut tools = request
@@ -96,6 +98,17 @@ impl AnthropicMessages {
                 })
             })
             .collect::<Vec<_>>();
+        let mut prefix = digest::Context::new(&digest::SHA256);
+        prefix.update(json!(tools).to_string().as_bytes());
+        prefix.update(json!(system).to_string().as_bytes());
+        let (messages, prefix) = serialize_messages(&request.messages, prefix)?;
+        let mut body = Map::from_iter([
+            ("model".to_string(), json!(self.config.model)),
+            ("max_tokens".to_string(), json!(max_tokens)),
+            ("stream".to_string(), Value::Bool(true)),
+            ("messages".to_string(), Value::Array(messages)),
+            ("cache_control".to_string(), json!({"type": "ephemeral"})),
+        ]);
         if !system.is_empty() {
             body.insert(
                 "system".to_string(),
@@ -116,12 +129,16 @@ impl AnthropicMessages {
             // otherwise omits by default on the current Opus and Fable models.
             body.insert(
                 "thinking".to_string(),
-                json!({"type": "adaptive", "display": "summarized"}),
+                json!({
+                    "type": "adaptive",
+                    "display": "summarized",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+                }),
             );
             body.insert("output_config".to_string(), json!({"effort": effort}));
         }
         apply_extra_body(&mut body, request.inference.as_ref())?;
-        Ok(Value::Object(body))
+        Ok((Value::Object(body), prefix))
     }
 }
 
@@ -150,15 +167,19 @@ impl AnthropicMessages {
         let api_key = self.config.api_key.clone();
         let body = self.request_body(request);
         try_stream! {
-            let body = body?;
+            let (body, prefix) = body?;
             if let Some(guard) = guard {
                 guard.verify().await?;
             }
-            let response = client
+            let mut request = client
                 .post(&endpoint)
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .header("x-api-key", &api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(beta) = anthropic_beta(&body) {
+                request = request.header("anthropic-beta", beta);
+            }
+            let response = request
                 .json(&body)
                 .send()
                 .await
@@ -171,7 +192,10 @@ impl AnthropicMessages {
                 Err(response_error(&model, format!("{status}: {detail}")))?
             };
 
-            let mut state = CompletionState::default();
+            let mut state = CompletionState {
+                thinking_prefix: Some(prefix),
+                ..CompletionState::default()
+            };
             let mut completed = false;
             let mut events = response.bytes_stream().eventsource();
             while let Some(event) = events.next().await {
@@ -227,6 +251,7 @@ enum ApiEvent {
     MessageDelta {
         delta: ApiMessageDelta,
         usage: Option<ApiUsage>,
+        input_transformations: Option<Vec<Value>>,
     },
     MessageStop,
     Ping,
@@ -241,6 +266,8 @@ enum ApiEvent {
 struct ApiMessageStart {
     #[serde(default)]
     usage: ApiUsage,
+    #[serde(default)]
+    input_transformations: Vec<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -336,6 +363,8 @@ struct CompletionState {
     cached_tokens: u64,
     cache_write_tokens: u64,
     stop_reason: Option<String>,
+    input_transformations: Vec<Value>,
+    thinking_prefix: Option<String>,
 }
 
 impl CompletionState {
@@ -347,6 +376,7 @@ impl CompletionState {
                 self.cached_tokens = message.usage.cache_read_input_tokens;
                 self.cache_write_tokens = message.usage.cache_creation_input_tokens;
                 self.output_tokens = message.usage.output_tokens;
+                self.input_transformations = message.input_transformations;
                 if self.output_tokens > 0 {
                     events.push(StreamEvent::OutputTokens(self.output_tokens));
                 }
@@ -434,9 +464,16 @@ impl CompletionState {
                     _ => {}
                 }
             }
-            ApiEvent::MessageDelta { delta, usage } => {
+            ApiEvent::MessageDelta {
+                delta,
+                usage,
+                input_transformations,
+            } => {
                 if let Some(stop_reason) = delta.stop_reason {
                     self.stop_reason = Some(stop_reason);
+                }
+                if let Some(transformations) = input_transformations {
+                    self.input_transformations = transformations;
                 }
                 if let Some(usage) = usage {
                     self.output_tokens = usage.output_tokens;
@@ -522,6 +559,22 @@ impl CompletionState {
                 "model completion produced an incomplete tool call".to_string(),
             ));
         }
+        let mut provider_fields = Map::new();
+        if !self.input_transformations.is_empty() {
+            provider_fields.insert(
+                "input_transformations".to_string(),
+                Value::Array(self.input_transformations),
+            );
+        }
+        if let Some(prefix) = self
+            .thinking_prefix
+            .filter(|_| !reasoning_details.is_empty())
+        {
+            provider_fields.insert(THINKING_PREFIX_FIELD.to_string(), Value::String(prefix));
+        }
+        let provider_fields = (!provider_fields.is_empty())
+            .then(|| json_to_struct(Value::Object(provider_fields)))
+            .transpose()?;
         Ok(Completion {
             message: AssistantMessage {
                 content: (!content.is_empty()).then_some(content),
@@ -529,10 +582,14 @@ impl CompletionState {
                 reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                 reasoning_details,
                 refusal: None,
-                provider_fields: None,
+                provider_fields,
             },
             usage: Some(Usage {
-                prompt_tokens: self.input_tokens,
+                // Anthropic's `input_tokens` excludes cached tokens.
+                prompt_tokens: self
+                    .input_tokens
+                    .saturating_add(self.cached_tokens)
+                    .saturating_add(self.cache_write_tokens),
                 completion_tokens: self.output_tokens,
                 cached_tokens: self.cached_tokens,
                 cache_write_tokens: self.cache_write_tokens,
@@ -554,7 +611,39 @@ impl CompletionState {
     }
 }
 
-fn serialize_message(message: &chat_record::Message) -> Result<Value, LlmError> {
+/// Whether an assistant turn is replayed with its thinking blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Thinking {
+    Replay,
+    Omit,
+}
+
+/// Serialize the conversation for the `messages` field, after the tools and
+/// system already in `prefix`, and return the digest of the whole prompt.
+///
+/// Anthropic binds thinking to the prompt before it, so a turn whose prompt
+/// changed since it was produced, as behind a compaction summary, replays
+/// without its thinking.
+fn serialize_messages(
+    messages: &[chat_record::Message],
+    mut prefix: digest::Context,
+) -> Result<(Vec<Value>, String), LlmError> {
+    let mut serialized = Vec::new();
+    for message in messages {
+        if matches!(message, chat_record::Message::System(_)) {
+            continue;
+        }
+        let value = serialize_message(message, &prefix)?;
+        prefix.update(value.to_string().as_bytes());
+        serialized.push(value);
+    }
+    Ok((serialized, STANDARD.encode(prefix.finish())))
+}
+
+fn serialize_message(
+    message: &chat_record::Message,
+    prefix: &digest::Context,
+) -> Result<Value, LlmError> {
     match message {
         // System messages are hoisted into the top-level `system` field.
         chat_record::Message::System(_) => Err(LlmError::Request(
@@ -571,15 +660,36 @@ fn serialize_message(message: &chat_record::Message) -> Result<Value, LlmError> 
                 "content": message.content,
             }],
         })),
-        chat_record::Message::Assistant(message) => serialize_assistant(message),
+        chat_record::Message::Assistant(message) => {
+            let thinking = if recorded_prefix(message)
+                .is_none_or(|recorded| recorded == STANDARD.encode(prefix.clone().finish()))
+            {
+                Thinking::Replay
+            } else {
+                Thinking::Omit
+            };
+            serialize_assistant(message, thinking)
+        }
     }
 }
 
-fn serialize_assistant(message: &AssistantMessage) -> Result<Value, LlmError> {
+/// The prefix digest recorded when `message` was produced, if it has one.
+fn recorded_prefix(message: &AssistantMessage) -> Option<String> {
+    struct_to_json(message.provider_fields.as_ref()?)
+        .get(THINKING_PREFIX_FIELD)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn serialize_assistant(message: &AssistantMessage, thinking: Thinking) -> Result<Value, LlmError> {
     let mut content = Vec::new();
     // Thinking blocks must precede text and tool_use, and replay verbatim so
     // their signatures still validate on the same model.
-    for detail in &message.reasoning_details {
+    for detail in message
+        .reasoning_details
+        .iter()
+        .filter(|_| thinking == Thinking::Replay)
+    {
         let value = struct_to_json(detail);
         if matches!(
             value.get("type").and_then(Value::as_str),
@@ -616,6 +726,13 @@ fn serialize_assistant(message: &AssistantMessage) -> Result<Value, LlmError> {
         content.push(json!({"type": "text", "text": ""}));
     }
     Ok(json!({"role": "assistant", "content": content}))
+}
+
+/// The `anthropic-beta` header value a request body requires, if any.
+fn anthropic_beta(body: &Value) -> Option<&'static str> {
+    body.pointer("/thinking/block_binding")
+        .is_some()
+        .then_some(THINKING_BINDING_CONTROLS_BETA)
 }
 
 fn format_api_error(error: &ApiError) -> String {
@@ -691,7 +808,7 @@ mod tests {
             }),
         };
 
-        let body = provider()
+        let (body, _) = provider()
             .request_body(request)
             .expect("valid messages serialize");
 
@@ -702,6 +819,7 @@ mod tests {
                 "max_tokens": 1024,
                 "stream": true,
                 "messages": [{"role": "user", "content": "hello"}],
+                "cache_control": {"type": "ephemeral"},
                 "system": [{
                     "type": "text",
                     "text": "be helpful",
@@ -712,10 +830,15 @@ mod tests {
                     "description": "Run a command.",
                     "input_schema": {"type": "object"},
                 }],
-                "thinking": {"type": "adaptive", "display": "summarized"},
+                "thinking": {
+                    "type": "adaptive",
+                    "display": "summarized",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+                },
                 "output_config": {"effort": "high"},
             })
         );
+        assert_eq!(anthropic_beta(&body), Some(THINKING_BINDING_CONTROLS_BETA));
     }
 
     #[test]
@@ -736,12 +859,13 @@ mod tests {
             }),
         };
 
-        let body = provider()
+        let (body, _) = provider()
             .request_body(request)
             .expect("valid messages serialize");
 
         assert_eq!(body.get("thinking"), None);
-        assert_eq!(body["max_tokens"], json!(4096));
+        assert_eq!(anthropic_beta(&body), None);
+        assert_eq!(body["max_tokens"], json!(32_000));
     }
 
     #[test]
@@ -752,7 +876,8 @@ mod tests {
             name: Some("bash".to_string()),
         });
 
-        let value = serialize_message(&message).expect("tool message serializes");
+        let value = serialize_message(&message, &digest::Context::new(&digest::SHA256))
+            .expect("tool message serializes");
 
         assert_eq!(
             value,
@@ -817,6 +942,72 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 7);
         assert!(!completion.truncated);
+        assert_eq!(completion.message.provider_fields, None);
+    }
+
+    #[test]
+    fn prompt_tokens_include_cached_input() {
+        let events = [
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 90,
+                "output_tokens": 1,
+            }}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "Hi"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+        ];
+        let mut state = CompletionState::default();
+
+        for event in events {
+            state.apply(serde_json::from_value(event).expect("valid event"));
+        }
+        let usage = state
+            .finish()
+            .expect("stream completes")
+            .usage
+            .expect("usage is present");
+
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.cached_tokens, 900);
+        assert_eq!(usage.cache_write_tokens, 90);
+    }
+
+    #[test]
+    fn input_transformations_are_recorded_for_diagnosis() {
+        let dropped = json!({
+            "type": "thinking_dropped",
+            "path": "messages.1.content.0",
+            "reason": "prefix_binding_mismatch",
+        });
+        let events = [
+            json!({"type": "message_start", "message": {
+                "usage": {"input_tokens": 10},
+                "input_transformations": [dropped],
+            }}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "Hi"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+        ];
+        let mut state = CompletionState::default();
+
+        for event in events {
+            state.apply(serde_json::from_value(event).expect("valid event"));
+        }
+        let completion = state.finish().expect("stream completes");
+
+        assert_eq!(
+            completion
+                .message
+                .provider_fields
+                .as_ref()
+                .map(struct_to_json),
+            Some(json!({"input_transformations": [dropped]}))
+        );
+        assert_eq!(
+            serialize_assistant(&completion.message, Thinking::Replay)
+                .expect("assistant serializes"),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
+        );
     }
 
     #[test]
@@ -843,7 +1034,7 @@ mod tests {
             provider_fields: None,
         };
 
-        let value = serialize_assistant(&message).expect("assistant serializes");
+        let value = serialize_assistant(&message, Thinking::Replay).expect("assistant serializes");
 
         assert_eq!(
             value,
@@ -855,6 +1046,96 @@ mod tests {
                     {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}},
                 ],
             })
+        );
+    }
+
+    fn user(content: &str) -> chat_record::Message {
+        chat_record::Message::User(UserMessage {
+            checkpoint: None,
+            content: content.to_string(),
+        })
+    }
+
+    fn request(messages: Vec<chat_record::Message>) -> CompletionRequest {
+        CompletionRequest {
+            messages,
+            tools: Vec::new(),
+            max_tokens: None,
+            inference: None,
+        }
+    }
+
+    /// A turn with thinking, produced after `history` as `stream` produces it.
+    fn thinking_turn(history: &[chat_record::Message]) -> chat_record::Message {
+        let (_, prefix) = provider()
+            .request_body(request(history.to_vec()))
+            .expect("valid messages serialize");
+        let mut state = CompletionState {
+            thinking_prefix: Some(prefix),
+            ..CompletionState::default()
+        };
+        for event in [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "plan", "signature": "sig"}}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": "Done."}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+        ] {
+            state.apply(serde_json::from_value(event).expect("valid event"));
+        }
+        chat_record::Message::Assistant(state.finish().expect("stream completes").message)
+    }
+
+    #[test]
+    fn thinking_replays_while_its_history_is_unchanged() {
+        let history = vec![user("hi")];
+        let turn = thinking_turn(&history);
+
+        let (body, _) = provider()
+            .request_body(request(vec![user("hi"), turn, user("next")]))
+            .expect("valid messages serialize");
+
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([
+                {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                {"type": "text", "text": "Done."},
+            ])
+        );
+    }
+
+    #[test]
+    fn thinking_is_dropped_once_its_history_changes() {
+        let turn = thinking_turn(&[user("hi")]);
+
+        let (body, _) = provider()
+            .request_body(request(vec![user("summary"), turn, user("next")]))
+            .expect("valid messages serialize");
+
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type": "text", "text": "Done."}])
+        );
+    }
+
+    #[test]
+    fn thinking_is_dropped_once_the_tools_change() {
+        let turn = thinking_turn(&[user("hi")]);
+        let changed = CompletionRequest {
+            tools: vec![ToolDefinition {
+                name: "bash".to_string(),
+                description: "Run a command.".to_string(),
+                parameters: Map::new(),
+            }],
+            ..request(vec![user("hi"), turn, user("next")])
+        };
+
+        let (body, _) = provider()
+            .request_body(changed)
+            .expect("valid messages serialize");
+
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type": "text", "text": "Done."}])
         );
     }
 

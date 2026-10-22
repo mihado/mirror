@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime
+import fcntl
 import logging
 import os
 import pathlib
@@ -257,6 +258,66 @@ def test_parse_args_version_prints_installed_version(
   )
 
 
+@pytest.mark.parametrize(
+  ('arguments', 'effort'),
+  [
+    (['--api', 'gemini'], 'none'),
+    (['--model', 'gemini-4-argon'], 'none'),
+    (['--api', 'gemini', '--reasoning-effort', 'high'], 'high'),
+  ],
+)
+def test_parse_args_gemini_uses_supported_default_reasoning(
+  tmp_path: pathlib.Path, arguments: list[str], effort: str
+) -> None:
+  result = subprocess.run(
+    [
+      sys.executable,
+      '-c',
+      (
+        'from mirror.cli import main; args = main._parse_args(); '
+        'print(args.model, args.reasoning_effort)'
+      ),
+      *arguments,
+    ],
+    cwd=tmp_path,
+    env={'HOME': str(tmp_path), 'PATH': os.defpath},
+    capture_output=True,
+    text=True,
+    check=True,
+  )
+  assert result.stdout.strip() == f'gemini-4-argon {effort}'
+
+
+def test_main_rejects_explicit_unsupported_gemini_effort(
+  tmp_path: pathlib.Path,
+) -> None:
+  result = subprocess.run(
+    [
+      sys.executable,
+      '-m',
+      'mirror.cli.main',
+      '--api',
+      'gemini',
+      '--reasoning-effort',
+      'max',
+      'exec',
+      'hello',
+    ],
+    cwd=tmp_path,
+    env={'HOME': str(tmp_path), 'PATH': os.defpath},
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+  assert result.returncode == 1
+  assert (
+    'Gemini 4 Argon supports provider default, low, medium, or high'
+    in result.stderr
+  )
+  assert 'Restart with --reasoning-effort medium' in result.stderr
+  assert 'GEMINI_API_KEY' not in result.stderr
+
+
 def test_remote_endpoint_requires_configuration(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,11 +470,33 @@ def test_continue_without_history_creates_a_new_conversation(
 ) -> None:
   monkeypatch.chdir(tmp_path)
   with cli_store.Store(tmp_path / 'state.db') as store:
+    store.set_workspace_conversation(
+      str(tmp_path), str(tmp_path), 'other-directory', tmp_path / 'other'
+    )
     conversation_id, create, allow = main._resolve_conversation(  # pyright: ignore[reportPrivateUsage]
       _args(continue_recent=True), store
     )
 
   assert len(conversation_id) == 32
+  assert create
+  assert not allow
+
+
+def test_continue_uses_tab_binding_without_requiring_projected_history(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  monkeypatch.chdir(tmp_path)
+  with cli_store.Store(tmp_path / 'cli.db') as store:
+    store.set_workspace_conversation(
+      str(tmp_path), str(tmp_path), 'bound', tmp_path
+    )
+    assert main._resolve_conversation(  # pyright: ignore[reportPrivateUsage] - exercise CLI selection without starting a worker
+      _args(continue_recent=True), store
+    ) == ('bound', False, False)
+    conversation_id, create, allow = main._resolve_conversation(  # pyright: ignore[reportPrivateUsage] - exercise CLI selection without starting a worker
+      _args(), store
+    )
+  assert conversation_id != 'bound'
   assert create
   assert not allow
 
@@ -778,6 +861,63 @@ async def test_worker_startup_failure_preserves_stderr(
 
   assert 'FileNotFoundError' in (tmp_path / 'logs/stderr').read_text()
   assert transport.process is None
+
+
+@pytest.mark.asyncio
+async def test_worker_reported_startup_failure_preserves_error(
+  tmp_path: pathlib.Path,
+) -> None:
+  transport = local_rpc_client.Transport(
+    [
+      sys.executable,
+      '-c',
+      'import os; '
+      'os.write(1, b"MIRROR_RPC_ERROR=synthetic startup failure\\n"); '
+      'os._exit(1)',
+    ],
+    {},
+    workspace=tmp_path,
+    log_dir=tmp_path / 'logs',
+  )
+  with pytest.raises(RuntimeError, match='^synthetic startup failure$'):
+    await transport.connect()
+
+  assert transport.process is None
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_failure_stops_descendants(
+  tmp_path: pathlib.Path,
+) -> None:
+  worker = '''
+import signal, subprocess, sys
+signal.signal(signal.SIGTERM, lambda *_: None)
+child = subprocess.Popen([sys.executable, '-c', """
+import fcntl, signal
+
+with open('child-running', 'w') as marker:
+    fcntl.flock(marker, fcntl.LOCK_EX)
+    print('ready', flush=True)
+    signal.pause()
+"""], stdout=subprocess.PIPE)
+assert child.stdout.readline() == b'ready\\n'
+print('MIRROR_RPC_ERROR=synthetic startup failure', flush=True)
+child.wait()
+'''
+  transport = local_rpc_client.Transport(
+    [sys.executable, '-c', worker],
+    {},
+    workspace=tmp_path,
+    log_dir=tmp_path / 'logs',
+  )
+  async with asyncio.timeout(10):
+    with pytest.raises(RuntimeError, match='^synthetic startup failure$'):
+      await transport.connect()
+
+  assert transport.process is None
+  # The descendant holds this lock until it exits, including forced cleanup.
+  with (tmp_path / 'child-running').open() as marker:
+    fcntl.flock(marker, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 @pytest.mark.skipif(

@@ -29,6 +29,7 @@ use super::LlmError;
 use super::ModelRequestGuard;
 use super::ResponsesClient;
 use super::ResponsesConfig;
+use super::ResponsesWebSocket;
 use super::StreamEvent;
 use crate::providers::CompletionRequest;
 
@@ -49,6 +50,8 @@ pub struct CodexResponsesConfig {
     pub base_url: Option<String>,
     pub auth_path: Option<PathBuf>,
     pub prompt_cache_key: String,
+    /// The session's WebSocket connection, for endpoints that serve it.
+    pub websocket: Option<ResponsesWebSocket>,
 }
 
 /// A Responses provider authenticated by the Codex CLI login.
@@ -96,6 +99,7 @@ impl CodexResponses {
                     .base_url
                     .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
                 prompt_cache_key: Some(config.prompt_cache_key),
+                websocket: config.websocket,
             },
             client.clone(),
         );
@@ -223,14 +227,12 @@ impl CodexResponses {
             let body = self.request_body(request)?;
             let mut rejected_token = None;
             for attempt in 0..2 {
-                let auth = self.fresh_auth(rejected_token.as_deref()).await?;
-                let mut headers = self.headers.clone();
-                insert_header(&mut headers, "chatgpt-account-id", &auth.account_id)?;
-                let attempted_token = auth.access_token.clone();
+                let (headers, access_token) = self.authorized(rejected_token.as_deref()).await?;
+                let attempted_token = access_token.clone();
                 let events = self.responses.stream_body(
                     Ok(body.clone()),
                     headers,
-                    auth.access_token,
+                    access_token,
                     guard,
                 );
                 pin_mut!(events);
@@ -250,6 +252,31 @@ impl CodexResponses {
                 }
             }
         }
+    }
+}
+
+impl CodexResponses {
+    /// Load `request` into the session's WebSocket without generating.
+    pub(super) async fn prewarm(
+        &self,
+        request: CompletionRequest,
+        guard: Option<&dyn ModelRequestGuard>,
+    ) -> Result<(), LlmError> {
+        let body = self.request_body(request)?;
+        let (headers, access_token) = self.authorized(None).await?;
+        self.responses
+            .prewarm_body(body, headers, access_token, guard)
+            .await
+    }
+
+    async fn authorized(
+        &self,
+        rejected_token: Option<&str>,
+    ) -> Result<(HeaderMap, String), LlmError> {
+        let auth = self.fresh_auth(rejected_token).await?;
+        let mut headers = self.headers.clone();
+        insert_header(&mut headers, "chatgpt-account-id", &auth.account_id)?;
+        Ok((headers, auth.access_token))
     }
 }
 

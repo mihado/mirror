@@ -186,6 +186,7 @@ class ScrollableMenu[Item]:
     footer: str | None = None,
     empty_row: StyleAndTextTuples | None = None,
     min_rows: int = 0,
+    pinned_rows: Sequence[StyleAndTextTuples] = (),
     heading: Callable[[Item, int], str] | None = None,
     width: int | None = None,
   ) -> StyleAndTextTuples:
@@ -277,6 +278,11 @@ class ScrollableMenu[Item]:
 
     padding = max(0, min_rows - max(1, len(view.visible)))
     fragments.extend([('', '\n')] * padding)
+    for row in pinned_rows:
+      for line in formatted_text.split_lines(row):
+        fragments.append((self.config.border_style, ' '))
+        fragments.extend(line)
+        fragments.append(('', '\n'))
     footer_hint = next(
       (
         value

@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import http
 import pathlib
+import re
 import signal
 import sys
+import threading
 import types
+import urllib.parse
 import uuid
 from collections.abc import Mapping, Sequence
 
 from mirror.protocol import agent_pb2
 
-from mirror.cli import cli_store, local_rpc_client, rpc_client
+from mirror.cli import cli_store, local_rpc_client, models, rpc_client
 
 _MAX_PROMPT_BYTES = 8 * 1024 * 1024
+_STDIN_HINT_SECONDS = 1.0
 
 
 def read_prompt(argument: str | None) -> str:
@@ -27,6 +32,10 @@ def read_prompt(argument: str | None) -> str:
     )
   prompt = argument or ''
   if argument == '-' or not terminal:
+    # The read waits for EOF; with a prompt argument, say why if that takes a while.
+    hint = threading.Timer(_STDIN_HINT_SECONDS, _print_stdin_hint)
+    if argument not in (None, '-'):
+      hint.start()
     try:
       raw = sys.stdin.buffer.read(_MAX_PROMPT_BYTES + 1)
       if len(raw) > _MAX_PROMPT_BYTES:
@@ -34,6 +43,8 @@ def read_prompt(argument: str | None) -> str:
       content = raw.decode('utf-8')
     except (OSError, UnicodeError):
       raise ValueError('could not read UTF-8 prompt from stdin') from None
+    finally:
+      hint.cancel()
     if argument is None or argument == '-':
       prompt = content
     elif content.strip():
@@ -46,6 +57,17 @@ def read_prompt(argument: str | None) -> str:
   return prompt
 
 
+def _print_stdin_hint() -> None:
+  print(
+    'mirror: waiting for input from another program; anything it sends is '
+    "added to your prompt. If you aren't sending anything, stop with Ctrl+C "
+    'and add "< /dev/null" to the end of the command, e.g. '
+    'mirror exec "..." < /dev/null',
+    file=sys.stderr,
+    flush=True,
+  )
+
+
 def require_interactive_consent(notice: str) -> bool:
   """Fail instead of granting directory trust or displaying an interactive notice."""
   del notice
@@ -55,11 +77,61 @@ def require_interactive_consent(notice: str) -> bool:
   )
 
 
+def _endpoint(base_url: str) -> str:
+  """scheme://host[:port] only: user info, path or query in a URL can hold credentials."""
+  parts = urllib.parse.urlsplit(base_url)
+  try:
+    port = f':{parts.port}' if parts.port else ''
+  except ValueError:
+    port = ''
+  return f'{parts.scheme}://{parts.hostname}{port}' if parts.hostname else ''
+
+
+def _failure_message(error: str, inference: agent_pb2.InferenceConfig) -> str:
+  """Explain a failed model request from its HTTP status and what was requested.
+
+  The provider's own text after the status can echo request data, so it is never shown.
+  """
+  match = re.match(r'model request failed: (\d{3})\b', error)
+  if match is None:
+    return 'model requests failed; see the session log for details'
+  code = int(match[1])
+  try:
+    status = f'{code} {http.HTTPStatus(code).phrase}'
+  except ValueError:
+    status = str(code)
+  endpoint = _endpoint(inference.base_url)
+  target = f'model "{inference.model}"' + (
+    f' at {endpoint}' if endpoint else ''
+  )
+  # exec takes credentials from the environment only; it rejects --api-key.
+  key = (
+    'your Codex login'
+    if inference.api == 'openai-codex-responses'
+    else models.key_env(inference.api)
+  )
+  if code == 401:
+    return (
+      f'the provider rejected the API key ({status}) for {target}. Check {key}.'
+    )
+  if code == 403:
+    return f'the provider denied access ({status}) for {target}. Check that {key} can use this model.'
+  if code == 404:
+    return f'the provider could not find {target} ({status}). Check --model and --base-url.'
+  if code == 429:
+    return f'the provider is rate limiting requests ({status}) for {target}. Wait and try again.'
+  if 500 <= code < 600:
+    return f'the provider had a server error ({status}) for {target}. Try again later.'
+  return f'model requests failed: {status}'
+
+
 async def _answer(
   events: asyncio.Queue[agent_pb2.SessionMessage | None],
+  inference: agent_pb2.InferenceConfig,
 ) -> str:
   """Wait for turn completion, retaining only the last committed answer."""
   answer = ''
+  last_error = ''
   while True:
     event = await events.get()
     if event is None:
@@ -76,7 +148,11 @@ async def _answer(
       raise RuntimeError('agent rejected the request; check run configuration')
     if payload == 'agent_message':
       record = event.agent_message
+      if record.WhichOneof('payload') == 'log' and record.log.level == 'error':
+        last_error = record.log.text
       if record.chat.WhichOneof('message') == 'assistant':
+        if record.HasField('inference'):
+          last_error = ''  # A later model completion supersedes earlier errors.
         assistant = record.chat.assistant
         # Limit notices are synthetic records, not model completions.
         answer = (
@@ -99,6 +175,8 @@ async def _answer(
       raise RuntimeError('agent turn was interrupted')
     if delta == 'turn_completed':
       if not answer.strip():
+        if last_error:
+          raise RuntimeError(_failure_message(last_error, inference))
         raise RuntimeError(
           'agent ended without a final answer; check run limits'
         )
@@ -150,21 +228,24 @@ async def _run(
     log_dir=log_dir,
     on_message=on_message,
   )
+  inference = configuration.inference_config(
+    str(configuration.values['model']), reasoning_effort, remote=False
+  )
   client = rpc_client.Client(
     transport,
     conversation_id,
     on_message=on_message,
     on_error=on_error,
-    inference_config=configuration.inference_config(
-      str(configuration.values['model']), reasoning_effort, remote=False
-    ),
+    inference_config=inference,
+    web_provider=configuration.web_provider,
   )
   try:
     await asyncio.wait_for(client.start(replay=False), timeout=30)
-  except (OSError, RuntimeError):
+  except (OSError, RuntimeError) as error:
+    # The worker's MIRROR_RPC_ERROR text is a configuration error, not a provider payload.
     raise RuntimeError(
-      'could not start agent; check numeric limits, model authentication and '
-      f'worker configuration. See {log_dir / "stderr"} for details'
+      f'could not start agent: {str(error).rstrip(".")}. '
+      f'See {log_dir / "stderr"} for details'
     ) from None
   try:
     client.enqueue(
@@ -175,7 +256,7 @@ async def _run(
         ),
       )
     )
-    return await _answer(events)
+    return await _answer(events, inference)
   finally:
     await client.close()
 

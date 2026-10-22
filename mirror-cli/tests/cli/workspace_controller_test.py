@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import sqlite3
+import subprocess
 import sys
 import threading
 import uuid
@@ -29,12 +30,15 @@ from prompt_toolkit.layout import containers, controls, mouse_handlers, screen
 from prompt_toolkit.output import base
 
 from mirror import config, project
+from mirror import workspace as workspace_identity
 from mirror.cli import (
   actions,
   cli,
   cli_store,
   effects,
   extension,
+  keymap,
+  main,
   models,
   reducer,
   rpc_client,
@@ -93,6 +97,11 @@ class _Agent:
     self.submitted.append(instruction)
     self.instruction_submitted.set()
 
+  async def fork_workspace(
+    self, session_id: str, directory: pathlib.Path, name: str
+  ) -> pathlib.Path:
+    raise NotImplementedError('this fixture does not fork workspaces')
+
   async def start(self) -> None:
     self.started = True
 
@@ -104,6 +113,25 @@ class _Agent:
 
   async def close(self) -> None:
     self.closed = True
+
+
+class _ForkAgent(_Agent):
+  def __init__(self, spec: workspaces.AgentSpec) -> None:
+    super().__init__(spec)
+    self.fork_started = asyncio.Event()
+    self.fork_release = asyncio.Event()
+    self.fork_id = ''
+
+  @override
+  async def fork_workspace(
+    self, session_id: str, directory: pathlib.Path, name: str
+  ) -> pathlib.Path:
+    del name
+    self.fork_id = session_id
+    self.fork_started.set()
+    await self.fork_release.wait()
+    directory.mkdir()
+    return directory.resolve()
 
 
 class _AgentFactory:
@@ -174,6 +202,69 @@ class _RecordingOutput(base.DummyOutput):
         rendered += await self.frames.get()
 
 
+@pytest.mark.parametrize(
+  ('flags', 'saved_effort', 'expected_effort'),
+  [
+    (('--api', 'gemini'), 'max', 'none'),
+    (('--model', 'gemini-4-argon'), 'max', 'none'),
+    (('--api', 'gemini'), 'high', 'high'),
+    (('--api', 'gemini', '--reasoning-effort', 'low'), 'max', 'low'),
+    (('--model', 'gemini-4-argon', '--reasoning-effort', 'max'), 'low', 'max'),
+  ],
+)
+@pytest.mark.asyncio
+async def test_gemini_launch_resolves_saved_effort_without_overwriting_it(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  flags: tuple[str, ...],
+  saved_effort: str,
+  expected_effort: str,
+) -> None:
+  monkeypatch.setenv('HOME', str(tmp_path))
+  monkeypatch.chdir(tmp_path)
+  monkeypatch.setattr(sys, 'argv', ['mirror', *flags])
+  database = cli_store.default_database_path()
+  preferences = client_pb2.WorkspacePreferences(
+    definition=mirror_pb2.AgentDefinition(
+      model='gpt-6-astra',
+      model_api='openai-responses',
+      reasoning_effort=saved_effort,
+    ),
+  )
+  with cli_store.Store(database) as store:
+    store.set_worktree_preferences(str(tmp_path), str(tmp_path), preferences)
+  args = main._parse_args()  # pyright: ignore[reportPrivateUsage]
+  worker_config = main._worker_config(  # pyright: ignore[reportPrivateUsage]
+    args, 'test', create_session=True, allow_workspace_mismatch=False
+  )
+  factory = _AgentFactory()
+  controller = workspace_controller.WorkspaceController(
+    worker_config,
+    workspace=tmp_path,
+    reasoning_effort=args.reasoning_effort,
+    database=database,
+    create_agent=factory,
+    discover=lambda _: (worktrees.Worktree(tmp_path, None),),
+  )
+  try:
+    agent = factory.agents[0]
+    inference = rpc_client.WorkerConfiguration(
+      agent.spec.config, cwd=tmp_path
+    ).inference_config(agent.model, agent.reasoning_effort, remote=False)
+    assert inference.api == 'gemini'
+    assert inference.model == 'gemini-4-argon'
+    assert inference.reasoning_effort == expected_effort
+    with cli_store.Store(database) as store:
+      assert (
+        store.worktree_overlays(str(tmp_path))[
+          controller.selected.id
+        ].preferences
+        == preferences
+      )
+  finally:
+    await controller.close()
+
+
 def _fixture_worktree(path: pathlib.Path) -> worktrees.Worktree:
   root = project.repository_root(path.resolve()) or path.resolve()
   return worktrees.Worktree(root, root.name)
@@ -193,6 +284,88 @@ def managed_root(
   root = tmp_path / '.mirror' / 'worktrees'
   root.mkdir(parents=True)
   return root
+
+
+@pytest.fixture
+def fork_repository(managed_root: pathlib.Path) -> pathlib.Path:
+  root = managed_root.parent.parent / 'repository'
+  root.mkdir()
+  subprocess.run(['git', 'init', str(root)], check=True, capture_output=True)
+  return root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('selected_index', [-1, 0], ids=['child', 'parent'])
+async def test_fork_autoselects_then_respects_navigation_and_saves_binding(
+  fork_repository: pathlib.Path,
+  tmp_path: pathlib.Path,
+  selected_index: int,
+) -> None:
+  database = tmp_path / 'fork.db'
+  controller = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=fork_repository,
+    reasoning_effort='medium',
+    create_agent=lambda spec, _: _ForkAgent(spec),
+    database=database,
+  )
+  source = controller.selected
+  assert isinstance(source, workspaces.AgentWorkspace)
+  agent = cast(_ForkAgent, source.agent)
+  repl = _repl(active=False)
+  try:
+    async with asyncio.timeout(5):
+      await _dispatch_and_wait(
+        repl, actions.ForkWorkspace('experiment'), controller
+      )
+      await agent.fork_started.wait()
+      pending = controller.workspaces[-1]
+      assert pending.state is actions.WorktreeAgentState.CREATING
+      assert controller.selected is pending
+      await _dispatch_and_wait(
+        repl,
+        actions.SelectWorkspaceRequested(
+          controller.workspaces[selected_index].identity
+        ),
+        controller,
+      )
+  finally:
+    agent.fork_release.set()
+    await controller.close()
+
+  child = controller.workspaces[-1]
+  assert isinstance(child, workspaces.AgentWorkspace)
+  assert not cast(_ForkAgent, child.agent).started
+  assert child.agent.conversation_id == agent.fork_id
+  assert controller.selected is controller.workspaces[selected_index]
+  repository_key = workspace_identity.git_workspace_key(str(fork_repository))
+  assert repository_key is not None
+  with cli_store.Store(database) as store:
+    overlay = store.worktree_overlays(repository_key).get(child.id)
+  assert overlay is not None
+  assert overlay.conversation_id == agent.fork_id
+  assert overlay.conversation_cwd == str(child.agent.workspace)
+
+
+@pytest.mark.asyncio
+async def test_fork_failure_retains_a_visible_recovery_tab(
+  fork_repository: pathlib.Path,
+) -> None:
+  controller = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=fork_repository,
+    reasoning_effort='medium',
+    create_agent=_AgentFactory(),
+  )
+  source = controller.selected
+  assert isinstance(source, workspaces.AgentWorkspace)
+  pending = await controller.fork_workspace(source.id, 'failed')
+  await controller.close()
+  assert pending in controller.workspaces
+  assert pending.error is not None
+  assert 'Check this outcome before retrying' in pending.error
+  assert 'failed' in pending.error
+  assert controller.selected is source
 
 
 async def _refresh(
@@ -218,11 +391,12 @@ def _config() -> Mapping[str, object]:
   }
 
 
-def _repl() -> cli._Repl:
+def _repl(*, active: bool = True) -> cli._Repl:
   return cli._Repl(
     [sys.executable],
     _config(),
     session_id='test-session',
+    active=active,
     workspace_effects=asyncio.Queue(),
     workspace_controller=mock.Mock(
       spec=workspace_controller.WorkspaceController
@@ -4185,6 +4359,51 @@ async def test_close_restored_folder_preserves_files_and_persists_closure(
 
 
 @pytest.mark.asyncio
+async def test_same_directory_tabs_resume_their_own_conversations(
+  tmp_path: pathlib.Path,
+) -> None:
+  database = tmp_path / 'cli.db'
+  factory = _AgentFactory()
+  controller = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='high',
+    create_agent=factory,
+    database=database,
+    is_trusted_directory=lambda _: True,
+  )
+  source = controller.list_workspaces(tmp_path).workspaces[0]
+  first = await controller.open_folder(source.id, tmp_path, name='first')
+  second = await controller.open_folder(source.id, tmp_path, name='second')
+  controller.save_conversation(factory.agents[1], 'first-conversation')
+  controller.save_conversation(factory.agents[2], 'second-conversation')
+  controller.save_conversation(factory.agents[1], 'rewound-first')
+  await controller.close()
+
+  restored = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='high',
+    create_agent=_AgentFactory(),
+    database=database,
+    continue_recent=True,
+    is_trusted_directory=lambda _: True,
+  )
+  try:
+    first_agent = restored.inspect_workspace(
+      source.id, first.id
+    ).workspace.agent
+    second_agent = restored.inspect_workspace(
+      source.id, second.id
+    ).workspace.agent
+    assert first_agent.conversation_id == 'rewound-first'
+    assert second_agent.conversation_id == 'second-conversation'
+    assert first_agent.state is actions.WorktreeAgentState.SAVED
+  finally:
+    await restored.close()
+
+
+@pytest.mark.asyncio
 async def test_open_folder_validation_and_trust(tmp_path: pathlib.Path) -> None:
   factory = _AgentFactory()
   controller = workspace_controller.WorkspaceController(
@@ -4873,7 +5092,13 @@ async def test_workspace_picker_creates_normal_workspace_and_remembers_kind(
   )
   try:
     picker = controller.new_workspace_selector()
-    assert [choice.label for choice in picker.choices] == ['Normal', 'Worktree']
+    assert [choice.label for choice in picker.choices] == [
+      'Working directory',
+      'New working directory',
+      'Worktree',
+      'Local sandbox',
+    ]
+    assert picker.numbered
     assert picker.selected == 'normal'
     identity = await controller.create_workspace('normal')
     assert await controller.select_workspace(identity)
@@ -4931,8 +5156,20 @@ async def test_workspace_picker_returns_before_worktree_creation_finishes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('key', 'value', 'effect'),
+  [
+    ('1', 'normal', effects.CreateWorkspace('normal')),
+    ('2', 'folder', effects.SetComposerText('/folder ')),
+    ('3', 'worktree', effects.CreateWorkspace('worktree')),
+    ('4', 'sandbox', effects.CreateSandboxWorkspace(None)),
+  ],
+)
 async def test_workspace_picker_navigation_and_cancellation_preserve_draft(
   tmp_path: pathlib.Path,
+  key: str,
+  value: str,
+  effect: effects.Effect,
 ) -> None:
   settings = config.Config(tmp_path / 'config.json')
   settings.update(
@@ -4955,14 +5192,14 @@ async def test_workspace_picker_navigation_and_cancellation_preserve_draft(
     composer=actions.ComposerState('keep my draft', 4),
   )
   try:
-    opened, _ = reducer.reduce(
-      current, actions.OpenSelector(controller.new_workspace_selector())
-    )
+    picker = controller.new_workspace_selector()
+    opened, emitted = reducer.reduce(current, actions.OpenSelector(picker))
+    assert emitted == (effects.SyncSelectorInput(True, ''),)
     choice = opened.selector.selected_choice()
     assert choice is not None and choice.value == 'worktree'
     moved, _ = reducer.reduce(opened, actions.MoveSelection(-1))
     choice = moved.selector.selected_choice()
-    assert choice is not None and choice.value == 'normal'
+    assert choice is not None and choice.value == 'folder'
     moved, _ = reducer.reduce(moved, actions.MoveSelection(1))
     _, emitted = reducer.reduce(moved, actions.AcceptSelection())
     assert emitted == (effects.AcceptSelection(),)
@@ -4971,7 +5208,23 @@ async def test_workspace_picker_navigation_and_cancellation_preserve_draft(
     assert controller.new_workspace_selector().on_select(choice.value) == (
       actions.CreateWorkspace('worktree')
     )
-    cancelled, _ = reducer.reduce(opened, actions.CloseSelector())
+    bindings = keymap.defaults(
+      opened,
+      completion_visible=False,
+      modal_active=True,
+      can_focus_tasks=False,
+    )
+    action = next(
+      binding.action for binding in bindings if binding.keys == (key,)
+    )
+    accepted, emitted = reducer.reduce(opened, action)
+    assert emitted == (effects.AcceptSelection(),)
+    choice = accepted.selector.selected_choice()
+    assert choice is not None and choice.value == value
+    _, emitted = reducer.reduce(accepted, picker.on_select(choice.value))
+    assert emitted == (effect,)
+    cancelled, emitted = reducer.reduce(opened, actions.CloseSelector())
+    assert emitted == (effects.SyncSelectorInput(False, ''),)
     assert not cancelled.selector.active
     assert cancelled.composer == current.composer
     assert len(controller.workspaces) == 1

@@ -1,3 +1,8 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use crate::Inbox;
 use crate::Store;
 use crate::StoreError;
 use mirror_protocol::agent_message;
@@ -30,6 +35,7 @@ pub struct ReactContext {
     events: mpsc::UnboundedSender<AgentEvent>,
     pending: mpsc::UnboundedReceiver<AgentMessage>,
     pending_sender: ReactContextInput,
+    inbox: Option<Arc<dyn Inbox>>,
     execution: ExecutionContext,
     hooks: Vec<Box<dyn ContextHooks>>,
 }
@@ -37,6 +43,7 @@ pub struct ReactContext {
 #[derive(Clone)]
 pub struct ReactContextInput {
     sender: mpsc::UnboundedSender<AgentMessage>,
+    doorbell: Arc<AtomicBool>,
 }
 
 impl ReactContextInput {
@@ -44,6 +51,18 @@ impl ReactContextInput {
         self.sender
             .send(message)
             .map_err(|_| ReactContextError::Closed)
+    }
+
+    pub fn ring(&self) {
+        self.doorbell.store(true, Ordering::Release);
+    }
+
+    fn answer(&self) -> bool {
+        self.doorbell.swap(false, Ordering::AcqRel)
+    }
+
+    fn rung(&self) -> bool {
+        self.doorbell.load(Ordering::Acquire)
     }
 }
 
@@ -56,6 +75,7 @@ impl ReactContext {
     ) -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
         let (events, event_receiver) = mpsc::unbounded_channel();
         let (pending_sender, pending) = mpsc::unbounded_channel();
+        let inbox = store.inbox();
         (
             Self {
                 session_id: session_id.into(),
@@ -66,7 +86,9 @@ impl ReactContext {
                 pending,
                 pending_sender: ReactContextInput {
                     sender: pending_sender,
+                    doorbell: Arc::new(AtomicBool::new(false)),
                 },
+                inbox,
                 execution,
                 hooks: Vec::new(),
             },
@@ -159,8 +181,16 @@ impl ReactContext {
         self.pending_sender.clone()
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn inbox(&self) -> Option<Arc<dyn Inbox>> {
+        self.inbox.clone()
+    }
+
     pub(crate) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || self.pending_sender.rung()
     }
 
     pub fn flush_pending(&mut self) -> Vec<AgentMessage> {
@@ -169,6 +199,23 @@ impl ReactContext {
             pending.push(message);
         }
         pending
+    }
+
+    pub async fn take_pending(&mut self) -> Result<Vec<AgentMessage>, ReactContextError> {
+        self.pending_sender.answer();
+        let inputs = match &self.inbox {
+            Some(inbox) => match inbox.take(&self.session_id).await {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    self.pending_sender.ring();
+                    return Err(error.into());
+                }
+            },
+            None => Vec::new(),
+        };
+        let mut pending = self.flush_pending();
+        pending.extend(inputs);
+        Ok(pending)
     }
 
     /// Commit `event`'s entries, then whatever the hooks add after them,
@@ -227,6 +274,14 @@ impl ReactContext {
                 "conversation append failed; reopen the session before writing".to_string(),
             )
             .into());
+        }
+        let mut turn_id = self
+            .entries
+            .last()
+            .and_then(|entry| entry.turn_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        for entry in entries.iter_mut() {
+            turn_id = entry.turn_id.get_or_insert(turn_id).clone();
         }
         if let Err(error) = self
             .store

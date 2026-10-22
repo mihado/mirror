@@ -42,7 +42,7 @@ pub struct BashTool {
 
 /// Captured process streams, independent of any tool's model-facing format.
 #[derive(Debug, Default)]
-pub(super) struct BashOutput {
+pub(crate) struct BashOutput {
     pub return_code: i32,
     pub stdout: CapturedStream,
     pub stderr: CapturedStream,
@@ -52,9 +52,9 @@ pub(super) struct BashOutput {
 }
 
 const PREVIEW_CHARS: usize = 2_000;
-pub(super) const MAX_OUTPUT_CHARS: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_OUTPUT_CHARS: usize = 64 * 1024 * 1024;
 const MAX_PARTIAL_OUTPUT_CHARS: usize = 2 * RAW_END_CHARS;
-pub(super) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(3);
 const SPILL_THRESHOLD_CHARS: usize = 30_000;
 const SPILL_DIR: &str = "/tmp/tool-results";
 
@@ -208,13 +208,13 @@ pub struct BashArgs {
 
 /// How long a command runs before it is stopped, unless the host sets another
 /// limit.
-pub(super) const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_mins(10);
+pub(crate) const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_mins(10);
 
 fn default_timeout_seconds() -> f64 {
     DEFAULT_BASH_TIMEOUT.as_secs_f64()
 }
 
-pub(super) fn validate_timeout(seconds: f64) -> Result<Duration, ToolError> {
+pub(crate) fn validate_timeout(seconds: f64) -> Result<Duration, ToolError> {
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(ToolError::InvalidArguments(
             "timeout_seconds must be finite and greater than zero".to_string(),
@@ -228,7 +228,7 @@ pub(super) fn validate_timeout(seconds: f64) -> Result<Duration, ToolError> {
 }
 
 /// The patterns `annotate_sandbox_errors` looks for in stderr.
-pub(super) fn sandbox_error_needles() -> Vec<&'static str> {
+pub(crate) fn sandbox_error_needles() -> Vec<&'static str> {
     SANDBOX_ERROR_PATTERNS
         .iter()
         .map(|(pattern, _)| *pattern)
@@ -238,7 +238,7 @@ pub(super) fn sandbox_error_needles() -> Vec<&'static str> {
 /// Variables set for every command so captured output carries no ANSI colour
 /// or interactive pager. Output already goes to a pipe, so this mainly changes
 /// what terminal-control commands such as `clear` and `tput` print.
-pub(super) const COMMAND_ENVIRONMENT: [(&str, &str); 6] = [
+pub(crate) const COMMAND_ENVIRONMENT: [(&str, &str); 6] = [
     ("TERM", "dumb"),
     ("NO_COLOR", "1"),
     ("COLORTERM", ""),
@@ -247,11 +247,15 @@ pub(super) const COMMAND_ENVIRONMENT: [(&str, &str); 6] = [
     ("GH_PAGER", "cat"),
 ];
 
-pub(super) const REMOVED_ENVIRONMENT: [&str; 4] = [
+pub(crate) const REMOVED_ENVIRONMENT: [&str; 8] = [
     "REFLECTION_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "FIRECRAWL_API_KEY",
+    "YOU_API_KEY",
+    "TAVILY_API_KEY",
 ];
 
 async fn run_command(
@@ -284,11 +288,12 @@ async fn format_result(mut output: BashOutput, command: String) -> Result<ToolOu
         success,
         touched: Vec::new(),
         exit_code,
+        duration: None,
     })
 }
 
 /// Apply Bash policy once, regardless of where the process ran.
-pub(super) async fn format_unspilled(
+pub(crate) async fn format_unspilled(
     mut output: BashOutput,
     command: String,
 ) -> Result<(ToolOutput, Duration), ToolError> {
@@ -313,6 +318,7 @@ pub(super) async fn format_unspilled(
             success,
             touched: Vec::new(),
             exit_code,
+            duration: None,
         },
         elapsed,
     ))
@@ -327,7 +333,7 @@ fn format_body(output: &mut BashOutput, command: &str) -> std::io::Result<String
 }
 
 /// Append the model-facing wall-time suffix.
-pub(super) fn append_duration(output: String, elapsed: Duration) -> String {
+pub(crate) fn append_duration(output: String, elapsed: Duration) -> String {
     append_line(
         output,
         &format!("[Completed in {:.1}s]", elapsed.as_secs_f64()),
@@ -517,23 +523,23 @@ fn maybe_spill(output: String) -> String {
     format_spill(&output, result)
 }
 
-pub(super) fn spill_path() -> PathBuf {
+pub(crate) fn spill_path() -> PathBuf {
     Path::new(SPILL_DIR).join(format!("{}.txt", uuid::Uuid::new_v4().simple()))
 }
 
-pub(super) fn spill_error(error: ToolError) -> String {
+pub(crate) fn spill_error(error: ToolError) -> String {
     match error {
         ToolError::Execution(message) => message,
         error => error.to_string(),
     }
 }
 
-pub(super) fn needs_spill(output: &str) -> bool {
+pub(crate) fn needs_spill(output: &str) -> bool {
     output.chars().count() > SPILL_THRESHOLD_CHARS
 }
 
 /// Use the same preview, character budgets, and error wording for either filesystem.
-pub(super) fn format_spill(output: &str, result: Result<PathBuf, String>) -> String {
+pub(crate) fn format_spill(output: &str, result: Result<PathBuf, String>) -> String {
     let output_chars = output.chars().count();
     match result {
         Ok(path) => format!(

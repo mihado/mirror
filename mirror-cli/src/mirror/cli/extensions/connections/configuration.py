@@ -110,10 +110,20 @@ def _read_json(path: pathlib.Path) -> dict[str, Any]:
 
 def load_servers() -> dict[str, dict[str, Any]]:
   """Load and minimally validate all configured MCP servers."""
+  return _scan_servers()[0]
+
+
+def invalid_servers() -> list[str]:
+  """Why each server file that load_servers() skipped was ignored."""
+  return _scan_servers()[1]
+
+
+def _scan_servers() -> tuple[dict[str, dict[str, Any]], list[str]]:
   directory = config_dir()
-  if not directory.exists():
-    return {}
   servers: dict[str, dict[str, Any]] = {}
+  invalid: list[str] = []
+  if not directory.exists():
+    return servers, invalid
   for path in sorted(directory.glob('*.json')):
     try:
       name = path.stem
@@ -127,9 +137,11 @@ def load_servers() -> dict[str, dict[str, Any]]:
         )
     except (OSError, UnicodeError, ValueError) as error:
       _LOGGER.warning('Ignoring invalid MCP server configuration: %s', error)
+      reason = str(error)
+      invalid.append(reason if str(path) in reason else f'{path}: {reason}')
       continue
     servers[name] = config
-  return servers
+  return servers, invalid
 
 
 def add_server(server: CatalogServer) -> pathlib.Path:

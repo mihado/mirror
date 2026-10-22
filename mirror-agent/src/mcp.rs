@@ -10,8 +10,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use crate::tools::{
-    validate_tools, AnyTool, DirectToolExecutor, ToolDefinition, ToolError, ToolExecutor,
-    ToolOutput,
+    validate_tools, AnyTool, DirectToolExecutor, RemoteToolExecutor, ToolDefinition, ToolError,
+    ToolExecutor, ToolOutput,
 };
 use crate::ExecutionContext;
 
@@ -74,7 +74,7 @@ const MANIFEST_BYTES: usize = 256;
 const RESPONSE_BYTES: usize = 32_768;
 const MAX_NAME_BYTES: usize = 128;
 
-/// Register the three MCP tools when discovery yielded capabilities.
+/// Register MCP tools bound to their configured routers, independent of the workspace.
 pub fn mcp_tools(tools: Vec<Arc<McpTool>>) -> Result<Vec<Arc<dyn AnyTool>>, ToolError> {
     if tools.is_empty() {
         return Ok(Vec::new());
@@ -98,6 +98,19 @@ impl AnyTool for McpSearch {
 
     fn needs_approval(&self) -> bool {
         false
+    }
+
+    fn supports_remote(&self) -> bool {
+        true
+    }
+
+    fn execute_remote<'a>(
+        &'a self,
+        arguments: &'a str,
+        context: &'a ExecutionContext,
+        _remote: &'a RemoteToolExecutor,
+    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
+        self.execute(arguments, context)
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -166,6 +179,19 @@ impl AnyTool for McpDescribe {
         false
     }
 
+    fn supports_remote(&self) -> bool {
+        true
+    }
+
+    fn execute_remote<'a>(
+        &'a self,
+        arguments: &'a str,
+        context: &'a ExecutionContext,
+        _remote: &'a RemoteToolExecutor,
+    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
+        self.execute(arguments, context)
+    }
+
     fn definition(&self) -> ToolDefinition {
         definition(
             self.name(),
@@ -219,6 +245,19 @@ impl AnyTool for McpCall {
 
     fn needs_approval(&self) -> bool {
         false
+    }
+
+    fn supports_remote(&self) -> bool {
+        true
+    }
+
+    fn execute_remote<'a>(
+        &'a self,
+        arguments: &'a str,
+        context: &'a ExecutionContext,
+        _remote: &'a RemoteToolExecutor,
+    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
+        self.execute(arguments, context)
     }
 
     fn definition(&self) -> ToolDefinition {

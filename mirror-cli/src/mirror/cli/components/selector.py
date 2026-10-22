@@ -9,7 +9,6 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.key_binding import key_bindings, key_processor
 from prompt_toolkit.layout import containers, controls, dimension, processors
 from prompt_toolkit.utils import get_cwidth
-
 from rich import cells, console, text
 
 from mirror.cli import rendering, selection, state, themes
@@ -53,16 +52,22 @@ def _label_suffix(label: str, width: int) -> str:
 
 
 def height(
-  menu_state: state.MenuState, choices: Sequence[selection.Choice]
+  menu_state: state.MenuState,
+  choices: Sequence[selection.Choice],
+  *,
+  pinned_count: int = 0,
 ) -> int:
-  view = _MENU.view(menu_state, choices)
+  scrolling = choices[:-pinned_count] if pinned_count else choices
+  view = _MENU.view(menu_state, scrolling)
   headings = sum(
     bool(choice.section)
     and (index == view.start or choice.section != choices[index - 1].section)
     for index, choice in enumerate(view.visible, view.start)
   )
   return (
-    _MENU.height(menu_state, choices, show_empty=menu_state.active) + headings
+    _MENU.height(menu_state, scrolling, show_empty=menu_state.active)
+    + headings
+    + pinned_count
   )
 
 
@@ -77,6 +82,7 @@ def render_choices(
   header_suffix: str | None = None,
   min_rows: int = 0,
   numbered: bool = False,
+  pinned_count: int = 0,
   width: int | None = None,
   stacked: bool = False,
   wrap_details: bool = False,
@@ -85,7 +91,9 @@ def render_choices(
 ) -> StyleAndTextTuples:
   row_budget = menu_state.max_rows
   wrapping_console = console.Console() if wrap_details else None
-  view = _MENU.view(menu_state, choices)
+  scrolling = choices[:-pinned_count] if pinned_count else choices
+  numbered_from = len(scrolling) if pinned_count else 0
+  view = _MENU.view(menu_state, scrolling)
   label_width = max((get_cwidth(choice.label) for choice in choices), default=0)
   if width is not None:
     label_width = min(
@@ -112,15 +120,26 @@ def render_choices(
   def row(
     choice: selection.Choice, index: int, selected: bool
   ) -> StyleAndTextTuples:
+    if pinned_count:
+      selected = index == min(menu_state.selected, len(choices) - 1)
     style = 'class:menu-selected' if selected else 'class:menu-item'
     label = choice.label
-    if get_cwidth(label) > label_width:
+    row_label_width = label_width
+    if (
+      numbered
+      and numbered_from <= index < numbered_from + 9
+      and width is not None
+    ):
+      row_label_width = max(
+        label_width, min(get_cwidth(label), max(0, width - 7))
+      )
+    if get_cwidth(label) > row_label_width:
       if truncate_labels_from_start:
-        label = '…' + _label_suffix(label, label_width - 1)
+        label = '…' + _label_suffix(label, row_label_width - 1)
       else:
         label = (
           formatted_text.fragment_list_to_text(
-            menu.fit_line([('', label)], max(0, label_width - 1))
+            menu.fit_line([('', label)], max(0, row_label_width - 1))
           )
           + '…'
         )
@@ -148,7 +167,12 @@ def render_choices(
     fragments = [
       (style, '› ' if selected else '  '),
       (style, ('* ' if choice.value == current else '  ') if current else ''),
-      (style, f'{index + 1}. ' if numbered and index < 9 else ''),
+      (
+        style,
+        f'{index - numbered_from + 1}. '
+        if numbered and numbered_from <= index < numbered_from + 9
+        else '',
+      ),
       *prefix,
       *highlight(label, label_query, style),
       *status,
@@ -161,8 +185,17 @@ def render_choices(
       sum(get_cwidth(fragment[1]) for fragment in fragments) + len(padding) + 2
     )
     detail_width = content_width - detail_column
-    if wrapping_console is not None and not stacked and detail_width >= 2:
+    if (
+      wrapping_console is not None
+      and not stacked
+      and detail_width >= 2
+      and index < len(scrolling)
+    ):
       lines = text.Text(detail).wrap(wrapping_console, detail_width)
+      # A long detail must not push fixed actions outside the viewport.
+      if pinned_count and len(lines) > row_budget:
+        lines = lines[:row_budget]
+        lines[-1] = text.Text('…' + _label_suffix(detail, detail_width - 1))
       detail = ('\n' + ' ' * detail_column).join(line.plain for line in lines)
     fragments.extend((
       *highlight(
@@ -210,16 +243,22 @@ def render_choices(
     menu_state = dataclasses.replace(
       menu_state, max_rows=menu_state.max_rows - 1
     )
-    view = _MENU.view(menu_state, choices)
+    view = _MENU.view(menu_state, scrolling)
 
   fragments = _MENU.render(
     menu_state,
-    choices,
+    scrolling,
     row,
     title=title,
     header_suffix=header_suffix,
     empty_row=[('class:menu-item', empty)],
     min_rows=min_rows,
+    pinned_rows=tuple(
+      row(choice, index, index == menu_state.selected)
+      for index, choice in enumerate(
+        choices[len(scrolling) :], start=len(scrolling)
+      )
+    ),
     footer=footer
     or (
       '1–9 to select · ↑↓/Enter · Esc to cancel'
@@ -241,6 +280,10 @@ def render_choices(
 
 class Selector(component.Component):
   """The single selector component used by core features and extensions."""
+
+  @override
+  def cache_key(self, state: state.State) -> object | None:
+    return () if state.selector.selector is None else None
 
   def __init__(self, get_max_height: Callable[[], int] | None = None) -> None:
     self._get_max_height = get_max_height
@@ -282,12 +325,16 @@ class Selector(component.Component):
       menu_state = dataclasses.replace(
         menu_state,
         max_rows=max(
-          1, min(menu_state.max_rows, limit - (4 if has_header else 3))
+          1,
+          min(
+            menu_state.max_rows,
+            limit - (4 if has_header else 3) - request.pinned_count,
+          ),
         ),
       )
       # Section headings share the bounded viewport with selectable rows.
       while menu_state.max_rows > 1 and height(
-        menu_state, choices
+        menu_state, choices, pinned_count=request.pinned_count
       ) + 1 > limit - int(has_header):
         menu_state = dataclasses.replace(
           menu_state, max_rows=menu_state.max_rows - 1
@@ -301,9 +348,11 @@ class Selector(component.Component):
       current=request.current,
       empty='' if request.loading else empty,
       stacked=is_resume,
+      wrap_details=request.wrap_details,
       footer='Tab scope · Enter · Esc' if is_resume else None,
       min_rows=min_rows,
       numbered=request.numbered,
+      pinned_count=request.pinned_count,
       width=state.layout.columns,
       truncate_labels_from_start=request.truncate_labels_from_start,
     )

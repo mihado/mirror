@@ -46,6 +46,7 @@ fn provider(auth_path: &Path) -> CodexResponses {
             base_url: Some("http://test/backend-api/codex".to_string()),
             auth_path: Some(auth_path.to_path_buf()),
             prompt_cache_key: "session-1".to_string(),
+            websocket: None,
         },
         super::super::http_client(None).expect("test HTTP client configuration is valid"),
     )
@@ -301,6 +302,7 @@ async fn revoked_authority_prevents_the_codex_retry_from_reaching_the_server() {
             base_url: Some(server.base_url.clone()),
             auth_path: Some(auth.0.clone()),
             prompt_cache_key: "session-1".to_string(),
+            websocket: None,
         },
         super::super::http_client(None).expect("HTTP client"),
     )

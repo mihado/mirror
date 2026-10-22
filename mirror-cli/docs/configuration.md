@@ -102,9 +102,11 @@ Approval is not filesystem or network isolation.
 - Ctrl+C: dismiss modal → clear draft → interrupt work → exit if idle.
 - Escape: dismiss UI or interrupt work.
 - Ctrl+D: quit immediately.
-- Ctrl+N: choose **Normal** (a new workspace in the current directory) or
-  **Worktree** (an isolated checkout), then press Enter. Use Up/Down to choose
-  and Escape to cancel. The previous choice is remembered across launches.
+- Ctrl+N: **1** Working directory · **2** New working directory ·
+  **3** Worktree · **4** Local sandbox.
+  - New working directory: complete `/folder <path>`.
+  - Up/Down + Enter: select · Escape: cancel.
+  - Working directory/Worktree choice persists.
 
 Create `~/.mirror/keybindings.json` and restart the CLI. Each entry replaces
 one action's shortcuts; omitted actions keep their defaults and `[]` disables

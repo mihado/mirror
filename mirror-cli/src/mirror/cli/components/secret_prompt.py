@@ -16,6 +16,10 @@ class SecretPrompt(component.Component):
   """The masked prompt's title, character count, and keys."""
 
   @override
+  def cache_key(self, state: state.State) -> object:
+    return state.secret
+
+  @override
   def render(self, state: state.State) -> containers.AnyContainer:
     request = state.secret.request
     if request is None:

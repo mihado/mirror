@@ -463,6 +463,61 @@ async fn view_of_a_deep_lineage_is_dense_and_excludes_abandoned_rows() {
 }
 
 #[tokio::test]
+async fn workspace_fork_commits_its_record_and_lineage_together() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = directory.path().join("react.db");
+    let mut store = open(&database, "parent", directory.path(), true);
+    let mut entries = [
+        identified("before", "inherited"),
+        identified("after", "excluded"),
+    ];
+    store
+        .append("parent", 0, &mut entries)
+        .await
+        .expect("seed parent");
+    let connection = Connection::open(&database).expect("database");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_child_entry BEFORE INSERT ON react_entry
+         WHEN NEW.session_id = 'child' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .expect("inject entry failure");
+
+    assert_matches!(
+        SQLiteStore::fork_at_head(&database, "parent", 1, "child", directory.path()),
+        Err(StoreError::Persistence(_))
+    );
+    assert_matches!(
+        store.load("child", true).await,
+        Err(StoreError::SessionNotFound { .. })
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_child_entry")
+        .expect("allow writes");
+    SQLiteStore::fork_at_head(&database, "parent", 1, "child", directory.path()).expect("fork");
+    let child = store.load("child", true).await.expect("child history");
+    assert_eq!(child.len(), 2);
+    assert_eq!(child[0], entries[0]);
+    assert_eq!(child[1].sequence, Some(2));
+    assert_matches!(&child[1].payload, Some(agent_message::Payload::Fork(record)) if record.inherited_sequence == 1);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM react_entry WHERE session_id = 'child'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("own rows"),
+        1,
+        "the inherited prefix is referenced, not copied"
+    );
+    assert_eq!(
+        store.load("parent", true).await.expect("parent history"),
+        entries
+    );
+}
+
+#[tokio::test]
 async fn deleting_a_parent_with_a_child_is_refused() {
     let directory = tempfile::tempdir().expect("directory");
     let database = directory.path().join("react.db");
@@ -1016,6 +1071,10 @@ async fn malformed_lineage_does_not_create_a_child() {
         .expect("simulate malformed persisted lineage");
     assert_matches!(
         SQLiteStore::fork(&database, "parent", "user", "child"),
+        Err(StoreError::Persistence(_))
+    );
+    assert_matches!(
+        SQLiteStore::fork_at_head(&database, "parent", 1, "child", directory.path()),
         Err(StoreError::Persistence(_))
     );
     assert_matches!(

@@ -25,23 +25,44 @@ class StatusBar(component.Component):
     self._extension_right = extension_right
 
   @override
+  def cache_key(self, state: _state.State) -> object | None:
+    left = self._extension_left.cache_key(state)
+    right = self._extension_right.cache_key(state)
+    if left is None or right is None:
+      return None
+    return (
+      state.status_bar.model,
+      state.status_bar.reasoning_effort,
+      state.status_bar.approval_mode,
+      state.session.pending_switch,
+      state.session.read_only,
+      left,
+      right,
+    )
+
+  @override
   def render(self, state: _state.State) -> containers.AnyContainer:
     """Render the complete status-bar layout from application state."""
-    return layout.Columns([
-      containers.Window(
-        controls.FormattedTextControl(fragments(state)),
-        style='class:footer',
-        dont_extend_height=True,
-        dont_extend_width=True,
-      ),
-      self._extension_left.render(state),
-      containers.Window(),
-      self._extension_right.render(state),
-    ])
+    return layout.Columns(
+      [
+        containers.Window(
+          controls.FormattedTextControl(fragments(state)),
+          style='class:footer',
+          dont_extend_height=True,
+          dont_extend_width=True,
+        ),
+        self._extension_left.render(state),
+        containers.Window(),
+        self._extension_right.render(state),
+      ],
+      retain=self.cache_key(state) is not None,
+    )
 
 
 def fragments(state: _state.State) -> _StyleAndTextTuples:
   """Render model and approval settings as status-bar fragments."""
+  if state.session.read_only:
+    return [('class:footer', ' Read-only · Esc parent · PgUp/PgDn scroll ')]
   if state.session.pending_switch is not None:
     return []
   approval = (

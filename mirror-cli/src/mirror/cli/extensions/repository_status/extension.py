@@ -12,6 +12,7 @@ from typing import cast, override
 from prompt_toolkit.layout import containers, controls
 
 from mirror.cli import actions, effects, extension, shell, state
+from mirror.cli.components import layout
 
 _REFRESH_DEBOUNCE = 0.2
 _GIT_REFRESH_INTERVAL = 10
@@ -285,6 +286,13 @@ class RepositoryStatusExtension(
         self.dispatch(context, StatusChanged(observed))
 
   @override
+  def cache_key(
+    self, global_state: state.State, extension_state: _RepositoryStatusState
+  ) -> object:
+    del global_state
+    return extension_state
+
+  @override
   def render(
     self,
     global_state: state.State,
@@ -308,30 +316,33 @@ class RepositoryStatusExtension(
     system = (
       '' if extension_state.system == 'jj' else f'{extension_state.system} '
     )
-    return containers.VSplit([
-      containers.Window(
-        controls.FormattedTextControl([
-          (
-            'class:footer',
-            f'   {system}{extension_state.revision}{bookmarks} ',
-          )
-        ]),
-        height=1,
-        dont_extend_width=True,
-      ),
-      containers.Window(),
-      containers.Window(
-        controls.FormattedTextControl([
-          (
-            'class:footer',
-            f'{extension_state.changes} {changes} · ',
-          ),
-          ('class:ui.success', f'+{extension_state.additions}'),
-          ('class:footer', '/'),
-          ('class:ui.error', f'-{extension_state.deletions} '),
-        ]),
-        height=1,
-        align=containers.WindowAlign.RIGHT,
-        dont_extend_width=True,
-      ),
-    ])
+    return layout.Columns(
+      [
+        containers.Window(
+          controls.FormattedTextControl([
+            (
+              'class:footer',
+              f'   {system}{extension_state.revision}{bookmarks} ',
+            )
+          ]),
+          height=1,
+          dont_extend_width=True,
+        ),
+        containers.Window(),
+        containers.Window(
+          controls.FormattedTextControl([
+            (
+              'class:footer',
+              f'{extension_state.changes} {changes} · ',
+            ),
+            ('class:ui.success', f'+{extension_state.additions}'),
+            ('class:footer', '/'),
+            ('class:ui.error', f'-{extension_state.deletions} '),
+          ]),
+          height=1,
+          align=containers.WindowAlign.RIGHT,
+          dont_extend_width=True,
+        ),
+      ],
+      retain=True,
+    )

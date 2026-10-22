@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 
 import pytest
 
@@ -176,7 +177,7 @@ async def test_polling_keeps_last_good_config_through_invalid_edits(
     with pytest.raises(TimeoutError):
       await asyncio.wait_for(updates.get(), 0.1)
     assert 'Ignoring invalid config' in caplog.text
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(ValueError, match='invalid JSON'):
       settings.set_extension('clock', False)
     assert path.read_text() == '{"extensions":'
     path.write_text('{"extensions":{"clock":{"enabled":false}}}')
@@ -224,7 +225,9 @@ def test_bad_extensions_section_is_ignored(extensions: object) -> None:
 def test_invalid_config_is_not_overwritten(tmp_path: pathlib.Path) -> None:
   path = tmp_path / 'config.json'
   path.write_text('not json')
-  with pytest.raises(json.JSONDecodeError):
+  with pytest.raises(
+    ValueError, match=f'^{re.escape(str(path))}: invalid JSON'
+  ):
     config.Config(path).set_extension('clock', True)
   assert path.read_text() == 'not json'
 

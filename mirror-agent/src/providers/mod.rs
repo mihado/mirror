@@ -11,6 +11,7 @@ mod protobuf_serde;
 mod reasoning_effort;
 mod reflection;
 mod responses;
+mod responses_websocket;
 
 pub use anthropic_messages::*;
 pub use chat_completions::*;
@@ -24,3 +25,4 @@ pub use model_provider::*;
 pub use reasoning_effort::*;
 pub use reflection::*;
 pub use responses::*;
+pub use responses_websocket::*;

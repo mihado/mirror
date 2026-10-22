@@ -86,12 +86,14 @@ class Keymap:
     dispatch: Callable[[actions.Action], object],
     *,
     dismiss: Callable[[], actions.Action | None],
+    on_escape_interrupt: Callable[[], None] | None = None,
     remappings: Sequence[Remapping] = (),
     enabled: filters.FilterOrBool = True,
   ) -> None:
     self._layers = layers
     self._dispatch = dispatch
     self._dismiss = dismiss
+    self._on_escape_interrupt = on_escape_interrupt
     self._remappings = tuple(remappings)
     self._enabled = filters.to_filter(enabled)
     self._snapshot: tuple[Binding, ...] | None = None
@@ -204,6 +206,8 @@ class Keymap:
     action = self._dismiss()
     if action is None and self._interrupt_on_escape:
       action = actions.InterruptRequested()
+      if self._on_escape_interrupt is not None:
+        self._on_escape_interrupt()
     self._invoke(action, event)
 
   def _invoke(
@@ -221,6 +225,8 @@ def dismissal_action(
   rewind_escape_active: bool,
 ) -> actions.Action | None:
   """Return the internal Escape action for the current UI, if any."""
+  if current.session.read_only:
+    return actions.CloseInspection()
   if rewind_escape_active:
     return actions.CloseSelector()
   if current.resume.confirmation is not None:
@@ -289,6 +295,15 @@ def defaults(
   if can_focus_tasks:
     bindings.append(Binding(('down',), actions.SelectFirstTask()))
   if current.tasks.selected_id is not None:
+    if (
+      owned_history
+      and not current.session.remote
+      and any(
+        task.id == current.tasks.selected_id and task.inspectable
+        for task in current.tasks.tasks
+      )
+    ):
+      bindings.append(Binding(('enter',), actions.InspectSelectedTask()))
     bindings.extend((
       Binding(('up',), actions.MoveTaskSelection(-1)),
       Binding(('down',), actions.MoveTaskSelection(1)),
@@ -305,6 +320,18 @@ def defaults(
       Binding(('tab',), actions.AcceptSelection()),
       Binding(('c-r',), actions.RequestPromptHistory()),
     ))
+  if current.session.read_only:
+    return (
+      *(
+        binding
+        for binding in bindings
+        if isinstance(binding.action, actions.NavigateHistory)
+      ),
+      Binding(('up',), actions.NavigateHistory('up')),
+      Binding(('down',), actions.NavigateHistory('down')),
+      Binding(('c-c',), actions.CloseInspection()),
+      Binding(('c-d',), actions.CloseInspection()),
+    )
   return (*bindings, *_picker_bindings(current))
 
 
@@ -333,10 +360,18 @@ def _picker_bindings(current: state.State) -> tuple[Binding, ...]:
       ))
   if current.secret.active:
     bindings.append(Binding(('enter',), actions.SubmitSecret()))
-  if current.selector.numbered:
+  selector = current.selector.selector
+  if current.selector.numbered and selector is not None:
     bindings.extend(
-      Binding((str(index + 1),), actions.AcceptSelection(index))
-      for index in range(min(9, len(current.selector.filtered_choices())))
+      Binding(
+        (str(index + 1),),
+        actions.AcceptSelection(index + selector.numbered_from),
+      )
+      for index in range(
+        min(
+          9, len(current.selector.filtered_choices()) - selector.numbered_from
+        )
+      )
     )
   if current.selector.id == 'resume':
     bindings.append(Binding(('tab',), actions.CycleResumeScope()))

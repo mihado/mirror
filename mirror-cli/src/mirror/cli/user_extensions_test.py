@@ -311,8 +311,8 @@ async def test_change_reports_extension_consent(
   await manager.on_foreground(context)
   opened = dispatched.pop()
   assert isinstance(opened, actions.OpenSelector)
-  request = opened.selector.on_select('enable')
-  assert isinstance(request, actions.ExtensionConsent)
+  request = opened.selector.on_select('approve-all')
+  assert isinstance(request, actions.ExtensionConsentBatch)
   await manager.change(context, request)
   assert analytics.events == _counts(2, 1, 0, 1, 0) + [
     _state('builtin/clock', 'enabled'),

@@ -26,6 +26,7 @@ use super::ModelRequestGuard;
 use super::Reflection;
 use super::ResponsesClient;
 use super::ResponsesConfig;
+use super::ResponsesWebSocket;
 use super::StreamEvent;
 
 /// Immutable provider defaults shared by inference and metadata requests.
@@ -34,6 +35,7 @@ pub struct ModelProvider {
     default_config: ModelProviderConfig,
     client: Client,
     request_guard: Option<Arc<dyn ModelRequestGuard>>,
+    responses_websocket: ResponsesWebSocket,
 }
 
 /// Configuration shared by root agents and subagents.
@@ -69,6 +71,8 @@ pub enum ModelApi {
     Responses,
     ChatCompletions,
     Reflection,
+    /// Gemini Developer API, using Google's OpenAI-compatible endpoint.
+    Gemini,
     AnthropicMessages,
     ChatCompletionsNonStreaming,
 }
@@ -77,6 +81,8 @@ pub enum ModelApi {
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("unsupported model API {0:?}")]
 pub struct ModelApiParseError(String);
+
+pub(super) const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 impl ModelProvider {
     /// Construct reusable provider defaults and validate explicit configuration.
@@ -95,8 +101,10 @@ impl ModelProvider {
         if config.api == ModelApi::CodexResponses {
             CodexResponses::validate_login(config.auth_path.as_deref())?;
         }
+        let client = super::http_client(config.request_timeout)?;
         Ok(Self {
-            client: super::http_client(config.request_timeout)?,
+            responses_websocket: ResponsesWebSocket::spawn(client.clone(), config.request_timeout),
+            client,
             default_config: config,
             request_guard,
         })
@@ -107,6 +115,29 @@ impl ModelProviderConfig {
     /// Resolve the same endpoint and credentials for inference and metadata.
     pub(super) async fn connection(&self) -> Result<(String, String), LlmError> {
         let (base_env, base_default, key_env) = match self.api {
+            ModelApi::Gemini => {
+                if self.model != "gemini-4-argon" {
+                    return Err(LlmError::Request(
+                        "gemini supports gemini-4-argon only; select /model gemini".into(),
+                    ));
+                }
+                if self
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| url.trim_end_matches('/') != GEMINI_BASE_URL)
+                {
+                    return Err(LlmError::Request(
+                    "gemini uses the Gemini Developer API, not Vertex AI or custom endpoints; use openai-chat-completions for a custom endpoint".into(),
+                ));
+                }
+                let key = self.api_key.clone()
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| LlmError::Request(
+                    "set GEMINI_API_KEY from Google AI Studio and restart Mirror; Gemini 4 Argon requires paid API access".into(),
+                ))?;
+                return Ok((GEMINI_BASE_URL.into(), key));
+            }
             ModelApi::CodexResponses => (
                 "MIRROR_CODEX_BASE_URL",
                 super::codex_responses::DEFAULT_BASE_URL,
@@ -225,9 +256,11 @@ impl Llm for ModelProvider {
         let config = self.config_for(request.inference.as_ref());
         let client = self.client.clone();
         let request_guard = self.request_guard.clone();
+        let responses_websocket = self.responses_websocket.clone();
         try_stream! {
             let config = config?;
             let (base_url, api_key) = config.connection().await?;
+            let websocket = ResponsesWebSocket::serves(&base_url).then_some(responses_websocket);
             match config.api {
                 ModelApi::CodexResponses => {
                     let provider = CodexResponses::new(
@@ -236,6 +269,7 @@ impl Llm for ModelProvider {
                             base_url: Some(base_url),
                             auth_path: config.auth_path,
                             prompt_cache_key: config.prompt_cache_key,
+                            websocket,
                         },
                         client,
                     )?;
@@ -252,6 +286,7 @@ impl Llm for ModelProvider {
                             api_key,
                             base_url,
                             prompt_cache_key: Some(config.prompt_cache_key),
+                            websocket,
                         },
                         client,
                     );
@@ -269,7 +304,10 @@ impl Llm for ModelProvider {
                         yield event?;
                     }
                 }
-                ModelApi::ChatCompletions | ModelApi::ChatCompletionsNonStreaming => {
+                ModelApi::ChatCompletions | ModelApi::ChatCompletionsNonStreaming | ModelApi::Gemini => {
+                    if config.api == ModelApi::Gemini {
+                        validate_gemini_request(&request)?;
+                    }
                     let provider = ChatCompletions::new(
                         ChatCompletionsConfig {
                             model: config.model,
@@ -281,7 +319,7 @@ impl Llm for ModelProvider {
                     let stream = provider.stream_guarded(
                         request,
                         request_guard.as_deref(),
-                        config.api == ModelApi::ChatCompletions,
+                        config.api != ModelApi::ChatCompletionsNonStreaming,
                     );
                     pin_mut!(stream);
                     while let Some(event) = stream.next().await {
@@ -305,6 +343,59 @@ impl Llm for ModelProvider {
                 }
             }
         }
+    }
+
+    fn prewarm(&self, request: CompletionRequest) {
+        let Ok(config) = self.config_for(request.inference.as_ref()) else {
+            return;
+        };
+        if !matches!(config.api, ModelApi::Responses | ModelApi::CodexResponses) {
+            return;
+        }
+        let client = self.client.clone();
+        let request_guard = self.request_guard.clone();
+        let websocket = self.responses_websocket.clone();
+        tokio::spawn(async move {
+            let Ok((base_url, api_key)) = config.connection().await else {
+                return;
+            };
+            if !ResponsesWebSocket::serves(&base_url) {
+                return;
+            }
+            let guard = request_guard.as_deref();
+            let _ = match config.api {
+                ModelApi::CodexResponses => {
+                    let provider = CodexResponses::new(
+                        CodexResponsesConfig {
+                            model: config.model,
+                            base_url: Some(base_url),
+                            auth_path: config.auth_path,
+                            prompt_cache_key: config.prompt_cache_key,
+                            websocket: Some(websocket),
+                        },
+                        client,
+                    );
+                    match provider {
+                        Ok(provider) => provider.prewarm(request, guard).await,
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => {
+                    ResponsesClient::new(
+                        ResponsesConfig {
+                            model: config.model,
+                            api_key,
+                            base_url,
+                            prompt_cache_key: Some(config.prompt_cache_key),
+                            websocket: Some(websocket),
+                        },
+                        client,
+                    )
+                    .prewarm(request, guard)
+                    .await
+                }
+            };
+        });
     }
 }
 
@@ -350,6 +441,7 @@ impl FromStr for ModelApi {
             "openai-codex-responses" => Ok(Self::CodexResponses),
             "openai-responses" => Ok(Self::Responses),
             "reflection" => Ok(Self::Reflection),
+            "gemini" => Ok(Self::Gemini),
             "openai-chat-completions" | "openrouter" => Ok(Self::ChatCompletions),
             "anthropic-messages" | "anthropic" => Ok(Self::AnthropicMessages),
             "openai-chat-completions-non-streaming" => Ok(Self::ChatCompletionsNonStreaming),
@@ -358,12 +450,120 @@ impl FromStr for ModelApi {
     }
 }
 
+fn validate_gemini_request(request: &CompletionRequest) -> Result<(), LlmError> {
+    if request
+        .max_tokens
+        .is_some_and(|tokens| tokens == 0 || tokens > 65_536)
+    {
+        return Err(LlmError::Request(
+            "Gemini 4 Argon supports 1..65536 output tokens per stream; long decode is not supported by the OpenAI-compatible API".into(),
+        ));
+    }
+    if let Some(inference) = &request.inference {
+        ModelApi::Gemini.validate_sampling(inference)?;
+        if inference
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|effort| !matches!(effort, "none" | "low" | "medium" | "high"))
+        {
+            return Err(LlmError::Request(
+                "Gemini 4 Argon reasoning effort must be none (provider default), low, medium, or high".into(),
+            ));
+        }
+        if inference
+            .extra_body
+            .as_deref()
+            .is_some_and(|extra| !extra.trim().is_empty())
+        {
+            return Err(LlmError::Request(
+                "gemini does not support extra_body overrides; use openai-chat-completions for custom requests".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn gemini_selection_resolves_its_own_endpoint_and_drops_previous_credentials() {
+        let original = ModelProviderConfig {
+            api: ModelApi::Responses,
+            model: "other-model".into(),
+            api_key: Some("synthetic-other-key".into()),
+            base_url: Some("http://other.invalid".into()),
+            context_window: None,
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+        };
+        let mut selected = original
+            .for_inference(&InferenceConfig {
+                api: Some("gemini".into()),
+                model: "gemini-4-argon".into(),
+                ..Default::default()
+            })
+            .expect("selection");
+        assert_eq!(selected.api_key, None);
+        assert_eq!(selected.base_url, None);
+        selected.api_key = Some("synthetic-gemini-key".into());
+        let provider = ModelProvider::new(selected.clone(), None)
+            .await
+            .expect("provider");
+        assert_eq!(
+            super::super::model_context_window(&provider, &selected).await,
+            1_048_576
+        );
+        assert_eq!(
+            selected.connection().await.expect("connection"),
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                "synthetic-gemini-key".into(),
+            )
+        );
+        selected.base_url = Some("https://other.invalid".into());
+        assert_matches!(selected.connection().await, Err(LlmError::Request(error)) if error.contains("not Vertex AI"));
+        selected.base_url = None;
+        selected.model = "unverified-model".into();
+        assert_matches!(selected.connection().await, Err(LlmError::Request(error)) if error.contains("gemini-4-argon only"));
+    }
+
+    #[test]
+    fn gemini_rejects_unsupported_controls_before_inference() {
+        let mut request = CompletionRequest {
+            messages: vec![],
+            tools: vec![],
+            max_tokens: Some(65_536),
+            inference: Some(InferenceConfig {
+                reasoning_effort: Some("medium".into()),
+                ..Default::default()
+            }),
+        };
+        assert_matches!(validate_gemini_request(&request), Ok(()));
+        request.max_tokens = Some(65_537);
+        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(error)) if error.contains("long decode"));
+        request.max_tokens = None;
+        request.inference = Some(InferenceConfig {
+            reasoning_effort: Some("xhigh".into()),
+            ..Default::default()
+        });
+        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(error)) if error.contains("reasoning effort"));
+        request.inference = Some(InferenceConfig {
+            temperature: Some(0.5),
+            ..Default::default()
+        });
+        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(_)));
+        request.inference = Some(InferenceConfig {
+            extra_body: Some("{}".into()),
+            ..Default::default()
+        });
+        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(error)) if error.contains("extra_body"));
+    }
 
     #[test]
     fn parses_supported_api_names() {

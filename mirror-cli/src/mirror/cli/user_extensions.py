@@ -10,6 +10,9 @@ import json
 import logging
 import os
 import pathlib
+import urllib.parse
+
+from rich import text
 
 from mirror import config, project
 from mirror.cli import (
@@ -72,6 +75,88 @@ def _approval(
   return _Approval(directory, digest.hexdigest())
 
 
+def _approval_prompt(
+  approvals: tuple[tuple[str, _Approval], ...],
+  checked: frozenset[str] = frozenset(),
+  selected: str | None = None,
+) -> actions.OpenSelector:
+  """Populate the shared selector with a fixed review batch and its selection."""
+  home = str(pathlib.Path.home().resolve()) + os.sep
+
+  def display_path(value: str) -> str:
+    return '~/' + value[len(home) :] if value.startswith(home) else value
+
+  def decide(enabled: bool | None) -> actions.ExtensionConsentBatch:
+    return actions.ExtensionConsentBatch(
+      tuple(
+        actions.ExtensionConsent(key, enabled, approval.revision)
+        for key, approval in approvals
+      )
+    )
+
+  def choose(value: str) -> actions.Action:
+    if value == 'approve-all':
+      return decide(True)
+    if value == 'reject-all':
+      return decide(False)
+    if value == 'approve-selected':
+      if checked:
+        return actions.ExtensionConsentBatch(
+          tuple(
+            actions.ExtensionConsent(key, key in checked, approval.revision)
+            for key, approval in approvals
+          )
+        )
+      return actions.ShowText('Select at least one extension first.')
+    return _approval_prompt(approvals, checked ^ {value}, value)
+
+  return actions.OpenSelector(
+    selection.Selector(
+      'extension-approval',
+      'Extensions · Enter selects · Esc skips',
+      (
+        *(
+          selection.Choice(
+            key,
+            approval.directory.name,
+            display_path(str(approval.directory / 'extension.py'))
+            if key == str(approval.directory / 'extension.py')
+            else (
+              f'{display_path(key)} · '
+              f'{display_path(str(approval.directory / "extension.py"))}'
+            ),
+            prefix='●' if key in checked else '○',
+            prefix_style='class:extension-on'
+            if key in checked
+            else 'class:extension-off',
+          )
+          for key, approval in approvals
+        ),
+        selection.Choice('approve-all', 'Approve all'),
+        selection.Choice(
+          'approve-selected',
+          'Approve selected',
+          f'{len(checked)} selected · others disabled'
+          if checked
+          else 'Select at least one first',
+        ),
+        selection.Choice('reject-all', 'Reject all', 'Disable this batch'),
+      ),
+      choose,
+      selected=selected,
+      keep_open=True,
+      numbered=True,
+      pinned_count=3,
+      wrap_details=True,
+      cancel_action=decide(None),
+      header=text.Text(
+        'Extensions run unsandboxed with your privileges. Only approve code you trust.',
+        style='ui.warning',
+      ),
+    )
+  )
+
+
 class UserExtensions:
   """Own extension discovery, settings, consent, and lifecycle management."""
 
@@ -94,6 +179,7 @@ class UserExtensions:
     ).resolve()
     self._sources = extension_sources.Sources(self.root)
     self._cwd = cwd
+    self._launch_directory = (cwd or pathlib.Path.cwd()).resolve()
     self._bundled = bundled.resolve() if bundled is not None else None
     self._config = (
       settings
@@ -104,6 +190,9 @@ class UserExtensions:
     self._apply_lock = asyncio.Lock()
     self._foreground: extension.Context | None = None
     self._pending_approval: dict[str, _Approval] = {}
+    # Extension key -> (folder name, last line of its load error).
+    self._load_errors: dict[str, tuple[str, str]] = {}
+    self._reported_errors: set[str] = set()
 
   def _key(self, directory: pathlib.Path) -> str:
     if key := self._sources.key(directory):
@@ -129,15 +218,20 @@ class UserExtensions:
       roots = []
     else:
       roots.insert(0, self._packaged)
+    settings = self._config.read().get('extensions')
+    local = extension_sources.local_directories(settings)
     found: dict[str, pathlib.Path] = {}
     if roots:
       found.update({
         directory.name: directory
-        for directory in self._sources.directories(
-          self._config.read().get('extensions')
-        ).values()
+        for key, directory in self._sources.directories(settings).items()
+        if key not in local
       })
     for root in roots:
+      if root == self.root:
+        found.update({
+          directory.name: directory for directory in local.values()
+        })
       if root.is_dir():
         for directory in sorted(root.iterdir()):
           if (directory / 'extension.py').is_file():
@@ -164,6 +258,8 @@ class UserExtensions:
       or config.resolve_extension(overrides).enabled is not True
     ):
       return None
+    if overrides.get('source') == 'local':
+      extension_sources.validate_local(directory)
     # Explicit, unversioned config entries retain their existing source-wide trust.
     if overrides.get('enabled') is True and 'consent_revision' not in overrides:
       return None
@@ -258,6 +354,9 @@ class UserExtensions:
       if os.getenv('MIRROR_EXTENSIONS_ENABLED', 'true').lower() == 'true':
         await self._sources.prepare(settings)
       directories = self._directories()
+      for key in self._load_errors.keys() - directories.keys():
+        del self._load_errors[key]
+        self._reported_errors.discard(key)
       previous = self._applied or {}
       loaded_directories = {
         name: self.registry.source_directory(name)
@@ -277,7 +376,14 @@ class UserExtensions:
         try:
           overrides = config.extension_overrides(settings, key)
           resolved = config.resolve_extension(overrides)
-          approval = self._required_approval(directory, overrides)
+          if overrides.get('source') == 'local' and key in self._sources.errors:
+            resolved = dataclasses.replace(
+              resolved,
+              enabled='hidden' if resolved.enabled == 'hidden' else False,
+            )
+            approval = None
+          else:
+            approval = self._required_approval(directory, overrides)
           if approval is None:
             self._resolve_approval(key)
           else:
@@ -288,8 +394,8 @@ class UserExtensions:
               self._queue_approval(key, approval)
             resolved = dataclasses.replace(resolved, enabled=False)
           try:
-            loaded = await self._apply_extension(
-              directory, resolved.enabled is True, overrides
+            loaded = await self._apply_and_record(
+              key, directory, overrides, enabled=resolved.enabled is True
             )
           except extension.ExtensionLoadError:
             loaded = (
@@ -313,13 +419,38 @@ class UserExtensions:
       self._applied = applied
       self._refresh_selector()
       if self._foreground is not None:
+        self._report_faults(self._foreground)
         self._show_approval(self._foreground)
       self._emit_metrics()
 
   async def on_foreground(self, context: extension.Context) -> None:
     self._foreground = context
     self._refresh_selector()
+    self._report_faults(context)
     self._show_approval(context)
+
+  def _report_faults(self, context: extension.Context) -> None:
+    for key, (name, error) in self._load_errors.items():
+      if key not in self._reported_errors:
+        self._reported_errors.add(key)
+        context.dispatch(
+          actions.ShowText(
+            f'Extension {name} failed to load: {error}',
+            style='ui.error',
+          )
+        )
+
+  def _fault(self, key: str, directory: pathlib.Path) -> str | None:
+    if pathlib.Path(key).is_absolute() and key in self._sources.errors:
+      return self._sources.errors[key]
+    if failure := self._load_errors.get(key):
+      return failure[1]
+    for name in self.registry.extension_ids():
+      if self.registry.source_directory(name) == directory:
+        for status in self.registry.statuses(name):
+          if status.error is not None:
+            return status.error
+    return None
 
   async def on_background(self, context: extension.Context) -> None:
     if (
@@ -344,26 +475,7 @@ class UserExtensions:
       return
     if context.get_state().selector.active:
       return
-    key, approval = next(iter(self._pending_approval.items()))
-    directory = approval.directory
-    context.dispatch(
-      actions.OpenSelector(
-        selection.Selector(
-          'extension-approval',
-          f'Enable {directory.name}? Runs unsandboxed code with your permissions. {key}',
-          (
-            selection.Choice('disable', 'Disable', key),
-            selection.Choice('enable', 'Enable', key),
-          ),
-          lambda choice: actions.ExtensionConsent(
-            key, choice == 'enable', approval.revision
-          ),
-          selected='disable',
-          numbered=True,
-          cancel_action=actions.ExtensionConsent(key, None, approval.revision),
-        )
-      )
-    )
+    context.dispatch(_approval_prompt(tuple(self._pending_approval.items())))
 
   def _choices(self) -> dict[str, bool]:
     return (
@@ -383,14 +495,49 @@ class UserExtensions:
     except (OSError, ValueError):
       return False
 
+  def _awaiting_approval(self, key: str, directory: pathlib.Path) -> bool:
+    """Config enables the extension, but its current revision is not approved."""
+    try:
+      overrides = config.extension_overrides(
+        self._config.read().get('extensions'), key
+      )
+      return (
+        overrides.get('enabled') is True
+        and self._required_approval(directory, overrides) is not None
+      )
+    except (OSError, ValueError):
+      return False
+
+  def _choice(
+    self, key: str, directory: pathlib.Path, *, enabled: bool
+  ) -> selection.Choice:
+    """One /extensions row: failed, awaiting approval, on or off."""
+    prefix, detail = ('●' if enabled else '○'), self._detail(key, directory)
+    if fault := self._fault(key, directory):
+      prefix, detail = '!', f'failed: {fault} · {detail}'
+    elif not enabled and self._awaiting_approval(key, directory):
+      prefix, detail = '◐', f'awaiting approval, Enter approves · {detail}'
+    return selection.Choice(
+      key,
+      directory.name,
+      detail,
+      prefix=prefix,
+      prefix_style='class:extension-on' if enabled else 'class:extension-off',
+    )
+
   def _detail(self, key: str, directory: pathlib.Path) -> str:
+    source = f'Local host: {key}' if pathlib.Path(key).is_absolute() else key
     if error := self._sources.errors.get(key):
-      return f'{key} · {error}'
+      return (
+        source if pathlib.Path(key).is_absolute() else f'{source} · {error}'
+      )
     description = self.registry.description(directory) or _description(
       directory
     )
     return (
-      f'{key} · {description}' if self._sources.key(directory) else description
+      f'{source} · {description}'
+      if self._sources.key(directory)
+      else description
     )
 
   def selector(self, selected: str | None = None) -> actions.OpenSelector:
@@ -401,15 +548,7 @@ class UserExtensions:
         'extensions',
         'Extensions · Enter toggles',
         tuple(
-          selection.Choice(
-            key,
-            directory.name,
-            self._detail(key, directory),
-            prefix='●' if choices.get(key, False) else '○',
-            prefix_style='class:extension-on'
-            if choices.get(key, False)
-            else 'class:extension-off',
-          )
+          self._choice(key, directory, enabled=choices.get(key, False))
           for key, directory in sorted(
             self._directories().items(),
             key=lambda item: (item[1].name.casefold(), item[0]),
@@ -423,14 +562,26 @@ class UserExtensions:
       )
     )
 
+  def _source_names(self, *, local: bool = True) -> dict[str, str]:
+    settings = self._config.read().get('extensions')
+    names = {
+      key: repository.name
+      for key, repository in extension_sources.repositories(
+        settings, self.root
+      ).items()
+    }
+    if local:
+      names.update({
+        key: path.name
+        for key, path in extension_sources.local_directories(settings).items()
+      })
+    return names
+
   def _source_selector(self, *, update: bool) -> actions.OpenSelector:
-    configured = extension_sources.repositories(
-      self._config.read().get('extensions'), self.root
-    )
     choices = tuple(
-      selection.Choice(key, repository.name, key)
-      for key, repository in sorted(
-        configured.items(), key=lambda item: item[1].name
+      selection.Choice(key, name, key)
+      for key, name in sorted(
+        self._source_names(local=not update).items(), key=lambda item: item[1]
       )
     )
     if update and choices:
@@ -438,23 +589,32 @@ class UserExtensions:
     return actions.OpenSelector(
       selection.Selector(
         'extensions-update' if update else 'extensions-remove',
-        'Update GitHub extensions' if update else 'Remove a GitHub extension',
+        'Update GitHub extensions' if update else 'Remove an extension source',
         choices,
         actions.UpdateExtensions if update else actions.RemoveExtension,
-        empty='No GitHub extension sources configured.',
+        empty=(
+          'No GitHub extension sources configured.'
+          if update
+          else 'No extension sources configured.'
+        ),
       )
     )
 
   def _remove_confirmation(self, key: str) -> actions.OpenSelector:
-    configured = extension_sources.repositories(
-      self._config.read().get('extensions'), self.root
-    )
+    configured = self._source_names()
     if key not in configured:
       raise ValueError('Extension source is no longer configured')
+    local = key in extension_sources.local_directories(
+      self._config.read().get('extensions')
+    )
     return actions.OpenSelector(
       selection.Selector(
         'extensions-remove-confirm',
-        f'Remove {configured[key].name}? Cached files will be kept.',
+        (
+          f'Unregister {configured[key]}? Source files and settings will be kept.'
+          if local
+          else f'Remove {configured[key]}? Cached files will be kept.'
+        ),
         (
           selection.Choice('cancel', 'Cancel'),
           selection.Choice('remove', 'Remove', key),
@@ -466,8 +626,38 @@ class UserExtensions:
         ),
         selected='cancel',
         numbered=True,
+        header=f'Source: {key}',
       )
     )
+
+  async def _add_local_source(
+    self, context: extension.Context, path: str
+  ) -> None:
+    try:
+      expanded = pathlib.Path(path).expanduser()
+    except RuntimeError as error:
+      raise ValueError(f'Cannot expand local source: {path!r}') from error
+    directory = extension_sources.local_directory(
+      self._launch_directory / expanded
+    )
+    if directory.is_relative_to(self._packaged) or (
+      self._bundled is not None and directory.is_relative_to(self._bundled)
+    ):
+      raise ValueError('Use your own checkout, not installed application files')
+    async with self._apply_lock:
+      self._sources.add_local(
+        self._config, directory, self._directories(ignore_environment=True)
+      )
+    context.dispatch(
+      actions.ShowText(
+        f'Local host source: {path!r} → {directory}\n'
+        f'Relative paths use the CLI launch directory: {self._launch_directory}\n'
+        'Registered without enabling execution or installing dependencies. '
+        'Manage with /extensions. Only enable trusted code: it runs unsandboxed '
+        'with your filesystem, network and credential access.'
+      )
+    )
+    await self.apply_settings()
 
   async def _add_source(self, context: extension.Context, url: str) -> None:
     async with self._apply_lock:
@@ -586,7 +776,10 @@ class UserExtensions:
     if os.getenv('MIRROR_EXTENSIONS_ENABLED', 'true').lower() != 'true':
       raise ValueError('External extensions are disabled')
     if isinstance(request, actions.AddExtension):
-      await self._add_source(context, request.url)
+      if urllib.parse.urlsplit(request.source).scheme:
+        await self._add_source(context, request.source)
+      else:
+        await self._add_local_source(context, request.source)
     elif isinstance(request, actions.UpdateExtensions):
       if request.name is None:
         context.dispatch(self._source_selector(update=True))
@@ -601,14 +794,14 @@ class UserExtensions:
         self._sources.remove(self._config, request.key)
       await self.apply_settings()
       context.dispatch(
-        actions.ShowText('Extension removed. Cached files were kept.')
+        actions.ShowText('Extension source removed. Files were kept.')
       )
 
   async def change(
     self,
     context: extension.Context,
     effect: actions.ToggleExtension
-    | actions.ExtensionConsent
+    | actions.ExtensionConsentBatch
     | actions.AddExtension
     | actions.UpdateExtensions
     | actions.RemoveExtension,
@@ -623,11 +816,12 @@ class UserExtensions:
       except (OSError, ValueError) as error:
         context.dispatch(actions.ShowText(str(error), style='ui.error'))
       return
-    if isinstance(effect, actions.ExtensionConsent):
-      try:
-        await self._consent(context, effect)
-      except (ValueError, OSError) as error:
-        context.dispatch(actions.ShowText(str(error), style='ui.error'))
+    if isinstance(effect, actions.ExtensionConsentBatch):
+      for request in effect.requests:
+        try:
+          await self._consent(context, request)
+        except (ValueError, OSError) as error:
+          context.dispatch(actions.ShowText(str(error), style='ui.error'))
       if self._foreground is not None:
         self._show_approval(self._foreground)
       return
@@ -674,7 +868,9 @@ class UserExtensions:
           )
         )
         return
-      await self._set_enabled(directory, request.enabled)
+      await self._set_enabled(
+        directory, request.enabled, reviewed_revision=approval.revision
+      )
       context.dispatch(
         actions.ShowText(
           f'{directory.name} {"enabled" if request.enabled else "disabled"}.'
@@ -689,7 +885,11 @@ class UserExtensions:
       return await self._set_enabled(directory, enabled)
 
   async def _set_enabled(
-    self, directory: pathlib.Path, enabled: bool
+    self,
+    directory: pathlib.Path,
+    enabled: bool,
+    *,
+    reviewed_revision: str | None = None,
   ) -> str | None:
     key = self._key(directory)
     if (
@@ -702,23 +902,54 @@ class UserExtensions:
     overrides = config.extension_overrides(
       self._config.read().get('extensions'), key
     )
+    if enabled and overrides.get('source') == 'local':
+      extension_sources.validate_local(directory)
+      self._sources.errors.pop(key, None)
     revision = (
       _approval(directory, overrides).revision
       if enabled and not self._trusted(directory)
       else None
     )
+    if (
+      enabled
+      and reviewed_revision is not None
+      and revision != reviewed_revision
+    ):
+      raise ValueError(
+        f'Extension changed during review: {directory}; reopen /extensions.'
+      )
     self._config.set_extension(key, enabled, consent_revision=revision)
     self._resolve_approval(key)
     overrides = config.extension_overrides(
       self._config.read().get('extensions'), key
     )
     settings = config.resolve_extension(overrides)
-    loaded = await self._apply_extension(directory, enabled, overrides)
+    loaded = await self._apply_and_record(
+      key, directory, overrides, enabled=enabled
+    )
     if enabled and loaded is None:
       raise ValueError(f'Could not load {directory}; see the CLI log.')
     self._applied = {**(self._applied or {}), key: settings}
     self._refresh_selector()
     self._emit_metrics()
+    return loaded
+
+  async def _apply_and_record(
+    self,
+    key: str,
+    directory: pathlib.Path,
+    overrides: config.JsonObject,
+    *,
+    enabled: bool,
+  ) -> str | None:
+    """Apply one extension and keep a load failure's cause for /extensions."""
+    try:
+      loaded = await self._apply_extension(directory, enabled, overrides)
+    except extension.ExtensionLoadError as error:
+      self._load_errors[key] = (directory.name, str(error).splitlines()[-1])
+      raise
+    self._load_errors.pop(key, None)
+    self._reported_errors.discard(key)
     return loaded
 
   async def _apply_extension(
@@ -766,6 +997,9 @@ class UserExtensions:
         await self.registry.unload(extension_id)
         loaded = None
       else:
+        if overrides.get('source') == 'local':
+          extension_sources.validate_local(directory)
+          self._sources.errors.pop(key, None)
         revision = (
           _approval(directory, overrides).revision
           if not self._trusted(directory)

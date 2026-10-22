@@ -30,6 +30,8 @@ pub enum CheckpointError {
     Jujutsu(String),
     #[error("repository checkpoint {0:?} timed out")]
     Timeout(String),
+    #[error("cannot fork workspace: {0}")]
+    Fork(String),
     #[error("repository checkpoint returned non-UTF-8 output")]
     Encoding(#[from] std::string::FromUtf8Error),
 }
@@ -37,6 +39,84 @@ pub enum CheckpointError {
 impl Checkpoints {
     pub fn new(workspace: PathBuf) -> Self {
         Self { workspace }
+    }
+
+    /// Create a checkout of current files, preserving the source checkout and index.
+    pub async fn fork(&self, destination: &Path, name: &str) -> Result<PathBuf, CheckpointError> {
+        if !destination.is_absolute()
+            || name.is_empty()
+            || name.len() > 64
+            || name.contains("..")
+            || name.ends_with('.')
+            || name.ends_with(".lock")
+            || !name.as_bytes()[0].is_ascii_alphanumeric()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        {
+            return Err(CheckpointError::Fork(
+                "invalid destination or workspace name".into(),
+            ));
+        }
+        if tokio::fs::try_exists(destination).await? {
+            return Err(CheckpointError::Fork(format!(
+                "destination {destination:?} already exists"
+            )));
+        }
+        let checkpoint = self.capture().await?.ok_or_else(|| {
+            CheckpointError::Fork("the workspace is not a Git or Jujutsu repository".into())
+        })?;
+        let root = Path::new(&checkpoint.repository_root);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| CheckpointError::Fork("destination has no parent".into()))?;
+        if tokio::fs::canonicalize(parent).await?.starts_with(root) {
+            return Err(CheckpointError::Fork(
+                "destination must be outside the source checkout".into(),
+            ));
+        }
+        let workspace = tokio::fs::canonicalize(&self.workspace).await?;
+        let relative = workspace
+            .strip_prefix(root)
+            .map_err(|error| CheckpointError::Fork(error.to_string()))?;
+        let path = destination
+            .to_str()
+            .ok_or_else(|| CheckpointError::Fork("destination is not UTF-8".into()))?;
+        if root.join(".jj").is_dir() {
+            fork_jj(root, &checkpoint, path, name).await?;
+        } else {
+            let git = Git {
+                root,
+                index: None,
+                objects: None,
+            };
+            git.run(&[
+                "worktree",
+                "add",
+                "-b",
+                &format!("mirror/{name}"),
+                path,
+                &checkpoint.snapshot_commit,
+            ])
+            .await?;
+            let child = Git {
+                root: destination,
+                index: None,
+                objects: None,
+            };
+            let sparse = child
+                .output(&["config", "--bool", "--get", "core.sparseCheckout"], None)
+                .await?;
+            if sparse.status.code() != Some(1) && text("config", sparse)? == "true" {
+                child.run(&["sparse-checkout", "disable"]).await?;
+            }
+            if let Some(head) = &checkpoint.head_commit {
+                child.run(&["reset", "--mixed", head]).await?;
+            }
+        }
+        let workspace = destination.join(relative);
+        tokio::fs::create_dir_all(&workspace).await?;
+        Ok(tokio::fs::canonicalize(workspace).await?)
     }
 
     /// Capture repository files, or return None outside Git and Jujutsu.
@@ -125,22 +205,14 @@ impl Checkpoints {
 
 // Native snapshots preserve jj's sparse checkout, ignores, and conflict representation.
 async fn jj_snapshot(root: &Path, snapshot: bool) -> Result<String, CheckpointError> {
-    let mut command = Command::new("jj");
-    #[cfg(test)]
-    if let Some(binary) = std::env::var_os("JJ_TEST_BIN") {
-        command = Command::new(std::fs::canonicalize(binary)?);
-    }
-    command
-        .current_dir(root)
-        // Keep the snapshot operation uncommitted: do not update @, bookmarks, or checkout state.
-        .arg(if snapshot {
-            "--no-integrate-operation"
-        } else {
-            "--ignore-working-copy"
-        })
-        .args([
-            "--color=never",
-            "--no-pager",
+    jj(
+        root,
+        &[
+            if snapshot {
+                "--no-integrate-operation"
+            } else {
+                "--ignore-working-copy"
+            },
             "--config",
             "snapshot.max-new-file-size=0",
             "--config",
@@ -151,7 +223,89 @@ async fn jj_snapshot(root: &Path, snapshot: bool) -> Result<String, CheckpointEr
             "@",
             "-T",
             "commit_id",
-        ])
+        ],
+    )
+    .await
+}
+
+// Use a private Git index to transfer resolved files; never import refs into the source jj view.
+async fn fork_jj(
+    root: &Path,
+    checkpoint: &Checkpoint,
+    path: &str,
+    name: &str,
+) -> Result<(), CheckpointError> {
+    let store = PathBuf::from(jj(root, &["--ignore-working-copy", "git", "root"]).await?);
+    let temporary = tempfile::tempdir()?;
+    let index = temporary.path().join("index");
+    let git = Git {
+        root: &store,
+        index: Some(&index),
+        objects: None,
+    };
+    let commit = git
+        .run(&["cat-file", "commit", &checkpoint.snapshot_commit])
+        .await?;
+    if commit
+        .split("\n\n")
+        .next()
+        .is_some_and(|headers| headers.lines().any(|line| line.starts_with("jj:trees ")))
+    {
+        return Err(CheckpointError::Fork(
+            "resolve Jujutsu file conflicts before forking".into(),
+        ));
+    }
+    let head = checkpoint
+        .head_commit
+        .as_deref()
+        .ok_or_else(|| CheckpointError::Fork("Jujutsu checkpoint has no base".into()))?;
+    jj(
+        root,
+        &[
+            "--ignore-working-copy",
+            "workspace",
+            "add",
+            "--sparse-patterns",
+            "full",
+            "--name",
+            name,
+            "--revision",
+            // A sibling must not follow rewrites of the source workspace's mutable @.
+            &format!("parents({head})"),
+            path,
+        ],
+    )
+    .await?;
+    // --ignore-working-copy registers the child without checking out its files.
+    jj(Path::new(path), &["workspace", "update-stale"]).await?;
+    let base = jj_snapshot(Path::new(path), false).await?;
+    git.run(&["--work-tree", path, "read-tree", &base]).await?;
+    git.run(&[
+        "-c",
+        "core.sparseCheckout=false",
+        "--work-tree",
+        path,
+        "read-tree",
+        "--reset",
+        "-u",
+        &checkpoint.snapshot_commit,
+    ])
+    .await?;
+    git.run(&["--work-tree", path, "checkout-index", "--all", "--force"])
+        .await?;
+    Ok(())
+}
+
+async fn jj(root: &Path, args: &[&str]) -> Result<String, CheckpointError> {
+    let mut command = Command::new("jj");
+    #[cfg(test)]
+    if let Some(binary) = std::env::var_os("JJ_TEST_BIN") {
+        command = Command::new(std::fs::canonicalize(binary)?);
+    }
+    command
+        .current_dir(root)
+        .args(["--color=never", "--no-pager"])
+        .args(args)
         .env("LC_ALL", "C")
         .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(60), command.output())

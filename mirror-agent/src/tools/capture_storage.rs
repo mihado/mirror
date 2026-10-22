@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 /// A captured stream's kept text: in an unlinked file, or in memory when no
 /// file can be written, so a command still runs on a read-only `/tmp`.
 #[derive(Debug)]
-pub(super) enum CaptureStorage {
+pub(crate) enum CaptureStorage {
     /// An unlinked file, and how many bytes of it were written whole; a write
     /// that failed partway may leave more.
     File {
@@ -28,7 +28,7 @@ pub(super) enum CaptureStorage {
 impl CaptureStorage {
     /// Storage in a new unlinked file in the temporary directory, or in memory
     /// when that cannot be created.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let path =
             std::env::temp_dir().join(format!("mirror-bash-{}.txt", uuid::Uuid::new_v4().simple()));
         let file = std::fs::OpenOptions::new()
@@ -49,7 +49,7 @@ impl CaptureStorage {
     }
 
     /// Append `bytes`, moving to memory if the file fails.
-    pub(super) fn write(&mut self, bytes: &[u8]) {
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
         match self {
             Self::File { file, written } => match file.write_all(bytes) {
                 Ok(()) => *written += bytes.len() as u64,
@@ -77,7 +77,7 @@ impl CaptureStorage {
     }
 
     /// Drop the kept text.
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         match self {
             Self::File { file, written } => {
                 if *written == 0 {
@@ -100,7 +100,7 @@ impl CaptureStorage {
     /// # Errors
     ///
     /// Returns the error that lost kept text, or a failure to read the file.
-    pub(super) fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
+    pub(crate) fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
         match self {
             Self::File { file, written } => {
                 let mut bytes = Vec::new();

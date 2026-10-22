@@ -249,6 +249,12 @@ class ContextUsageExtension(extension.Extension[ContextUsage, None, None]):
     return current, ()
 
   @override
+  def cache_key(
+    self, global_state: state.State, extension_state: ContextUsage
+  ) -> object:
+    return (global_state.session.pending_switch, extension_state.render())
+
+  @override
   def render(
     self,
     global_state: state.State,

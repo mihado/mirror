@@ -1,4 +1,4 @@
-"""Private local API-key files shared by provider onboarding."""
+"""Credential readiness and private local API-key files for onboarding."""
 
 from __future__ import annotations
 
@@ -7,6 +7,11 @@ import pathlib
 import tempfile
 
 ANTHROPIC_KEY_URL = 'https://platform.claude.com/settings/keys'
+
+
+def environment_key_hint(name: str) -> str:
+  """Describe credential presence without exposing or persisting its value."""
+  return 'key set' if os.environ.get(name, '').strip() else f'set ${name}'
 
 
 def anthropic_key_path() -> pathlib.Path:

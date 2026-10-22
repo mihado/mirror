@@ -15,7 +15,9 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
-          version: '0.10.10'
+          # Pinned to the first uv release with webpki-root-certs 1.0.10, which drops the
+          # compromised eMudhra root (INC-2436); any later release is safe.
+          version: '0.13.4'
       - run: cargo install ripgrep --locked
       - run: bash ci.sh
   rust:
@@ -28,7 +30,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           # Keep the launcher check on the Python job's uv toolchain.
-          version: '0.10.10'
+          version: '0.13.4'
       - run: rustup toolchain install 1.95.0 --profile minimal
       - run: cargo +1.95.0 install ripgrep --locked
       # Match the development test toolchain; upgrade with checkpoint tests.
@@ -40,7 +42,6 @@ jobs:
           version: '33.4'
       - run: |
           cargo +1.95.0 test --locked -p mirror-agent -p mirror-protocol
-          cargo +1.95.0 check --locked -p mirror-agent-python
           ./mirror-cli/mirror-dev --help
         env:
           # mirror-dev must use the same compiler as the Rust checks.

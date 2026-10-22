@@ -102,7 +102,9 @@ async fn run_once(arguments: &[String], cwd: &Path, input: Option<&str>) -> io::
     // Keep the private extraction directory alive until the subprocess finishes.
     let (binary, _directory) = executable().await?;
     let mut std_command = std::process::Command::new(binary);
-    std_command.env_remove("REFLECTION_API_KEY");
+    for name in super::REMOVED_ENVIRONMENT {
+        std_command.env_remove(name);
+    }
     std_command
         .arg("--no-config")
         .args(arguments)

@@ -8,15 +8,15 @@ from prompt_toolkit.layout import (
   containers,
   controls,
   dimension,
-  scrollable_pane,
 )
 
-from mirror.cli import actions, extension, state, themes
+from mirror.cli import actions, extension, retained, state, themes
 from mirror.cli.components import (
   activity,
   completion,
   component,
   failure,
+  layout,
   pending,
   queued,
   resume,
@@ -77,6 +77,7 @@ class Pane:
     navigation: containers.AnyContainer,
     *,
     fullscreen: bool,
+    above_input: containers.Container | None = None,
     secret_active: Callable[[], bool] = lambda: False,
     show_activity: Callable[[], bool] = lambda: True,
     queued_input_pending: Callable[[], bool] | None = None,
@@ -86,6 +87,20 @@ class Pane:
   ) -> None:
     self._get_state = get_state
     self._get_size = get_size
+    self._paint_components = tuple(
+      components[name]
+      for name in (
+        'completion',
+        'selector',
+        'status_bar',
+        'extensions_below_activity',
+        'extensions_above_prompt',
+        'extensions_below_prompt',
+      )
+    )
+    self._paint_keys = layout.FrameCache[tuple[object, ...]]()
+    above_input = above_input or containers.Window(height=0)
+    self._above_input = above_input
     queued_input_pending = queued_input_pending or (
       lambda: bool(get_state().turn.pending_instructions)
     )
@@ -95,7 +110,7 @@ class Pane:
     )
     status_bar = containers.to_container(host.mount(components['status_bar']))
     footer = containers.ConditionalContainer(
-      containers.HSplit(
+      layout.Rows(
         [status_bar],
         height=lambda: dimension.Dimension.exact(
           status_bar.preferred_height(get_state().layout.columns, 1).preferred
@@ -124,15 +139,15 @@ class Pane:
         or get_state().secret.active
       )
     )
-    composer = containers.ConditionalContainer(
-      containers.HSplit([
+    composer: containers.Container = containers.ConditionalContainer(
+      layout.Rows([
         host.mount(components['completion']),
         surface.wrap_input(
           input_window,
           lambda: (
             get_state().selector.active or completion.visible(get_state())
           ),
-          containers.HSplit([footer, setup_footer]),
+          layout.Rows([footer, setup_footer]),
           theme_name=lambda: themes.current(
             get_state().extensions, get_state().extension_themes
           ),
@@ -146,6 +161,8 @@ class Pane:
       ]),
       filter=composer_visible,
     )
+    if fullscreen:
+      composer = retained.Layer(composer, self.paint_key)
     activity_window = containers.ConditionalContainer(
       host.mount(components['activity']),
       filter=filters.Condition(lambda: not secret_active() and show_activity()),
@@ -165,7 +182,10 @@ class Pane:
         child.preferred_height(get_state().layout.columns, 1).preferred
       )
 
-    self._activity_prefix = containers.HSplit([
+    queued_window = containers.to_container(host.mount(components['queued']))
+    if fullscreen:
+      queued_window = retained.Layer(queued_window, animated=False)
+    self._activity_prefix = layout.Rows([
       pending_window,
       containers.Window(
         height=lambda: int(
@@ -176,7 +196,7 @@ class Pane:
           )
         )
       ),
-      host.mount(components['queued']),
+      queued_window,
       containers.Window(
         height=lambda: int(
           bool(
@@ -197,8 +217,10 @@ class Pane:
       above_prompt,
       containers.ConditionalContainer(
         containers.Window(
+          # Above-input content supplies separation without another blank row.
           height=lambda: int(
             not secret_active()
+            and not occupied(above_input)
             and bool(
               occupied(activity_window)
               or get_state().lifecycle.failure
@@ -210,11 +232,11 @@ class Pane:
       ),
       host.mount(components['resume']),
     ])
-    body = containers.HSplit([
+    body: containers.Container = layout.Rows([
       self._activity_prefix,
       host.mount(components['selector']),
       containers.ConditionalContainer(
-        containers.HSplit([
+        layout.Rows([
           host.mount(components['secret']),
           host.mount(components['rewind_picker']),
           host.mount(components['rewind_banner']),
@@ -225,7 +247,7 @@ class Pane:
       ),
     ])
     self.tasks = host.mount(components['tasks'])
-    below = containers.HSplit([
+    below = layout.Rows([
       self.tasks,
       containers.Window(
         height=lambda: dimension.Dimension.exact(
@@ -240,10 +262,19 @@ class Pane:
       containers.ConditionalContainer(footer, filter=~composer_visible),
       below_prompt,
     ])
-    self._fixed = containers.HSplit([composer, below, navigation])
+    self._fixed = layout.Rows([above_input, composer, below, navigation])
     visible_body: containers.Container = body
     if fullscreen:
-      body_pane = scrollable_pane.ScrollablePane(
+      body = retained.Layer(
+        body,
+        # Above-input visibility changes the separator, even at the same budget.
+        lambda: (
+          self._body_height(),
+          occupied(above_input),
+          self.paint_key(),
+        ),
+      )
+      body_pane = layout.ScrollableRows(
         body,
         show_scrollbar=False,
         keep_cursor_visible=False,
@@ -261,10 +292,25 @@ class Pane:
 
       body_pane.height = activity_height
       visible_body = body_pane
-    self.prompt = containers.HSplit([visible_body, composer, below])
-    self.bottom = containers.HSplit([self.prompt, navigation])
-    self.dock = containers.HSplit(
+    self.prompt = layout.Rows([visible_body, above_input, composer, below])
+    self.bottom = layout.Rows([self.prompt, navigation])
+    self.dock = layout.Rows(
       [self.bottom], height=lambda: dimension.Dimension.exact(self.height())
+    )
+
+  def paint_key(self) -> tuple[object, ...]:
+    """Keep unkeyed menu and extension callbacks live on transcript-only draws."""
+    return self._paint_keys.get((), self._component_key)
+
+  def _component_key(self) -> tuple[object, ...]:
+    snapshot = self._get_state()
+    keys = tuple(
+      component.cache_key(snapshot) for component in self._paint_components
+    )
+    return (
+      (current.get_app().render_counter,)
+      if any(key is None for key in keys)
+      else keys
     )
 
   def _budget(self) -> int:
@@ -277,7 +323,11 @@ class Pane:
       if self._get_state().approval.request
       else size.rows * 2 // 3
     )
-    return min(size.rows, max(minimum, budget))
+    # Above-input rows borrow transcript space, not activity capacity.
+    above_input = self._above_input.preferred_height(
+      size.columns, size.rows
+    ).preferred
+    return min(size.rows, max(minimum, budget + above_input))
 
   def _body_height(self) -> int:
     size = self._get_size()
@@ -320,7 +370,7 @@ def _bounded_widget(
       min(child.preferred_height(size.columns, size.rows).preferred, limit)
     )
 
-  return containers.HSplit(
-    [scrollable_pane.ScrollablePane(child, show_scrollbar=False)],
+  return layout.Rows(
+    [layout.ScrollableRows(child, show_scrollbar=False)],
     height=height,
   )

@@ -34,8 +34,7 @@ mirror --version
 ```
 
 Release wheels include the native agent executable and ripgrep. You do not need
-Rust or a separate agent installation to use one. The `mirror-agent-py` Python
-embedding bindings are not part of this release and are not included in the package.
+Rust or a separate agent installation to use one.
 
 The public PyPI package named `mirror` is unrelated. Do not install Mirror with
 `uv tool install mirror` or `pip install mirror`.
@@ -71,7 +70,7 @@ Rerun after editing. See [development checks](https://github.com/reflection-oss/
 
 | Requirement  | Supported                                                      |
 | ------------ | -------------------------------------------------------------- |
-| macOS        | macOS 15 or later on Apple Silicon                             |
+| macOS        | macOS 14 or later on Apple Silicon                             |
 | Linux        | x86-64 or ARM64, with glibc 2.28 or later                      |
 | Python       | 3.12 or later; uv can download a compatible interpreter        |
 | Model access | Credentials for a supported provider, or a compatible endpoint |
@@ -133,6 +132,7 @@ API key alone does not select that provider.
 | OpenRouter                       | `openrouter`              | `OPENROUTER_API_KEY`                                      |
 | OpenAI Responses                 | `openai-responses`        | `OPENAI_API_KEY`                                          |
 | Anthropic Messages               | `anthropic-messages`      | `ANTHROPIC_API_KEY`                                       |
+| Google Gemini Developer API      | `gemini`                 | `GEMINI_API_KEY` (paid API access)                        |
 | ChatGPT plan through Codex       | `openai-codex-responses`  | Existing Codex CLI login                                  |
 | Custom Chat Completions endpoint | `openai-chat-completions` | Endpoint-specific; `--api-key` if required                |
 
@@ -185,6 +185,11 @@ set `REFLECTION_API_KEY`, unset it in your shell and restart Mirror as well.
 If Reflection is active and no key remains, Mirror reopens sign-in.
 
 ## Working with Mirror
+
+### Usage and context
+
+- `/usage`: this agent’s recorded tokens, requests, cache, and wall-time span.
+- `/context`: current prompt and tools, not cumulative usage.
 
 ### Terminal layout
 
@@ -239,8 +244,28 @@ references for each finding.
 ```
 
 Connect services through MCP when a task needs information from other systems.
-For web search and browsing, configure a [Firecrawl](https://firecrawl.dev/) key
-through `FIRECRAWL_API_KEY` before launching Mirror.
+Web search and browsing default to [You.com](https://you.com/) with `YOU_API_KEY`.
+Use `/web-provider` to choose You.com, [Tavily](https://tavily.com/), or
+[Firecrawl](https://www.firecrawl.dev/) for both tools. The built-in extension saves
+`web_provider` in `~/.mirror/config.json`;
+omitting it defaults to You.com. For example, add this setting to your config:
+
+```json
+{"web_provider": "tavily"}
+```
+
+`/web-provider` applies immediately to subsequent tool calls and shows whether
+each key is set. In-flight calls finish with their original provider. Supply the
+selected service's `YOU_API_KEY`, `TAVILY_API_KEY`, or `FIRECRAWL_API_KEY` in your
+trusted launch environment, never config, command arguments, or project files. Keys are removed
+from bash/ripgrep children. Selection is independent of your model and is also
+used by `mirror exec` and `mirror acp`. Another provider's key alone never selects
+it. Web tools enter model context only when the selected provider's key is
+non-blank; live switches update visibility for subsequent model requests.
+Missing keys never block agent startup or recovery; unavailable web calls
+fail without fallback. Page caches belong to one
+provider and conversation. Tool arguments and output formatting stay the same,
+but retrieved content may differ. See [web provider details](../mirror-agent/README.md).
 
 ### Conversations and context
 
@@ -251,9 +276,15 @@ cd /path/to/your/project
 mirror --continue
 ```
 
-`--continue` resumes the most recent conversation in each worktree. Use
-`/resume` to browse saved conversations, or `/resume <id-or-prefix>` to choose
-one directly. `/clear` starts a fresh conversation in the current workspace.
+`--continue` resumes each tab's saved conversation, or the directory's latest if
+unbound. `/resume [id-or-prefix]` selects saved history; `/clear` starts fresh.
+
+- `/fork [name]`: current conversation + files → new Git worktree/Jujutsu workspace and tab.
+- Idle, host-local only. Selects the new tab immediately; the child opens idle when ready.
+- On-demand file capture; automatic checkpoints not required. No historical restore.
+- History by reference. Git changes unstaged; sparse files expanded.
+- Excludes ignored files, submodule contents, nested repos. Resolve Jujutsu conflicts first.
+- Stop other writers: capture isn't atomic. Inspect failure IDs/paths before retrying.
 
 `/rewind` branches conversation history from an earlier message. It does not
 undo changes to files; use version control or backups for that.
@@ -291,7 +322,9 @@ microVM. The VM mounts that directory at the same path, reaches only HTTPS hosts
 on an allowlist, and receives no host credentials; the agent and your model key
 stay on this machine. Setup asks separately before installing the runtime or
 downloading an image. Mirror needs macOS on Apple Silicon, or Linux with access
-to `/dev/kvm`.
+to `/dev/kvm`. The separately installed microsandbox runtime has its own OS
+requirements; version 0.7.7's macOS runtime targets 14.0 or later. Nested
+virtualization requires newer hardware and macOS 15+, not just a compatible CLI.
 
 Quitting Mirror stops the VMs, and reopening it restarts them. `/drop` deletes a
 sandbox's VM and clone after you confirm. To bring the agent's commits into your
@@ -488,7 +521,9 @@ for authentication, tool selection, and timeouts.
 Extensions can add terminal widgets, slash commands, keybindings, skills, and
 tools. Put local Python extensions under `~/.mirror/extensions/` or a project's
 `.mirror/extensions/`, then use `/extensions` to enable them. Use
-`/extensions-add` for a GitHub source and `/extensions-update` to update it.
+`/extensions-add <GitHub URL>` or `/extensions-add "<host directory>"`; Mirror
+recognizes the source type automatically. Relative paths use the CLI launch directory, not the
+active workspace. `/extensions-update` updates GitHub sources only.
 
 External extensions require consent before import and run with your account's
 permissions. Only enable code you trust. See the
@@ -530,11 +565,30 @@ using Mirror with sensitive repositories.
 | `~/.mirror/reflection_api_key`      | Saved Reflection API key                 |
 | `~/.mirror/mcp/credentials/`        | MCP credentials                          |
 | `~/.mirror/memory/`                 | Local memory store, when enabled         |
+| `~/.mirror/analytics/`              | Usage events waiting to be sent          |
 
 Conversation history, memories, and logs may contain sensitive information.
 Use `--database <path>` to select another agent database. Resuming a conversation
 from a different directory asks for confirmation. A conversation can be open
 in only one worker at a time.
+
+### Usage analytics
+
+Mirror sends product usage events to [Statsig](https://statsig.com) so Reflection
+can see how its features are used. An event records that something happened,
+such as a submitted prompt, a slash command, a tool call or a finished
+compaction, with counts and durations. Every event carries a random install ID
+created on first run, a session ID, the Mirror version, OS, CPU architecture,
+locale, timezone and terminal program. Conversation and turn events also carry
+the conversation ID, and some events name the slash command or tool used. They
+never include prompts, model responses, code, file contents or tool arguments;
+for a prompt, only its length is sent.
+
+Turn analytics off in `/settings` → **Usage analytics**, or set
+`"analytics": false` in `~/.mirror/config.json`. Events that could not be sent
+are saved in `~/.mirror/analytics/` and retried the next time Mirror starts with
+analytics on, which also drops any older than five days. Turning analytics off
+leaves that folder as it is; delete it to remove unsent events.
 
 Report suspected vulnerabilities privately to
 [developers@reflection.ai](mailto:developers@reflection.ai). See
@@ -586,7 +640,7 @@ the full exported source checkout.
 
 We welcome bug reports and feature requests through
 [GitHub issues](https://github.com/reflection-oss/mirror/issues). Search existing
-issues first, then use the
+issues first, then use `/feedback` or the
 [GitHub issue form](https://github.com/reflection-oss/mirror/issues/new/choose).
 Include your Mirror version, operating system,
 terminal, reproduction steps, and relevant errors. Remove secrets and private

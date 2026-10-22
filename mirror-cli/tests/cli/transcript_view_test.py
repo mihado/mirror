@@ -9,13 +9,20 @@ from prompt_toolkit import (
   formatted_text,
   mouse_events,
 )
+from prompt_toolkit.application import current
 from prompt_toolkit.input import defaults
 from prompt_toolkit.key_binding import key_bindings, key_processor
 from prompt_toolkit.layout import containers, controls, layout
 from prompt_toolkit.output import base
-from rich import console
+from rich import console, text
 
-from mirror.cli import actions, rendering, transcript, transcript_view
+from mirror.cli import (
+  actions,
+  rendering,
+  transcript,
+  transcript_view,
+  workspace_application,
+)
 
 
 def _source(
@@ -146,6 +153,41 @@ async def test_render_keeps_input_live_and_discards_switched_work(
       blocked.release.set()
       app.exit()
       await running
+
+
+@pytest.mark.asyncio
+async def test_refresh_invalidates_only_changed_transcript_rows() -> None:
+  blocks = (transcript.Block('body', (0, 0), text.Text('before')),)
+  view = transcript_view.TranscriptView(lambda: blocks, lambda: ())
+  rendered = asyncio.Event()
+  with defaults.create_pipe_input() as pipe:
+    app = workspace_application.WorkspaceApplication(
+      layout=layout.Layout(containers.Window(view)),
+      input=pipe,
+      output=base.DummyOutput(),
+      after_render=lambda _: rendered.set(),
+    )
+    running = asyncio.create_task(app.run_async())
+    try:
+      await asyncio.wait_for(rendered.wait(), 1)
+      revision = app.ui_revision
+      positions = view.scrolling_positions()
+      with current.set_app(app):
+        assert view.refresh()
+        assert not app.invalidated, 'Unchanged rows must not request a paint'
+        assert view.scrolling_positions() == positions
+        rendered.clear()
+        blocks = (transcript.Block('body', (1, 0), text.Text('after')),)
+        assert view.refresh()
+        assert app.invalidated
+        assert app.ui_revision is revision, (
+          'Transcript damage must retain chrome'
+        )
+      await asyncio.wait_for(rendered.wait(), 1)
+      assert 'after' in _text(view.create_content(80, 10))
+    finally:
+      app.exit()
+      await asyncio.wait_for(running, 1)
 
 
 def _shell_result(

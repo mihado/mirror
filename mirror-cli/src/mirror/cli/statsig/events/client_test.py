@@ -111,8 +111,13 @@ async def test_log_event_while_off_sends_nothing(
     async with _client(tmp_path) as sender:
       sender.log_event(event.Event('before_enable'))
       await sender.enable()
+      epoch = sender.collection_epoch
+      await sender.enable()
+      assert sender.collection_epoch == epoch
       await sender.disable()
       sender.log_event(event.Event('after_disable'))
+      await sender.enable()
+      assert sender.collection_epoch == epoch + 1
 
     assert statsig.requests.empty()
   assert not list(tmp_path.glob('*.jsonl'))

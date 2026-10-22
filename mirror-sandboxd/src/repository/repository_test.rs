@@ -11,7 +11,7 @@ use prost::Message;
 use tokio::io::AsyncWriteExt;
 
 use super::*;
-use crate::REQUEST_BYTES_VARIABLE;
+use crate::tool_runner::REQUEST_BYTES_VARIABLE;
 
 const PROJECT_URL: &str = "https://github.com/acme/project.git";
 

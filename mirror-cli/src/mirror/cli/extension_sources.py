@@ -1,4 +1,4 @@
-"""GitHub extension checkouts, separate from consent and extension execution."""
+"""GitHub checkouts and live local references, separate from execution consent."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import pathlib
 import re
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from typing import cast
 
 from mirror import config
@@ -208,6 +209,45 @@ def repositories(
   return repositories
 
 
+def local_directories(settings: object) -> dict[str, pathlib.Path]:
+  """Read explicit references, not historical path-keyed enablement settings."""
+  if not isinstance(settings, dict):
+    return {}
+  directories: dict[str, pathlib.Path] = {}
+  for key, value in cast(dict[str, object], settings).items():
+    if (
+      not isinstance(value, dict)
+      or cast(dict[str, object], value).get('source') != 'local'
+    ):
+      continue
+    path = pathlib.Path(key)
+    if path.is_absolute() and path.name == 'extension.py':
+      directories[key] = path.parent
+  return directories
+
+
+def local_directory(path: pathlib.Path) -> pathlib.Path:
+  """Resolve and inspect a local entrypoint without importing or writing it."""
+  try:
+    directory = path.resolve(strict=True)
+  except RuntimeError as error:
+    raise ValueError(f'Cannot resolve local source: {path}') from error
+  entrypoint = directory / 'extension.py'
+  if entrypoint.is_symlink() or not entrypoint.is_file():
+    raise ValueError('Local directory must contain a regular extension.py file')
+  try:
+    ast.parse(entrypoint.read_text(encoding='utf-8'))
+  except (SyntaxError, UnicodeError) as error:
+    raise ValueError('Local extension.py is not valid Python') from error
+  return directory
+
+
+def validate_local(directory: pathlib.Path) -> None:
+  """Keep a saved canonical reference from silently following a retargeted path."""
+  if local_directory(directory) != directory:
+    raise ValueError('Local source was retargeted; remove it and add it again')
+
+
 class Sources:
   """Acquire sources while retaining each running CLI's chosen checkout."""
 
@@ -224,11 +264,12 @@ class Sources:
   def directories(self, settings: object) -> dict[str, pathlib.Path]:
     if not isinstance(settings, dict):
       return {}
+    settings = cast(dict[str, object], settings)
     return {
       key: path
       for key, path in self._directories.items()
       if key in settings and key in self._configured
-    }
+    } | local_directories(settings)
 
   def use(self, key: str, directory: pathlib.Path) -> None:
     """Choose a checkout for this CLI without changing other running CLIs."""
@@ -254,14 +295,69 @@ class Sources:
     configuration.update(change)
     self._directories.pop(url, None)
 
+  def add_local(
+    self,
+    configuration: config.Config,
+    directory: pathlib.Path,
+    discovered: Mapping[str, pathlib.Path],
+  ) -> None:
+    """Register a disabled, user-owned source without adopting discovered files."""
+    validate_local(directory)
+    if directory.is_relative_to((self._root / '.managed').resolve()):
+      raise ValueError('Use your own checkout, not a managed GitHub cache')
+    key = str(directory / 'extension.py')
+
+    def change(settings: dict[str, object]) -> None:
+      entries = settings.get('extensions', {})
+      if not isinstance(entries, dict):
+        raise ValueError('extensions must be a JSON object')
+      entries = cast(dict[str, object], entries)
+      overrides = config.extension_overrides(entries, key)
+      resolved = config.resolve_extension(overrides)
+      local = local_directories(entries)
+      if key in local:
+        return
+      if directory in discovered.values():
+        raise ValueError(f'Already discoverable: {directory}. Use /extensions.')
+      occupied = {
+        source: repository.name
+        for source, repository in repositories(entries, self._root).items()
+      }
+      occupied.update({source: path.name for source, path in local.items()})
+      occupied.update({
+        source: path.name for source, path in discovered.items()
+      })
+      for source, name in occupied.items():
+        if name == directory.name:
+          raise ValueError(f'Extension ID {name!r} is already used by {source}')
+      if overrides.get('enabled') is True:
+        raise ValueError(f'Disable the existing settings entry first: {key}')
+      settings['extensions'] = {
+        **entries,
+        key: {
+          **overrides,
+          'source': 'local',
+          'enabled': 'hidden' if resolved.enabled == 'hidden' else False,
+        },
+      }
+
+    configuration.update(change)
+
   def remove(self, configuration: config.Config, key: str) -> None:
-    """Remove only the source declaration, retaining every cached revision."""
+    """Unregister sources, keeping files and local settings; never delete a tree."""
 
     def change(settings: dict[str, object]) -> None:
       entries = settings.get('extensions')
       configured = (
         cast(dict[str, object], entries) if isinstance(entries, dict) else {}
       )
+      if key in local_directories(configured):
+        overrides = config.extension_overrides(configured, key)
+        overrides.pop('source')
+        if overrides.get('enabled') != 'hidden':
+          overrides['enabled'] = False
+        configured[key] = overrides
+        return
       if key not in repositories(configured, self._root):
         raise ValueError('Extension source is no longer configured')
       del configured[key]
@@ -272,6 +368,16 @@ class Sources:
     """Install missing sources; never replace a checkout in a running process."""
     configured = repositories(settings, self._root)
     self._configured = set(configured)
+    local = local_directories(settings)
+    for key in self.errors.keys() - (configured.keys() | local.keys()):
+      del self.errors[key]
+    for key, directory in local.items():
+      self._keys[directory] = key
+      try:
+        validate_local(directory)
+        self.errors.pop(key, None)
+      except (OSError, ValueError) as error:
+        self.errors[key] = f'Local source unavailable: {error}'
     for key, repository in configured.items():
       if key in self._directories:
         continue

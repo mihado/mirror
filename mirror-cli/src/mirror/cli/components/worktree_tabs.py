@@ -242,11 +242,17 @@ def _status(
 def _indicator(
   agent: actions.WorktreeAgentState,
 ) -> tuple[formatted_text.AnyFormattedText, str]:
+  icon, style = status_indicator(agent)
+  if agent is actions.WorktreeAgentState.CREATING:
+    return lambda: spinner.render(spinner.Color.LIGHT_GREEN), style
+  return icon, style
+
+
+def status_indicator(agent: actions.WorktreeAgentState) -> tuple[str, str]:
+  """Return the tab badge and style without animation."""
   return {
-    actions.WorktreeAgentState.CREATING: (
-      lambda: spinner.render(spinner.Color.LIGHT_GREEN),
-      'class:worktree-running',
-    ),
+    # Like overflow tabs, use the running badge for creation without animation.
+    actions.WorktreeAgentState.CREATING: ('●', 'class:worktree-running'),
     actions.WorktreeAgentState.NOT_STARTED: ('·', 'class:worktree'),
     actions.WorktreeAgentState.SAVED: ('↻', 'class:worktree'),
     actions.WorktreeAgentState.IDLE: ('○', 'class:worktree'),

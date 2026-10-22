@@ -51,6 +51,9 @@ pub trait Llm: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + Send;
+
+    /// Start preparing for a request like `request`; a no-op by default.
+    fn prewarm(&self, _request: CompletionRequest) {}
 }
 
 /// An incremental or final event from a streaming model request.

@@ -380,6 +380,16 @@ class WorkspaceController:
     preferences = overlay.preferences
     definition = preferences.definition
     config = dict(config)
+    if (
+      not active
+      and self._continue_recent
+      and overlay.conversation_id
+      and overlay.conversation_cwd == str(agent_workspace.resolve())
+    ):
+      config.update({
+        'conversation_id': overlay.conversation_id,
+        'create_session': False,
+      })
     if sandbox is not None:
       config['sandbox'] = sandbox.worker_config(self._sandboxd)
     if definition.HasField('model') and not (
@@ -423,11 +433,17 @@ class WorkspaceController:
       active and config.get('reasoning_effort_override')
     ):
       reasoning_effort = definition.reasoning_effort
+    reasoning_effort = reasoning_effort or self._reasoning_effort
+    if not remote and not (active and config.get('reasoning_effort_override')):
+      reasoning_effort = models.inherited_reasoning_effort(
+        str(config.get('model_api') or config.get('api') or ''),
+        reasoning_effort,
+      )
     agent = self._create_agent(
       workspaces.AgentSpec(
         config=config,
         workspace=agent_workspace,
-        reasoning_effort=reasoning_effort or self._reasoning_effort,
+        reasoning_effort=reasoning_effort,
         active=active,
         remote=remote,
         workspace_id=workspace_id if not remote else None,
@@ -976,6 +992,34 @@ class WorkspaceController:
     except (OSError, sqlite3.Error) as error:
       agent.show_error(f'could not save model preference: {error}')
 
+  def save_conversation(
+    self, agent: workspaces.Agent, conversation_id: str
+  ) -> None:
+    """Bind an opened local conversation to its tab, not its shared directory."""
+    source = next(
+      (
+        workspace
+        for workspace in self._agent_workspaces()
+        if workspace.agent is agent
+      ),
+      None,
+    )
+    if source is None or source.remote:
+      return
+    try:
+      with cli_store.Store(self._database) as store:
+        store.set_workspace_conversation(
+          self._repository_key, source.id, conversation_id, agent.workspace
+        )
+      overlay = self._overlays.get(source.id, cli_store.WorktreeOverlay())
+      self._overlays[source.id] = dataclasses.replace(
+        overlay,
+        conversation_id=conversation_id,
+        conversation_cwd=str(agent.workspace.resolve()),
+      )
+    except (OSError, sqlite3.Error) as error:
+      agent.show_error(f'could not save workspace conversation: {error}')
+
   def retarget_remote(self, agent: workspaces.Agent, session_id: str) -> None:
     """Keep a remote agent's tab and preferences on its selected session."""
     source = next(
@@ -1348,14 +1392,29 @@ class WorkspaceController:
   def new_workspace_selector(self) -> selection.Selector[actions.Action]:
     """Offer supported workspace kinds, remembering the last accepted choice."""
     previous = self._settings.read().get('new_workspace_kind')
+    workspace_actions: dict[str, actions.Action] = {
+      'normal': actions.CreateWorkspace('normal'),
+      'folder': actions.RestorePrompt('/folder '),
+      'worktree': actions.CreateWorkspace('worktree'),
+      'sandbox': actions.CreateSandbox(),
+    }
     return selection.Selector(
       id='new-workspace',
       title='New workspace',
       choices=(
-        selection.Choice('normal', 'Normal', 'Use the current directory'),
+        selection.Choice(
+          'normal', 'Working directory', 'Use the current directory'
+        ),
+        selection.Choice(
+          'folder', 'New working directory', 'Enter a path to another directory'
+        ),
         selection.Choice('worktree', 'Worktree', 'Create an isolated checkout'),
+        selection.Choice(
+          'sandbox', 'Local sandbox', 'Set up an isolated local VM'
+        ),
       ),
-      on_select=actions.CreateWorkspace,
+      numbered=True,
+      on_select=lambda kind: workspace_actions[kind],
       selected=previous
       if isinstance(previous, str) and previous in ('normal', 'worktree')
       else 'normal',
@@ -1440,6 +1499,91 @@ class WorkspaceController:
       raise
     self._insert_local(workspace)
     return self._workspace_snapshot(workspace, sender.id)
+
+  async def fork_workspace(
+    self, source: pathlib.Path | str, name: str | None = None
+  ) -> workspaces.PendingWorkspace:
+    """Start a snapshot-backed fork without waiting for checkout creation."""
+    sender = self._source_workspace(source)
+    if self._shutting_down or sender.sandbox is not None:
+      raise worktrees.WorktreeError(
+        'forking requires an available host workspace'
+      )
+    if (
+      sender.agent.queued_message_count
+      or sender.state is actions.WorktreeAgentState.RUNNING
+    ):
+      raise worktrees.WorktreeError(
+        'wait for the conversation and queued messages before forking'
+      )
+    if (
+      workspace_identity.git_workspace_key(str(sender.path))
+      != self._repository_key
+    ):
+      raise worktrees.WorktreeError(
+        'forking is scoped to the launch repository'
+      )
+    path = await asyncio.to_thread(
+      worktrees.fork_destination, sender.agent.workspace, name
+    )
+    conversation_id = uuid.uuid4().hex
+    pending = workspaces.PendingWorkspace(f'tab:{uuid.uuid4().hex}', path.name)
+    pending.preferences.CopyFrom(
+      self._overlays.get(sender.id, cli_store.WorktreeOverlay()).preferences
+    )
+    self._insert_local(pending)
+    task = asyncio.create_task(
+      self._fork_workspace(pending, sender, path, conversation_id)
+    )
+    self._worktree_creation_tasks.add(task)
+
+    def completed(task: asyncio.Task[workspaces.AgentWorkspace]) -> None:
+      self._worktree_creation_tasks.discard(task)
+      if not task.cancelled():
+        task.exception()
+
+    task.add_done_callback(completed)
+    return pending
+
+  async def _fork_workspace(
+    self,
+    pending: workspaces.PendingWorkspace,
+    source: workspaces.AgentWorkspace,
+    path: pathlib.Path,
+    conversation_id: str,
+  ) -> workspaces.AgentWorkspace:
+    try:
+      await self._cancel_reconcile()
+      cwd = await source.agent.fork_workspace(conversation_id, path, path.name)
+      created = await asyncio.to_thread(worktrees.current_worktree, path)
+      preferences = pending.preferences
+      config = self._new_worker_config(source.agent) | {
+        'conversation_id': conversation_id,
+        'create_session': False,
+      }
+      with cli_store.Store(self._database) as store:
+        store.set_worktree_preferences(
+          self._repository_key, created.id, preferences
+        )
+        store.set_workspace_conversation(
+          self._repository_key, created.id, conversation_id, cwd
+        )
+      self._overlays[created.id] = cli_store.WorktreeOverlay(
+        preferences=preferences,
+        conversation_id=conversation_id,
+        conversation_cwd=str(cwd),
+      )
+      workspace = self._new_workspace(
+        created,
+        config,
+        agent_workspace=cwd,
+        reasoning_effort=source.agent.reasoning_effort,
+      )
+      self._replace_pending(pending, workspace)
+      return workspace
+    except Exception as error:  # Keep partial checkout and conversation identities visible for recovery.
+      pending.error = f'Fork {conversation_id} at {path} did not finish: {error}. Check this outcome before retrying; no files were removed.'
+      raise worktrees.WorktreeError(pending.error) from error
 
   async def start_task(
     self, workspace_id: str, instruction: str

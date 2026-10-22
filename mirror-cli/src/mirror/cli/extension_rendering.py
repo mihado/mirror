@@ -10,7 +10,15 @@ from prompt_toolkit.layout import containers, dimension
 from prompt_toolkit.layout import mouse_handlers as _mouse_handlers
 from prompt_toolkit.layout import screen as _screen
 
-from mirror.cli import extension_faults
+from mirror.cli import extension_faults, row_renderer
+from mirror.cli.components import layout
+
+
+@functools.lru_cache(maxsize=1024)
+def _validate_style(style: str) -> None:
+  # Inline style syntax is independent of the active theme. Invalid results
+  # raise before entering the cache and still disable the extension boundary.
+  styles.Style([]).get_attrs_for_style_str(style)
 
 
 class ExtensionContainer(containers.Container):
@@ -26,6 +34,8 @@ class ExtensionContainer(containers.Container):
     self._interactive = interactive
     self._child = containers.to_container(child)
     self._boundary = boundary
+    self._widths = layout.FrameCache[dimension.Dimension]()
+    self._heights = layout.FrameCache[dimension.Dimension]()
 
   @override
   def reset(self) -> None:
@@ -33,21 +43,31 @@ class ExtensionContainer(containers.Container):
 
   @override
   def preferred_width(self, max_available_width: int) -> dimension.Dimension:
-    return self._boundary.call(
-      self._child.preferred_width,
-      dimension.Dimension.exact(0),
-      max_available_width,
+    if not self._boundary.active():
+      return dimension.Dimension.exact(0)
+    return self._widths.get(
+      (max_available_width,),
+      lambda: self._boundary.call(
+        self._child.preferred_width,
+        dimension.Dimension.exact(0),
+        max_available_width,
+      ),
     )
 
   @override
   def preferred_height(
     self, width: int, max_available_height: int
   ) -> dimension.Dimension:
-    return self._boundary.call(
-      self._child.preferred_height,
-      dimension.Dimension.exact(0),
-      width,
-      max_available_height,
+    if not self._boundary.active():
+      return dimension.Dimension.exact(0)
+    return self._heights.get(
+      (width, max_available_height),
+      lambda: self._boundary.call(
+        self._child.preferred_height,
+        dimension.Dimension.exact(0),
+        width,
+        max_available_height,
+      ),
     )
 
   @override
@@ -70,19 +90,18 @@ class ExtensionContainer(containers.Container):
     painted = _screen.Screen(
       initial_width=screen.width, initial_height=screen.height
     )
-    handlers = _mouse_handlers.MouseHandlers()
+    handlers = row_renderer.MouseHandlers()
     try:
       self._child.write_to_screen(
         painted, handlers, write_position, parent_style, erase_bg, z_index
       )
       painted.draw_all_floats()
       # Validate before copying: the terminal renderer parses inline colors later.
-      validator = styles.Style([])
       checked: set[str] = set()
       for row in painted.data_buffer.values():
         for cell in row.values():
           if cell.style not in checked:
-            validator.get_attrs_for_style_str(cell.style)
+            _validate_style(cell.style)
             checked.add(cell.style)
     except (
       Exception
@@ -97,6 +116,7 @@ class ExtensionContainer(containers.Container):
       write_position.xpos,
       write_position.xpos + write_position.width,
     )
+    guarded: dict[int, _mouse_handlers.MouseHandler] = {}
     for y in range(top, bottom):
       screen.data_buffer[y].update({
         x: cell
@@ -108,11 +128,19 @@ class ExtensionContainer(containers.Container):
         for x, value in painted.zero_width_escapes[y].items()
         if left <= x < right
       })
-      for x, handler in handlers.mouse_handlers[y].items():
-        if self._interactive and left <= x < right:
-          mouse_handlers.mouse_handlers[y][x] = functools.partial(
+    if self._interactive:
+
+      def guard(
+        handler: _mouse_handlers.MouseHandler,
+      ) -> _mouse_handlers.MouseHandler:
+        identity = id(handler)
+        if identity not in guarded:
+          guarded[identity] = functools.partial(
             self._boundary.call, handler, NotImplemented
           )
+        return guarded[identity]
+
+      handlers.copy_to(mouse_handlers, write_position, guard)
     screen.cursor_positions.update(painted.cursor_positions)
     screen.menu_positions.update(painted.menu_positions)
     screen.visible_windows_to_write_positions.update(

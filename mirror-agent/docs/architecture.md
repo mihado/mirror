@@ -33,6 +33,7 @@ model/tool loop themselves.
 | [Agent loop](../src/react/agent.rs)                          | Model/tool iteration and turn completion                                 |
 | [Providers](../src/providers/model_provider.rs)              | Protocol selection and model clients                                     |
 | [Tools](../src/tools/mod.rs)                                 | Native file, shell, search, and other tools                              |
+| [Tool executors](../src/tool_executors/mod.rs)              | Ordered execution of tool batches: direct, remote, and sandboxed        |
 | [Compaction](../src/compaction/compactor.rs)                 | Summarization and context budgets                                        |
 | [System prompt](../src/system_prompt/build_system_prompt.rs) | Environment, project instructions, and skills                            |
 | [Store](../src/store.rs)                                     | Durable conversation storage contract                                    |
@@ -47,7 +48,10 @@ model/tool loop themselves.
 1. The service accepts a user message for its conversation.
 2. The agent assembles context and calls the configured model provider.
 3. Requested tools execute through the tool executor, subject to the service's
-   approval mode. Results return to the model for the next iteration.
+   approval mode. Consecutive calls to concurrency-safe tools (the read-only
+   file, search, web and memory-search tools) run together, up to ten at a
+   time; any other call runs alone, after every earlier call in the batch.
+   Results return to the model in call order for the next iteration.
 4. The loop finishes with a response, reaches a limit, fails, or is interrupted.
 5. Committed records go to the store; transient previews and runtime events
    are delivered separately.

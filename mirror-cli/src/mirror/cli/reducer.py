@@ -276,8 +276,15 @@ def _reduce(
       return state, ()
     case _actions.AcceptSelection(index):
       if index is not None:
-        if not state.selector.numbered or not 0 <= index < min(
-          9, len(state.selector.filtered_choices())
+        selector = state.selector.selector
+        if (
+          not state.selector.numbered
+          or selector is None
+          or not selector.numbered_from
+          <= index
+          < min(
+            selector.numbered_from + 9, len(state.selector.filtered_choices())
+          )
         ):
           return state, ()
         state = dataclasses.replace(
@@ -349,19 +356,31 @@ def _reduce(
       ) if state.composer.text else ()
     case _actions.ExtensionConsentResolved(key, revision):
       selector = state.selector.selector
-      if (
-        selector is not None
-        and isinstance(selector.cancel_action, _actions.ExtensionConsent)
-        and selector.cancel_action.key == key
-        and selector.cancel_action.revision == revision
+      if selector is not None and isinstance(
+        selector.cancel_action, _actions.ExtensionConsentBatch
       ):
-        return _reduce(state, _actions.ClearSelector())
+        remaining = tuple(
+          request
+          for request in selector.cancel_action.requests
+          if (request.key, request.revision) != (key, revision)
+        )
+        if not remaining:
+          return _reduce(state, _actions.ClearSelector())
+        return dataclasses.replace(
+          state,
+          selector=dataclasses.replace(
+            state.selector,
+            selector=dataclasses.replace(
+              selector, cancel_action=_actions.ExtensionConsentBatch(remaining)
+            ),
+          ),
+        ), ()
       return state, ()
     case _actions.ShowExtensions():
       return state, (effects.ShowExtensions(),)
     case (
       _actions.ToggleExtension()
-      | _actions.ExtensionConsent()
+      | _actions.ExtensionConsentBatch()
       | _actions.AddExtension()
       | _actions.UpdateExtensions()
       | _actions.RemoveExtension()
@@ -393,6 +412,12 @@ def _reduce(
       return state, (effects.CancelModelSelection(),)
     case _actions.ForgetReflectionKey():
       return state, (effects.ForgetReflectionKey(),)
+    case _actions.SetWebProvider(provider):
+      if state.session.remote:
+        return state, (
+          effects.EmitError('web provider is configured by the server'),
+        )
+      return state, (effects.SetWebProvider(provider),)
     case _actions.SetModel(model_id):
       if state.session.remote:
         return state, (
@@ -473,6 +498,12 @@ def _reduce(
           effects.EmitError('workspace supervision is unavailable'),
         )
       return state, (effects.CloseWorkspace(),)
+    case _actions.ForkWorkspace(name):
+      if not state.supervised:
+        return state, (
+          effects.EmitError('workspace supervision is unavailable'),
+        )
+      return state, (effects.ForkWorkspace(name),)
     case _actions.CreateWorktree(name):
       if not state.supervised:
         return state, (
@@ -725,7 +756,12 @@ def _reduce(
         submitted_inputs=(),
         input_order=tuple(key for key, _ in state.turn.awaiting_inputs),
       )
-      return dataclasses.replace(state, turn=turn), ()
+      updated = dataclasses.replace(state, turn=turn)
+      restore_effects: list[effects.Effect] = []
+      for _, instruction in reversed(state.turn.submitted_inputs):
+        updated, emitted = _restore_draft(updated, instruction)
+        restore_effects.extend(emitted)
+      return updated, (*restore_effects,)
     case _actions.InputRejected(message_id):
       instruction = next(
         (
@@ -1315,6 +1351,16 @@ def _reduce(
         and previous is not None
         and previous.id == selector.id
       )
+      if (
+        keep_open
+        and previous is not None
+        and isinstance(previous.cancel_action, _actions.ExtensionConsentBatch)
+        and isinstance(selector.cancel_action, _actions.ExtensionConsentBatch)
+      ):
+        # Checkbox refreshes must not resurrect already resolved revisions.
+        selector = dataclasses.replace(
+          selector, cancel_action=previous.cancel_action
+        )
       selector_state = _state.SelectorState(
         menu=_state.MenuState(max_rows=4 if selector.id == 'resume' else 8),
         selector=selector,
@@ -1616,6 +1662,20 @@ def _reduce(
         return state, ()
       tasks = dataclasses.replace(state.tasks, selected_id=None)
       return dataclasses.replace(state, tasks=tasks), (effects.FocusComposer(),)
+    case _actions.InspectSelectedTask():
+      task = next(
+        (
+          task
+          for task in state.tasks.tasks
+          if task.id == state.tasks.selected_id
+        ),
+        None,
+      )
+      if task is None or not task.inspectable:
+        return state, ()
+      return state, (effects.InspectTask(task),)
+    case _actions.CloseInspection():
+      return state, (effects.CloseInspection(),)
     case _actions.CancelSelectedTask():
       task_id = state.tasks.selected_id
       if task_id is None:
@@ -1630,27 +1690,10 @@ def _reduce(
     case _actions.InterruptRequested():
       if not state.activity.busy and state.approval.request is None:
         return state, ()
-      drafts = (
-        *_unsaved_instructions(state.turn),
-        *((state.composer.text,) if state.composer.text else ()),
-      )
-      text = '\n'.join(drafts)
       activity = dataclasses.replace(state.activity, status='interrupting…')
-      turn = dataclasses.replace(
-        state.turn,
-        queued=(),
-        submitted_inputs=(),
-        awaiting_inputs=(),
-        input_order=(),
+      return dataclasses.replace(state, activity=activity), (
+        effects.InterruptTurn(),
       )
-      composer = _actions.ComposerState(text, len(text))
-      return dataclasses.replace(
-        state,
-        activity=activity,
-        turn=turn,
-        composer=composer,
-        completion=_state.CompletionState(),
-      ), (effects.SetComposerText(text), effects.InterruptTurn())
     case _actions.CancelOrQuitRequested():
       if state.resume.confirmation is not None:
         return _reduce(state, _actions.ClearResume())

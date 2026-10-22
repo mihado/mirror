@@ -620,6 +620,7 @@ def run(
           'create_session': True,
         },
         database=root / 'cli.db',
+        collect_analytics=False,
         scrollback_limit=scrollback_limit,
         flush_scrollback=flush_scrollback,
       )

@@ -64,6 +64,46 @@ running or temporary files behind. Mutations are never replayed. Remote file
 snapshots, directory listings, and search streams are limited to 64 MiB; edits
 reject files changed since their snapshot.
 
+## MCP
+
+Pass trusted MCP connections as inline JSON:
+
+```bash
+mirror-agent serve --model your-model-name \
+  --mcp-connections '[{"name":"example","config":{"url":"http://127.0.0.1:8000/mcp"}}]'
+```
+
+For bearer authentication, put this in `connections.json`:
+
+```json
+[
+  {
+    "name": "search",
+    "config": {
+      "url": "https://mcp.example.com/mcp",
+      "auth": { "type": "bearer", "tokenEnvVar": "MCP_TOKEN" }
+    }
+  }
+]
+```
+
+Read the token privately in Bash, then pass the **file contents**, not its path:
+
+```bash
+read -rs -p 'MCP token: ' MCP_TOKEN; echo
+export MCP_TOKEN
+mirror-agent serve --model your-model-name \
+  --mcp-connections "$(cat connections.json)"
+```
+
+`tokenEnvVar` is the environment variable's **name**, not the token. Its value is
+the raw token, without the `Bearer ` prefix; Mirror adds the authorization header.
+`'$file'` passes literal text; use `"$(cat "$file")"` for a filename variable.
+
+Add `--remote <send-command-url>` to run workspace tools in a sandbox. HTTP MCP
+still runs through the agent host, without sending its credentials to the sandbox.
+Stdio MCP requires local mode.
+
 ## Inference and limits
 
 | Options                              | Purpose                                                            |
@@ -74,6 +114,7 @@ reject files changed since their snapshot.
 | `--context-window`, `--max-tokens`   | Context and output-token budgets                                   |
 | `--compaction-threshold`             | When to summarize history                                          |
 | `--max-iterations`                   | Maximum model/tool iterations per turn                             |
+| `--max-exceptions`                   | Consecutive retryable failures; 0 disables the cutoff (default)     |
 | `--turn-timeout-seconds`             | Turn deadline                                                      |
 | `--request-timeout-seconds`          | Limit on one model request, including generation; unset by default |
 

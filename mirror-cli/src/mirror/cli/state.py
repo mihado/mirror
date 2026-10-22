@@ -102,6 +102,7 @@ class SessionState:
 
   conversation_id: str
   remote: bool = False
+  read_only: bool = False
   pending_switch: actions.PendingSwitch | None = None
   has_user_message: bool = False
   replaying: bool = True

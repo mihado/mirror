@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+import itertools
 from collections.abc import Callable
 from typing import override
 
@@ -36,7 +38,7 @@ class Pending(component.Component):
 
 
 def render(state: _state.State, background_shortcut: str = '') -> ansi.ANSI:
-  """Render in-flight tool calls exactly like their settled form."""
+  """Render in-flight tools with single-line summaries in the default view."""
   if state.approval.request is not None:
     return ansi.ANSI('')
   return _render(
@@ -62,12 +64,6 @@ def _render(
 ) -> ansi.ANSI:
   """Share tool-row rendering between measurement and painting."""
   blocks = renderables(view_mode, running, pending, group, background_shortcut)
-  if view_mode is _actions.ViewMode.DEFAULT:
-    return ansi.ANSI(
-      rendering.renderable_to_ansi(
-        console.Group(*blocks), columns, theme_name=theme_name
-      ).rstrip()
-    )
   return ansi.ANSI(
     rendering.render_blocks(blocks, columns, theme_name=theme_name)
   )
@@ -88,18 +84,60 @@ def renderables(
   if view_mode is _actions.ViewMode.DEFAULT:
     parts: list[console.RenderableType] = []
     calls = (*running, *pending)
+    # Only consecutive calls with the same semantic key share a progress row.
+    batches = [
+      tuple(batch)
+      for _, batch in itertools.groupby(
+        calls, key=lambda call: tool_groups.group_key(call.name)
+      )
+    ]
+    if len(batches) > 1:
+      hinted_call = next(
+        (
+          call
+          for call in reversed(running)
+          if tool_groups.group_key(call.name) != 'exploration'
+        ),
+        None,
+      )
+      for index, batch in enumerate(batches):
+        parts.extend(
+          renderables(
+            view_mode,
+            tuple(
+              call
+              for call in batch
+              if isinstance(call, _actions.RunningToolCall)
+            ),
+            tuple(
+              call
+              for call in batch
+              if isinstance(call, _actions.PendingToolCall)
+            ),
+            group if index == 0 else None,
+            background_shortcut if hinted_call in batch else '',
+          )
+        )
+      return tuple(parts)
     key = tool_groups.group_key(calls[-1].name) if calls else None
+    if group is not None and calls and group.key != key:
+      return (
+        group.summary(),
+        *renderables(view_mode, running, pending, None, background_shortcut),
+      )
     summary = group
     if summary is None and key is not None:
       summary = tool_groups.ToolGroup(key=key)
     if summary is not None:
       parts.append(summary.summary(active=bool(calls)))
-    label = group.latest if group is not None else ''
-    wrap = False
+    label = group.latest if group is not None else None
     if calls:
       current = calls[-1]
-      wrap = current.name == 'bash'
-      args = rendering.command_preview(current.args) if wrap else current.args
+      args = (
+        rendering.command_preview(current.args)
+        if current.name == 'bash'
+        else current.args
+      )
       verb = {
         'bash': 'Running',
         'read': 'Reading',
@@ -113,16 +151,25 @@ def renderables(
         'web_browse': 'Web browsing',
         'subagent': 'Subagent',
       }.get(current.name, tool_groups.display_name(current.name).capitalize())
-      label = f'{verb} {args}'
-      if len(calls) > 1:
-        label += f' · {len(calls)} running'
-    if label:
+      label = rendering.ToolLabel(
+        ' '.join(verb.split()),
+        ' '.join(args.split()),
+        f' · {len(calls)} running' if len(calls) > 1 else '',
+      )
+    if label is not None:
+      if summary is not None:
+        label = dataclasses.replace(
+          label,
+          arguments=' '.join(rendering.strip_ansi(label.arguments).split()),
+        )
+      title = label.render()
+      title.overflow = 'ellipsis'
+      title.no_wrap = True
       if summary is None:
         return (
           rendering.tool_block(
-            text.Text(rendering.strip_ansi(label), style='dim'),
+            title,
             rendering.result_summary(hint) if hint and running else None,
-            wrap=wrap,
           ),
         )
       prefix = ' ' * rendering.GUTTER_WIDTH + '└ '
@@ -131,14 +178,9 @@ def renderables(
       row.add_column()
       row.add_row(
         text.Text(prefix, style='dim'),
-        text.Text(
-          rendering.strip_ansi(label),
-          style='dim',
-          overflow='fold' if wrap else 'ellipsis',
-          no_wrap=not wrap,
-        ),
+        title,
       )
-      if hint and running:
+      if hint and running and summary.key != 'exploration':
         row.add_row(
           text.Text(prefix, style='dim'), rendering.result_summary(hint)
         )

@@ -13,6 +13,10 @@ from mirror.cli.components import component
 
 class Failure(component.Component):
   @override
+  def cache_key(self, state: state.State) -> object:
+    return state.lifecycle.failure is not None
+
+  @override
   def render(self, state: state.State) -> containers.AnyContainer:
     fragments: StyleAndTextTuples = (
       []

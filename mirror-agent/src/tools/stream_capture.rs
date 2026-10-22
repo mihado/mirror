@@ -23,7 +23,7 @@ const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 const QUEUED_READS: usize = 16;
 
 /// A stream being captured, fed its bytes in the order the command wrote them.
-pub(super) struct StreamCapture {
+pub(crate) struct StreamCapture {
     max_kept_chars: usize,
     needles: Vec<&'static str>,
     found: Vec<bool>,
@@ -45,7 +45,7 @@ pub(super) struct StreamCapture {
 impl StreamCapture {
     /// A capture that keeps at most `max_kept_chars` of stripped text and
     /// records which of `needles` the stream contains.
-    pub(super) fn new(max_kept_chars: usize, needles: Vec<&'static str>) -> Self {
+    pub(crate) fn new(max_kept_chars: usize, needles: Vec<&'static str>) -> Self {
         Self {
             max_kept_chars,
             found: vec![false; needles.len()],
@@ -71,7 +71,7 @@ impl StreamCapture {
     ///
     /// The capture takes the reads sent to the returned sender, in order; the
     /// handle yields it finished once every sender is dropped.
-    pub(super) fn spawn(
+    pub(crate) fn spawn(
         max_kept_chars: usize,
         needles: Vec<&'static str>,
     ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<CapturedStream>) {
@@ -87,7 +87,7 @@ impl StreamCapture {
     }
 
     /// Record the next bytes the stream produced.
-    pub(super) fn push(&mut self, bytes: &[u8]) {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
         self.raw_bytes += bytes.len() as u64;
         let mut input = std::mem::take(&mut self.undecoded);
         input.extend_from_slice(bytes);
@@ -109,7 +109,7 @@ impl StreamCapture {
     }
 
     /// The finished capture, once the stream has ended.
-    pub(super) fn finish(mut self) -> CapturedStream {
+    pub(crate) fn finish(mut self) -> CapturedStream {
         let undecoded = std::mem::take(&mut self.undecoded);
         if !undecoded.is_empty() {
             self.push_text(&String::from_utf8_lossy(&undecoded));

@@ -4,41 +4,41 @@ use super::capture_storage::CaptureStorage;
 use super::partial_text::PartialText;
 
 /// Characters of each end of the stream kept for a timed-out result.
-pub(super) const RAW_END_CHARS: usize = 2_048;
+pub(crate) const RAW_END_CHARS: usize = 2_048;
 
 /// A whole stream's capture: its ends, its counts and its kept text, as
 /// `StreamCapture::finish` records them.
 #[derive(Debug)]
 pub(crate) struct CapturedStream {
     /// Whether the stream wrote nothing.
-    pub(super) is_empty: bool,
+    pub(crate) is_empty: bool,
     /// The stream's length in characters, as `from_utf8_lossy` decodes it.
-    pub(super) raw_chars: usize,
+    pub(crate) raw_chars: usize,
     /// The stream's first `2 * RAW_END_CHARS` characters.
-    pub(super) raw_head: String,
+    pub(crate) raw_head: String,
     /// The stream's last `RAW_END_CHARS` characters.
-    pub(super) raw_tail: String,
+    pub(crate) raw_tail: String,
     /// Which of the capture's needles the stream contains.
-    pub(super) found: Vec<bool>,
+    pub(crate) found: Vec<bool>,
     /// Whether the stream has a non-blank character.
-    pub(super) has_text: bool,
+    pub(crate) has_text: bool,
     /// Characters from the start of the kept text to its stripped end.
-    pub(super) text_chars: usize,
+    pub(crate) text_chars: usize,
     /// Line breaks from the start of the kept text to its stripped end.
-    pub(super) text_newlines: usize,
+    pub(crate) text_newlines: usize,
     /// Characters from the start of the kept text to the stream's end.
-    pub(super) rest_chars: usize,
+    pub(crate) rest_chars: usize,
     /// Line breaks from the start of the kept text to the stream's end.
-    pub(super) rest_newlines: usize,
+    pub(crate) rest_newlines: usize,
     /// The most characters of text kept.
-    pub(super) max_kept_chars: usize,
+    pub(crate) max_kept_chars: usize,
     /// The kept text.
-    pub(super) storage: CaptureStorage,
+    pub(crate) storage: CaptureStorage,
 }
 
 impl CapturedStream {
     /// Capture `bytes` as one stream that wrote them in a single read.
-    pub(super) fn from_bytes(
+    pub(crate) fn from_bytes(
         bytes: &[u8],
         max_kept_chars: usize,
         needles: Vec<&'static str>,
@@ -50,7 +50,7 @@ impl CapturedStream {
 
     /// The whole stream when it is at most `2 * RAW_END_CHARS` characters,
     /// otherwise its first `RAW_END_CHARS`.
-    pub(super) fn raw_head(&self) -> &str {
+    pub(crate) fn raw_head(&self) -> &str {
         if self.raw_chars <= 2 * RAW_END_CHARS {
             return &self.raw_head;
         }
@@ -63,7 +63,7 @@ impl CapturedStream {
     }
 
     /// The index of the first needle the stream contains.
-    pub(super) fn first_needle(&self) -> Option<usize> {
+    pub(crate) fn first_needle(&self) -> Option<usize> {
         self.found.iter().position(|found| *found)
     }
 
@@ -72,7 +72,7 @@ impl CapturedStream {
     /// # Errors
     ///
     /// Returns an error when the kept text cannot be read or was lost.
-    pub(super) fn stripped(&mut self) -> std::io::Result<PartialText> {
+    pub(crate) fn stripped(&mut self) -> std::io::Result<PartialText> {
         if !self.has_text {
             return Ok(PartialText::whole(String::new()));
         }
@@ -90,7 +90,7 @@ impl CapturedStream {
     /// # Errors
     ///
     /// Returns an error when the kept text cannot be read or was lost.
-    pub(super) fn stripped_with_suffix(&mut self, suffix: &str) -> std::io::Result<PartialText> {
+    pub(crate) fn stripped_with_suffix(&mut self, suffix: &str) -> std::io::Result<PartialText> {
         if !self.has_text {
             return Ok(PartialText::whole(strip_leading_lines(suffix)));
         }

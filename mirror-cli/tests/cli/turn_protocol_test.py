@@ -204,8 +204,9 @@ def test_declined_interrupt_ends_interrupting() -> None:
 
   current = _reduce(current, actions.InterruptDeclined('interrupt-1'))
 
-  assert not current.activity.busy
-  assert current.activity.status == ''
+  assert current.activity.busy
+  assert current.activity.status == 'thinking…'
+  assert current.turn.queued == ('status?',)
   assert current.turn.interrupt_id is None
 
 
@@ -408,16 +409,22 @@ class _Agent:
         pending=(*self.pending, (message_id, text)),
       )
     if self.in_turn:
+      if self.pending and self.stale:
+        return dataclasses.replace(self, requests=requests).fail(starting=False)
+      durable = tuple(('durable', item, text) for item, text in self.pending)
+      restarted = (('turn_started', '', ''),) if self.pending else ()
       return dataclasses.replace(
         self,
         requests=requests,
         events=(
           *self.events,
+          *durable,
           ('turn_interrupted', '', ''),
           ('turn_completed', '', ''),
+          *restarted,
         ),
         pending=(),
-        in_turn=False,
+        in_turn=bool(self.pending),
       )
     return dataclasses.replace(
       self, requests=requests, events=(*self.events, ('nack', message_id, ''))

@@ -25,6 +25,11 @@ async fn reports_lifecycle_updates_and_detached_completion() {
             TaskBehavior::Detach,
             |context| async move {
                 context.update(Some("working".to_string()));
+                context.agent_event(crate::AgentEvent::StreamContent(
+                    mirror_protocol::StreamContent {
+                        content: "partial answer".into(),
+                    },
+                ));
                 released.await.expect("released");
                 ToolOutput::success("done")
             },
@@ -49,6 +54,8 @@ async fn reports_lifecycle_updates_and_detached_completion() {
             ..
         })) if display == "working"
     );
+    assert_matches!(events.recv().await, Some(TaskEvent::Agent(info, event))
+        if info.id == task_id && matches!(*event, crate::AgentEvent::StreamContent(ref content) if content.content == "partial answer"));
 
     release.send(()).expect("release");
     assert_eq!(

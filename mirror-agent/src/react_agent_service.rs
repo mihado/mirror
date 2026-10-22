@@ -3,9 +3,11 @@ use std::collections::HashSet;
 use std::future;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::tools::ToolOutput;
 use crate::Store;
@@ -21,12 +23,12 @@ use mirror_protocol::AgentMessage;
 use mirror_protocol::ApprovalSource;
 use mirror_protocol::ChatRecord;
 use mirror_protocol::FunctionCall;
+use mirror_protocol::HitlRequest;
 use mirror_protocol::InferenceConfig;
 use mirror_protocol::TaskResultRecord;
 use mirror_protocol::ToolApprovalOutcome;
 use mirror_protocol::ToolCall;
 use mirror_protocol::ToolMessage;
-use mirror_protocol::UserMessage;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -34,6 +36,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::input_payload;
 use crate::providers::Llm;
 use crate::react::ContextHooks;
 use crate::react::ReactAgent;
@@ -46,14 +49,18 @@ use crate::task_manager::TaskEvent;
 use crate::task_manager::TaskManager;
 use crate::tools::ToolExecutor;
 use crate::tools::ToolExecutorError;
+use crate::web::WebProviderConfig;
 use crate::AgentApprovalMode;
 use crate::AgentEvent;
 use crate::ApprovalDecision;
 use crate::ApprovalHook;
+use crate::ApprovalKind;
 use crate::ApprovalRequest;
 use crate::ExecutionContext;
 use crate::ExecutionContextInput;
 use crate::HostToolRequest;
+use crate::Inbox;
+use crate::InboxAdmission;
 use crate::MentionedSkills;
 use crate::TaskInfo;
 use crate::TaskManagerHandle;
@@ -75,9 +82,33 @@ pub struct ReactAgentService<Model> {
     pending_approvals: PendingApprovals,
     approval_resolutions: FuturesUnordered<BoxFuture<'static, ()>>,
     pending_host_tools: HashMap<String, PendingHostTool>,
+    external_tools: Vec<oneshot::Sender<()>>,
     inputs: HashMap<String, agent_message::Payload>,
+    inbox: Option<Arc<dyn Inbox>>,
     resume_turn: bool,
 }
+
+// The receiver stays alive while a CallTool future is owned outside the actor, including cancellation.
+fn track_external_tool(
+    active: &mut Vec<oneshot::Sender<()>>,
+    execution: BoxFuture<'static, Result<ToolOutput, ToolExecutorError>>,
+) -> BoxFuture<'static, Result<ToolOutput, ToolExecutorError>> {
+    active.retain(|tool| !tool.is_closed());
+    let (sender, receiver) = oneshot::channel();
+    active.push(sender);
+    Box::pin(async move {
+        let result = execution.await;
+        drop(receiver);
+        result
+    })
+}
+
+const INBOX_READ_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
 
 #[derive(Clone)]
 pub struct ReactAgentServiceHandle {
@@ -91,11 +122,12 @@ pub struct ReactAgentServiceHandle {
 #[non_exhaustive]
 pub enum ReactServiceEvent {
     Agent(AgentEvent),
-    HitlRequest(ToolCall),
+    HitlRequest(HitlRequest),
     HitlResolved { call_id: String, approved: bool },
     TaskUpdated(TaskInfo),
+    TaskAgentEvent(TaskInfo, Box<AgentEvent>),
     HostToolCall(ToolCall),
-    TurnStarted,
+    TurnStarted { turn_id: Option<String> },
     TurnCompleted,
     TurnInterrupted,
     TurnError(String),
@@ -119,9 +151,16 @@ pub enum ReactServiceError {
 }
 
 enum Command {
+    ForkWorkspace {
+        checkpoints: crate::Checkpoints,
+        destination: PathBuf,
+        name: String,
+        response: oneshot::Sender<Result<(u64, PathBuf), ReactServiceError>>,
+    },
     CallTool {
         name: String,
         arguments: String,
+        web_provider: Option<WebProviderConfig>,
         response: oneshot::Sender<BoxFuture<'static, Result<ToolOutput, ToolExecutorError>>>,
     },
     GetMessages {
@@ -151,13 +190,17 @@ enum Command {
         result: oneshot::Sender<Result<bool, ReactServiceError>>,
     },
     DetachTools(oneshot::Sender<Result<usize, ReactServiceError>>),
-    PendingApprovals(oneshot::Sender<Vec<ToolCall>>),
+    PendingApprovals(oneshot::Sender<Vec<HitlRequest>>),
     SetApprovalMode {
         mode: AgentApprovalMode,
         result: oneshot::Sender<Result<(), ReactServiceError>>,
     },
     SetInferenceConfig {
         inference: InferenceConfig,
+        result: oneshot::Sender<()>,
+    },
+    SetWebProvider {
+        provider: WebProviderConfig,
         result: oneshot::Sender<()>,
     },
     CloseIfIdle(oneshot::Sender<bool>),
@@ -180,6 +223,7 @@ enum OperationOutcome {
 /// A decision a client still owes, with the call it was asked about.
 struct PendingApproval {
     call: ToolCall,
+    kind: ApprovalKind,
     response: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -260,6 +304,10 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
         let (context, mut context_events) =
             ReactContext::new(session_id.clone(), entries, store, execution);
         let mut context = context.with_hooks(hooks);
+        let inbox = context.inbox();
+        if inbox.is_some() {
+            context.input().ring();
+        }
         let initialized = agent.initialize(&mut context, tool_executor.as_ref()).await;
         while let Ok(event) = context_events.try_recv() {
             publish_context_event(&events, event);
@@ -283,7 +331,9 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
             pending_approvals: HashMap::new(),
             approval_resolutions: FuturesUnordered::new(),
             pending_host_tools: HashMap::new(),
+            external_tools: Vec::new(),
             inputs,
+            inbox,
             resume_turn: false,
         };
         let runner = async move {
@@ -359,15 +409,42 @@ impl ReactAgentServiceHandle {
         .await?
     }
 
+    /// Pair an idle durable conversation boundary with a new snapshot-backed checkout.
+    pub async fn fork_workspace(
+        &self,
+        checkpoints: crate::Checkpoints,
+        destination: PathBuf,
+        name: String,
+    ) -> Result<(u64, PathBuf), ReactServiceError> {
+        self.request(|response| Command::ForkWorkspace {
+            checkpoints,
+            destination,
+            name,
+            response,
+        })
+        .await?
+    }
+
     pub async fn call_tool(
         &self,
         name: String,
         arguments: String,
     ) -> Result<ToolOutput, ReactServiceError> {
+        self.call_tool_with_web_provider(name, arguments, None)
+            .await
+    }
+
+    pub async fn call_tool_with_web_provider(
+        &self,
+        name: String,
+        arguments: String,
+        web_provider: Option<WebProviderConfig>,
+    ) -> Result<ToolOutput, ReactServiceError> {
         let execution = self
             .request(|response| Command::CallTool {
                 name,
                 arguments,
+                web_provider,
                 response,
             })
             .await?;
@@ -382,7 +459,8 @@ impl ReactAgentServiceHandle {
         self.queue_execute(message, None)
     }
 
-    /// Accept into the actor's input queue, not necessarily durable history.
+    /// Wait until the actor admits the input: committed to the session's inbox
+    /// when it has one, otherwise queued in memory.
     pub async fn accept(&self, message: AgentMessage) -> Result<(), ReactServiceError> {
         let (accepted, receipt) = oneshot::channel();
         self.queue_execute(message, Some(accepted))?;
@@ -394,27 +472,7 @@ impl ReactAgentServiceHandle {
         message: AgentMessage,
         accepted: Option<oneshot::Sender<Result<(), ReactServiceError>>>,
     ) -> Result<(), ReactServiceError> {
-        match message.payload.as_ref() {
-            Some(agent_message::Payload::Chat(chat)) => {
-                if chat.rewind_to.is_some() {
-                    return Err(ReactServiceError::Agent(
-                        "rewind_to is not supported; fork the session with MirrorRPC.ForkSession"
-                            .to_string(),
-                    ));
-                }
-                if !matches!(chat.message, Some(chat_record::Message::User(_))) {
-                    return Err(ReactServiceError::Agent(
-                        "service input is not a user or extension message".to_string(),
-                    ));
-                }
-            }
-            Some(agent_message::Payload::Extension(_)) => {}
-            _ => {
-                return Err(ReactServiceError::Agent(
-                    "service input is not a user or extension message".to_string(),
-                ));
-            }
-        }
+        validate_input(&message)?;
         self.commands
             .send(Command::Execute {
                 message: Box::new(message),
@@ -474,7 +532,7 @@ impl ReactAgentServiceHandle {
     }
 
     /// Calls that are still waiting for an approval decision.
-    pub async fn pending_approvals(&self) -> Result<Vec<ToolCall>, ReactServiceError> {
+    pub async fn pending_approvals(&self) -> Result<Vec<HitlRequest>, ReactServiceError> {
         self.request(Command::PendingApprovals).await
     }
 
@@ -485,6 +543,14 @@ impl ReactAgentServiceHandle {
     ) -> Result<(), ReactServiceError> {
         self.request(|result| Command::SetApprovalMode { mode, result })
             .await?
+    }
+
+    pub async fn set_web_provider(
+        &self,
+        provider: WebProviderConfig,
+    ) -> Result<(), ReactServiceError> {
+        self.request(|result| Command::SetWebProvider { provider, result })
+            .await
     }
 
     pub async fn set_inference_config(
@@ -520,15 +586,55 @@ impl ReactAgentServiceHandle {
 
 impl<Model: Llm> ReactAgentService<Model> {
     fn call_tool(
-        &self,
+        &mut self,
         name: String,
         arguments: String,
+        web_provider: Option<WebProviderConfig>,
     ) -> BoxFuture<'static, Result<ToolOutput, ToolExecutorError>> {
-        self.tool_executor
-            .call_tool(name, arguments, self.context.execution().clone())
+        track_external_tool(
+            &mut self.external_tools,
+            self.tool_executor.call_tool(
+                name,
+                arguments,
+                self.context
+                    .execution()
+                    .clone()
+                    .with_web_provider(web_provider),
+            ),
+        )
+    }
+
+    async fn fork_workspace(
+        &mut self,
+        checkpoints: crate::Checkpoints,
+        destination: PathBuf,
+        name: String,
+    ) -> Result<(u64, PathBuf), ReactServiceError> {
+        self.external_tools.retain(|tool| !tool.is_closed());
+        let tasks_idle = self.tasks.list().await.is_ok_and(|tasks| tasks.is_empty());
+        self.publish_task_events();
+        if !tasks_idle
+            || !self.external_tools.is_empty()
+            || self.context.has_pending()
+            || !self.pending_approvals.is_empty()
+            || !self.pending_host_tools.is_empty()
+            || !self.approval_resolutions.is_empty()
+        {
+            return Err(ReactServiceError::ConversationBusy);
+        }
+        // Reload the durable boundary rather than using a possibly failed in-memory append.
+        let (entries, _) = self.context.history(0, u32::MAX).await?;
+        let head = crate::head(&entries);
+        let workspace = checkpoints
+            .fork(&destination, &name)
+            .await
+            .map_err(|error| ReactServiceError::Agent(error.to_string()))?;
+        Ok((head, workspace))
     }
 
     async fn run(mut self) {
+        let mut inbox_read_failures = 0;
+        let mut inbox_retry_at = None;
         loop {
             if let Err(error) = self
                 .agent
@@ -539,15 +645,34 @@ impl<Model: Llm> ReactAgentService<Model> {
                     .events
                     .send(ReactServiceEvent::TurnError(error.to_string()));
             }
-            if self.resume_turn {
-                self.resume_turn = false;
-                if !self.run_turn(Vec::new()).await {
-                    return;
+            // Only the retry timer re-enables reads; other actor traffic must
+            // neither bypass nor restart the backoff.
+            let pending = if inbox_retry_at.is_none() && self.context.has_pending() {
+                match self.context.take_pending().await {
+                    Ok(pending) => {
+                        inbox_read_failures = 0;
+                        pending
+                    }
+                    Err(ReactContextError::Store(StoreError::Persistence(_)))
+                        if inbox_read_failures < INBOX_READ_RETRY_DELAYS.len() =>
+                    {
+                        inbox_retry_at =
+                            Some(Instant::now() + INBOX_READ_RETRY_DELAYS[inbox_read_failures]);
+                        inbox_read_failures += 1;
+                        Vec::new()
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .events
+                            .send(ReactServiceEvent::TurnError(error.to_string()));
+                        self.stop(false).await;
+                        return;
+                    }
                 }
-                continue;
-            }
-            let pending = self.context.flush_pending();
-            if !pending.is_empty() {
+            } else {
+                Vec::new()
+            };
+            if !pending.is_empty() || (self.resume_turn && inbox_read_failures == 0) {
                 if !self.run_turn(pending).await {
                     return;
                 }
@@ -555,6 +680,14 @@ impl<Model: Llm> ReactAgentService<Model> {
             }
             let host_tool_timeout = next_host_tool_timeout(&self.pending_host_tools);
             tokio::select! {
+                () = async {
+                    match inbox_retry_at {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => future::pending().await,
+                    }
+                } => {
+                    inbox_retry_at = None;
+                }
                 Some(()) = self.approval_resolutions.next() => {}
                 call_id = wait_for_host_tool_timeout(host_tool_timeout) => {
                     if let Some(call_id) = call_id {
@@ -601,12 +734,22 @@ impl<Model: Llm> ReactAgentService<Model> {
 
     async fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::ForkWorkspace {
+                checkpoints,
+                destination,
+                name,
+                response,
+            } => {
+                let result = self.fork_workspace(checkpoints, destination, name).await;
+                let _ = response.send(result);
+            }
             Command::CallTool {
                 name,
                 arguments,
+                web_provider,
                 response,
             } => {
-                let _ = response.send(self.call_tool(name, arguments));
+                let _ = response.send(self.call_tool(name, arguments, web_provider));
             }
             Command::GetMessages {
                 offset,
@@ -621,7 +764,14 @@ impl<Model: Llm> ReactAgentService<Model> {
                 );
             }
             Command::Execute { message, accepted } => {
-                let result = accept_input(&self.context.input(), &mut self.inputs, *message);
+                let result = admit_input(
+                    self.inbox.as_deref(),
+                    self.context.session_id(),
+                    &self.context.input(),
+                    &mut self.inputs,
+                    *message,
+                )
+                .await;
                 if let Some(accepted) = accepted {
                     let _ = accepted.send(result);
                 } else if let Err(error) = result {
@@ -687,7 +837,7 @@ impl<Model: Llm> ReactAgentService<Model> {
                 let _ = result.send(response);
             }
             Command::PendingApprovals(result) => {
-                let _ = result.send(pending_calls(&self.pending_approvals));
+                let _ = result.send(pending_requests(&self.pending_approvals));
             }
             Command::SetApprovalMode { mode, result } => {
                 let saved = save_approval_mode(self.approval_mode_store.as_deref(), mode).await;
@@ -701,6 +851,10 @@ impl<Model: Llm> ReactAgentService<Model> {
                     );
                 }
                 let _ = result.send(saved);
+            }
+            Command::SetWebProvider { provider, result } => {
+                self.execution_input.set_web_provider(provider);
+                let _ = result.send(());
             }
             Command::SetInferenceConfig { inference, result } => {
                 self.execution_input.set_inference_config(Some(inference));
@@ -735,12 +889,17 @@ impl<Model: Llm> ReactAgentService<Model> {
         true
     }
 
-    async fn run_turn(&mut self, pending: Vec<AgentMessage>) -> bool {
+    async fn run_turn(&mut self, mut pending: Vec<AgentMessage>) -> bool {
         let _busy = BusyFlag::raise(self.busy.clone());
         let should_run = pending.is_empty()
             || pending
                 .iter()
                 .any(|entry| !entry.to_llm_messages().is_empty());
+        if should_run {
+            if let Some(first) = pending.first_mut() {
+                first.turn_id = Some(Uuid::new_v4().to_string());
+            }
+        }
         if !pending.is_empty() {
             let pending_ids = pending
                 .iter()
@@ -749,7 +908,7 @@ impl<Model: Llm> ReactAgentService<Model> {
             if let Err(error) = self.context.push(AgentEvent::Entries(pending)).await {
                 self.reject_turn(service_error(error));
                 for pending_id in pending_ids {
-                    if self.inputs.remove(&pending_id).is_some() {
+                    if self.inputs.remove(&pending_id).is_some() && self.inbox.is_none() {
                         let _ = self.events.send(ReactServiceEvent::InputRejected {
                             message_id: pending_id,
                         });
@@ -762,9 +921,18 @@ impl<Model: Llm> ReactAgentService<Model> {
         if !should_run {
             return true;
         }
+        // Draining non-model inputs alone does not satisfy a pending resume.
+        self.resume_turn = false;
         let execution = self.context.execution().clone();
+        let turn_id = self
+            .context
+            .entries()
+            .last()
+            .and_then(|entry| entry.turn_id.clone());
         let outcome = self
-            .drive_operation(|agent, context, tools| agent.run(context, tools).boxed())
+            .drive_operation(turn_id, |agent, context, tools| {
+                agent.run(context, tools).boxed()
+            })
             .await;
         let interrupted = matches!(
             outcome,
@@ -778,7 +946,7 @@ impl<Model: Llm> ReactAgentService<Model> {
             let pending_messages = if closing {
                 Vec::new()
             } else {
-                self.take_interrupted_messages()
+                self.take_interrupted_messages().await
             };
             if let Err(error) = self.finalize_interrupted_tools().await {
                 let _ = self
@@ -786,25 +954,31 @@ impl<Model: Llm> ReactAgentService<Model> {
                     .send(ReactServiceEvent::TurnError(error.to_string()));
             }
             if !pending_messages.is_empty() {
+                let has_user_input = pending_messages.iter().any(|message| {
+                    matches!(message.chat_message(), Some(chat_record::Message::User(_)))
+                });
                 let pending_ids = pending_messages
                     .iter()
                     .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
-                if let Err(error) = self
+                match self
                     .context
                     .push(AgentEvent::Entries(pending_messages))
                     .await
                 {
-                    for pending_id in pending_ids {
-                        if self.inputs.remove(&pending_id).is_some() {
-                            let _ = self.events.send(ReactServiceEvent::InputRejected {
-                                message_id: pending_id,
-                            });
+                    Ok(()) => self.resume_turn = has_user_input,
+                    Err(error) => {
+                        for pending_id in pending_ids {
+                            if self.inputs.remove(&pending_id).is_some() && self.inbox.is_none() {
+                                let _ = self.events.send(ReactServiceEvent::InputRejected {
+                                    message_id: pending_id,
+                                });
+                            }
                         }
+                        let _ = self
+                            .events
+                            .send(ReactServiceEvent::TurnError(error.to_string()));
                     }
-                    let _ = self
-                        .events
-                        .send(ReactServiceEvent::TurnError(error.to_string()));
                 }
             }
         }
@@ -822,7 +996,9 @@ impl<Model: Llm> ReactAgentService<Model> {
     async fn run_compaction(&mut self) -> bool {
         let _busy = BusyFlag::raise(self.busy.clone());
         let outcome = self
-            .drive_operation(|agent, context, tools| agent.compact_now(context, tools).boxed())
+            .drive_operation(None, |agent, context, tools| {
+                agent.compact_now(context, tools).boxed()
+            })
             .await;
         self.finish_operation(outcome).await
     }
@@ -830,13 +1006,14 @@ impl<Model: Llm> ReactAgentService<Model> {
     /// Keep session controls responsive while an operation owns the agent and context.
     async fn drive_operation(
         &mut self,
+        turn_id: Option<String>,
         operation: impl for<'a> FnOnce(
             &'a mut ReactAgent<Model>,
             &'a mut ReactContext,
             &'a dyn ToolExecutor,
         ) -> BoxFuture<'a, Result<(), ReactAgentError>>,
     ) -> OperationOutcome {
-        let _ = self.events.send(ReactServiceEvent::TurnStarted);
+        let _ = self.events.send(ReactServiceEvent::TurnStarted { turn_id });
         let events = self.events.clone();
         let commands = &mut self.commands;
         let context_events = &mut self.context_events;
@@ -847,8 +1024,11 @@ impl<Model: Llm> ReactAgentService<Model> {
         let pending_approvals = &mut self.pending_approvals;
         let approval_resolutions = &mut self.approval_resolutions;
         let pending_host_tools = &mut self.pending_host_tools;
+        let external_tools = &mut self.external_tools;
         let inputs = &mut self.inputs;
         let input = self.context.input();
+        let inbox = self.inbox.clone();
+        let session_id = self.context.session_id().to_string();
         let execution_input = &self.execution_input;
         let approval_mode_store = self.approval_mode_store.clone();
         let mut approval_mode = execution_input.approval_mode();
@@ -873,12 +1053,15 @@ impl<Model: Llm> ReactAgentService<Model> {
                         Command::Close(response)
                     }) {
                         Command::Execute { message, accepted } => {
-                            let result = accept_input(&input, inputs, *message);
+                            let result = admit_input(inbox.as_deref(), &session_id, &input, inputs, *message).await;
                             if let Some(accepted) = accepted {
                                 let _ = accepted.send(result);
                             } else if let Err(error) = result {
                                 let _ = events.send(ReactServiceEvent::TurnError(error.to_string()));
                             }
+                        }
+                        Command::ForkWorkspace { response, .. } => {
+                            let _ = response.send(Err(ReactServiceError::ConversationBusy));
                         }
                         Command::Compact(result) => {
                             let _ = result.send(Err(ReactServiceError::ConversationBusy));
@@ -918,7 +1101,7 @@ impl<Model: Llm> ReactAgentService<Model> {
                             let _ = result.send(response);
                         }
                         Command::PendingApprovals(result) => {
-                            let _ = result.send(pending_calls(pending_approvals));
+                            let _ = result.send(pending_requests(pending_approvals));
                         }
                         Command::SetApprovalMode { mode, result } => {
                             let saved =
@@ -935,12 +1118,16 @@ impl<Model: Llm> ReactAgentService<Model> {
                             }
                             let _ = result.send(saved);
                         }
+                        Command::SetWebProvider { provider, result } => {
+                            execution_input.set_web_provider(provider);
+                            let _ = result.send(());
+                        }
                         Command::SetInferenceConfig { inference, result } => {
                             execution_input.set_inference_config(Some(inference));
                             let _ = result.send(());
                         }
-                        Command::CallTool { name, arguments, response } => {
-                            let _ = response.send(tool_executor.call_tool(name, arguments, execution.clone()));
+                        Command::CallTool { name, arguments, web_provider, response } => {
+                            let _ = response.send(track_external_tool(external_tools, tool_executor.call_tool(name, arguments, execution.clone().with_web_provider(web_provider))));
                         }
                         Command::GetMessages { response, .. } => {
                             let _ = response.send(Err(ReactServiceError::ConversationBusy));
@@ -1044,19 +1231,16 @@ impl<Model: Llm> ReactAgentService<Model> {
             .map_err(service_error)
     }
 
-    fn take_interrupted_messages(&mut self) -> Vec<AgentMessage> {
-        self.context
-            .flush_pending()
-            .into_iter()
-            .filter_map(|message| {
-                if matches!(message.chat_message(), Some(chat_record::Message::User(_))) {
-                    self.inputs.remove(&message.id);
-                    None
-                } else {
-                    Some(message)
-                }
-            })
-            .collect()
+    async fn take_interrupted_messages(&mut self) -> Vec<AgentMessage> {
+        match self.context.take_pending().await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let _ = self
+                    .events
+                    .send(ReactServiceEvent::TurnError(error.to_string()));
+                Vec::new()
+            }
+        }
     }
 
     fn publish_context_events(&mut self) {
@@ -1077,8 +1261,11 @@ impl<Model: Llm> ReactAgentService<Model> {
         fail_host_tools(&mut self.pending_host_tools);
         let _ = self.tasks.close().await;
         self.publish_task_events();
+        // Admitted inbox inputs stay durable for the next actor; only volatile
+        // inputs belong to this shutdown drain.
         let pending = self.context.flush_pending();
-        if !persist_pending || self.context.append_failed() {
+        let discard = !persist_pending || self.context.append_failed();
+        if discard {
             for dropped in &pending {
                 if self.inputs.remove(&dropped.id).is_some() {
                     let _ = self.events.send(ReactServiceEvent::InputRejected {
@@ -1095,7 +1282,11 @@ impl<Model: Llm> ReactAgentService<Model> {
         }
         self.commands.close();
         while let Some(command) = self.commands.recv().await {
-            if let Command::Execute { message, .. } = command {
+            if let Command::Execute {
+                message,
+                accepted: None,
+            } = command
+            {
                 let _ = self.events.send(ReactServiceEvent::InputRejected {
                     message_id: message.id,
                 });
@@ -1147,45 +1338,70 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-fn accept_input(
+fn validate_input(message: &AgentMessage) -> Result<(), ReactServiceError> {
+    match message.payload.as_ref() {
+        Some(agent_message::Payload::Chat(chat))
+            if matches!(chat.message, Some(chat_record::Message::User(_))) =>
+        {
+            Ok(())
+        }
+        Some(agent_message::Payload::Extension(_)) => Ok(()),
+        _ => Err(ReactServiceError::Agent(
+            "service input is not a user or extension message".to_string(),
+        )),
+    }
+}
+
+async fn admit_input(
+    inbox: Option<&dyn Inbox>,
+    session_id: &str,
     input: &crate::react::ReactContextInput,
     inputs: &mut HashMap<String, agent_message::Payload>,
-    message: AgentMessage,
+    mut message: AgentMessage,
 ) -> Result<(), ReactServiceError> {
+    message.turn_id = None;
     let payload = input_payload(&message).ok_or_else(|| {
         ReactServiceError::Agent("service input is not a durable message".to_string())
     })?;
     if let Some(previous) = inputs.get(&message.id) {
-        return if previous == &payload {
-            Ok(())
-        } else {
-            Err(ReactServiceError::MessageIdConflict(message.id))
-        };
+        return same_input(&message.id, Some(previous), &payload);
     }
-    let message_id = message.id.clone();
-    input.push(message).map_err(service_error)?;
-    inputs.insert(message_id, payload);
+    let Some(inbox) = inbox else {
+        let message_id = message.id.clone();
+        input.push(message).map_err(service_error)?;
+        inputs.insert(message_id, payload);
+        return Ok(());
+    };
+    let admission = match inbox.admit(session_id, &message).await {
+        Ok(admission) => admission,
+        Err(StoreError::MessageIdConflict { .. }) => {
+            return Err(ReactServiceError::MessageIdConflict(message.id));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match admission {
+        InboxAdmission::Admitted => {}
+        InboxAdmission::Pending(previous) => {
+            same_input(&message.id, input_payload(&previous).as_ref(), &payload)?;
+        }
+        InboxAdmission::Appended(previous) => {
+            return same_input(&message.id, input_payload(&previous).as_ref(), &payload);
+        }
+    }
+    input.ring();
+    inputs.insert(message.id, payload);
     Ok(())
 }
 
-fn input_payload(entry: &AgentMessage) -> Option<agent_message::Payload> {
-    match entry.payload.as_ref()? {
-        agent_message::Payload::Chat(chat) => {
-            let Some(chat_record::Message::User(user)) = &chat.message else {
-                return None;
-            };
-            Some(agent_message::Payload::Chat(ChatRecord {
-                message: Some(chat_record::Message::User(UserMessage {
-                    content: user.content.clone(),
-                    checkpoint: None,
-                })),
-                ..chat.clone()
-            }))
-        }
-        agent_message::Payload::Extension(extension) => {
-            Some(agent_message::Payload::Extension(extension.clone()))
-        }
-        _ => None,
+fn same_input(
+    message_id: &str,
+    previous: Option<&agent_message::Payload>,
+    payload: &agent_message::Payload,
+) -> Result<(), ReactServiceError> {
+    if previous == Some(payload) {
+        Ok(())
+    } else {
+        Err(ReactServiceError::MessageIdConflict(message_id.to_string()))
     }
 }
 
@@ -1303,20 +1519,22 @@ fn handle_approval(
     if request.response.is_closed() {
         return;
     }
-    if mode == AgentApprovalMode::Auto {
+    if mode == AgentApprovalMode::Auto && request.kind == ApprovalKind::Ordinary {
         let _ = request
             .response
             .send(ApprovalDecision::new(true, ApprovalSource::Automatic));
     } else {
         let call_id = request.call.id.clone();
+        let announcement = hitl_request(&request.call, request.kind);
         pending.insert(
             call_id,
             PendingApproval {
-                call: request.call.clone(),
+                call: request.call,
+                kind: request.kind,
                 response: request.response,
             },
         );
-        let _ = events.send(ReactServiceEvent::HitlRequest(request.call));
+        let _ = events.send(ReactServiceEvent::HitlRequest(announcement));
     }
 }
 
@@ -1328,7 +1546,14 @@ fn resolve_hitl(
     source: ApprovalSource,
     result: Option<oneshot::Sender<bool>>,
 ) -> BoxFuture<'static, ()> {
-    let response = pending.remove(&call_id).map(|pending| pending.response);
+    let response = match pending.get(&call_id) {
+        Some(waiting)
+            if waiting.kind == ApprovalKind::AlwaysAsk && !answered_by_person(approved, source) =>
+        {
+            None
+        }
+        _ => pending.remove(&call_id).map(|pending| pending.response),
+    };
     let events = events.clone();
     Box::pin(async move {
         let accepted = if let Some(response) = response {
@@ -1353,11 +1578,29 @@ fn resolve_hitl(
     })
 }
 
-fn pending_calls(pending: &PendingApprovals) -> Vec<ToolCall> {
+fn answered_by_person(approved: bool, source: ApprovalSource) -> bool {
+    !approved
+        || !matches!(
+            source,
+            ApprovalSource::Automatic
+                | ApprovalSource::NotRequired
+                | ApprovalSource::RememberedExact
+                | ApprovalSource::RememberedPrefix
+        )
+}
+
+fn hitl_request(call: &ToolCall, kind: ApprovalKind) -> HitlRequest {
+    HitlRequest {
+        call: Some(call.clone()),
+        always_ask: kind == ApprovalKind::AlwaysAsk,
+    }
+}
+
+fn pending_requests(pending: &PendingApprovals) -> Vec<HitlRequest> {
     pending
         .values()
         .filter(|pending| !pending.response.is_closed())
-        .map(|pending| pending.call.clone())
+        .map(|pending| hitl_request(&pending.call, pending.kind))
         .collect()
 }
 
@@ -1396,7 +1639,12 @@ fn set_approval_mode(
 ) {
     input.set_approval_mode(mode);
     if mode == AgentApprovalMode::Auto {
-        while let Some(call_id) = pending.keys().next().cloned() {
+        let ordinary: Vec<String> = pending
+            .iter()
+            .filter(|(_, approval)| approval.kind == ApprovalKind::Ordinary)
+            .map(|(call_id, _)| call_id.clone())
+            .collect();
+        for call_id in ordinary {
             resolutions.push(resolve_hitl(
                 pending,
                 events,
@@ -1417,6 +1665,9 @@ fn handle_task_event(
     match event {
         TaskEvent::Updated(info) => {
             let _ = events.send(ReactServiceEvent::TaskUpdated(info));
+        }
+        TaskEvent::Agent(info, event) => {
+            let _ = events.send(ReactServiceEvent::TaskAgentEvent(info, event));
         }
         TaskEvent::Finished(info, result) => {
             let _ = input.push(task_result_message(info, result));
@@ -1476,6 +1727,7 @@ fn owes_model(entry: &AgentMessage) -> Option<bool> {
                 })
         }
         agent_message::Payload::TaskResult(_) => Some(true),
+        agent_message::Payload::Fork(_) => Some(false),
         agent_message::Payload::Extension(extension) => {
             extension.model_message.as_ref().map(|_| true)
         }
@@ -1560,15 +1812,22 @@ fn append_interrupted_tools(
     repaired: &mut Vec<AgentMessage>,
     pending: &mut Vec<(ToolCall, Option<ToolApprovalOutcome>)>,
 ) {
+    let turn_id = repaired.last().and_then(|entry| entry.turn_id.clone());
     for (call, approval) in pending.drain(..) {
         if approval == Some(ToolApprovalOutcome::Requested) {
-            repaired.push(AgentMessage::tool_approval(
-                &call,
-                ToolApprovalOutcome::Canceled,
-                ApprovalSource::Unspecified,
-            ));
+            repaired.push(AgentMessage {
+                turn_id: turn_id.clone(),
+                ..AgentMessage::tool_approval(
+                    &call,
+                    ToolApprovalOutcome::Canceled,
+                    ApprovalSource::Unspecified,
+                )
+            });
         }
-        repaired.push(interrupted_tool(&call));
+        repaired.push(AgentMessage {
+            turn_id: turn_id.clone(),
+            ..interrupted_tool(&call)
+        });
     }
 }
 

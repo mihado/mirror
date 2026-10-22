@@ -21,9 +21,12 @@ There is no application version counter or custom frame codec.
   remaining runs. Cleanup belongs to the execution runtime and survives the
   RPC handler disappearing.
 
-The package separates the gRPC adapter (`sandboxd_service.rs`) from process
-ownership (`execution_runtime.rs`). It serves over the provider's byte stream
-with `mirror-sandbox`, which hosts also use to connect.
+The crate is split by job. `connection/` serves one provider stream: the gRPC
+adapter (`sandboxd_service.rs`), process ownership (`execution_runtime.rs`) and
+egress setup (`egress_setup.rs`). `egress/` owns the local proxy and identity
+renewal, `guest/` applies guest profiles, `tool_runner/` is the `run-once`
+worker and `repository/` is `prepare-repository`. sandboxd serves over the
+provider's byte stream with `mirror-sandbox`, which hosts also use to connect.
 The runtime runs each call in its own process group, limits concurrent work,
 retains call IDs until cleanup completes, and bounds shutdown. Each child runs
 `run-once`, which consumes one protobuf tool call on stdin and emits one record
@@ -49,11 +52,43 @@ the stronger boundary. The sandbox image installs the binary at
 `/usr/local/bin/mirror-sandboxd`. `MIRROR_WORKSPACE` selects the tool workspace.
 
 The optional `Egress` RPC configures a stream-owned local CONNECT proxy and
-renews Mirror identity through the trusted server. `egress_runtime.rs` owns
-renewal sequencing and expiry; `egress_connector.rs` owns the bounded local
-listener and verified outer TLS relay. Child environments contain a fixed local
-proxy URL and public CA path, never the execution token. Refresh needs no child
-restart. Existing tunnels reject new requests after their original identity expires;
+renews Mirror identity through the trusted server. `egress/egress_runtime.rs`
+owns renewal sequencing and expiry; `egress/egress_connector.rs` owns the bounded local
+listener and verified outer TLS relay. The local proxy listens on the loopback
+port the setup names, retrying for two seconds while a replaced process lets
+go of it, so processes that outlive a reconnect keep a working proxy. Child
+environments contain that proxy URL for every proxy variable and Java's
+`JAVA_TOOL_OPTIONS`, never the execution token, and `NO_PROXY` keeps loopback
+off the proxy. Refresh needs no
+child restart. Existing tunnels reject new requests after their original identity expires;
 already admitted transfers may finish, and interrupted operations are not replayed. Renewal failure closes the connector, and a new
 provider control stream is required to configure it again. Hosted Mirror's
 egress contract covers authority and deployment requirements.
+
+## Guest profiles
+
+The `Egress` setup may carry guest profiles: named, data-only sets of
+environment variables, files and static HTTP endpoints built by the host.
+sandboxd knows no providers or clouds. A profile applies in two phases:
+
+- `ready` runs once per connection, after setup and before any `Execute`. It
+  writes the files (absolute paths, atomic replace, failing on any symbolic link
+  in the path) and starts each endpoint on `127.0.0.1` at the port given. The
+  first `Egress` event always reports the outcome: ready, or failed with the
+  reason.
+- `before_command` sets the environment variables on every `Execute` call.
+
+A static endpoint matches routes by exact path, ignoring the query string. A
+request missing a route's required header gets 403 and an unknown path 404;
+endpoint response headers go on every response. Requests are served with
+bounded concurrency, and the listener closes with the connection.
+
+Until `ready` succeeds, `Execute` is rejected with the failure reason. Profiles
+are refused if two profiles set one variable, two files name one path (compared
+after normalizing), a path is relative, an endpoint listens anywhere but
+`127.0.0.1`, or a variable is one sandboxd sets itself. A new connection is a
+new process, so a reconnect applies the profiles again.
+
+`mirror_sandbox::egress_profile` builds the profile every egress setup needs:
+the proxy CA at `/tmp/mirror-egress-ca.pem`, the CA variables tools read, and
+the host's placeholder variables set to `mirror-managed`.

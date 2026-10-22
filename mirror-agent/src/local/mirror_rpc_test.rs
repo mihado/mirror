@@ -132,7 +132,11 @@ async fn start_local_rpc(database: &Path, workspace: &Path) -> LocalMirrorRpc {
             break;
         }
     }
-    LocalMirrorRpc::new(service, database.to_path_buf())
+    LocalMirrorRpc::new(
+        service,
+        database.to_path_buf(),
+        Some(workspace.to_path_buf()),
+    )
 }
 
 fn fork_request(at_entry_id: &str) -> Request<ForkSessionRequest> {
@@ -220,6 +224,99 @@ async fn fork_validates_the_boundary_and_leaves_the_source_running() {
             .expect("child prefix stays fixed"),
         view
     );
+    rpc.service.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn workspace_fork_pairs_history_with_files_and_binds_the_new_directory() {
+    let directory = tempfile::tempdir().expect("temporary repositories");
+    let source = directory.path().join("source");
+    let destination = directory.path().join("child");
+    std::fs::create_dir(&source).expect("source");
+    assert!(std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&source)
+        .status()
+        .expect("init")
+        .success());
+    std::fs::write(source.join("file"), "snapshot").expect("working file");
+    let database = directory.path().join("react.db");
+    let rpc = start_local_rpc(&database, &source).await;
+    let parent = rpc.service.messages().await.expect("parent history");
+    let child = Uuid::new_v4().simple().to_string();
+
+    let forked = rpc
+        .fork_workspace(Request::new(ForkWorkspaceRequest {
+            source_session_id: "session".into(),
+            session_id: child.clone(),
+            directory: destination.to_string_lossy().into_owned(),
+            name: "child".into(),
+        }))
+        .await
+        .expect("fork workspace")
+        .into_inner();
+
+    assert_eq!(
+        Path::new(&forked.workspace),
+        std::fs::canonicalize(&destination).expect("child directory")
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("file")).expect("child file"),
+        "snapshot"
+    );
+    assert!(SQLiteStore::open(&database, &child, &source, false, false).is_err());
+    let mut store = SQLiteStore::open(&database, &child, &destination, false, false)
+        .expect("child binds to new directory");
+    let history = store.load(&child, true).await.expect("fork history");
+    assert_eq!(&history[..parent.len()], parent);
+    assert_eq!(history.len(), parent.len() + 1);
+    assert_eq!(
+        history.last().expect("fork record").payload,
+        Some(agent_message::Payload::Fork(mirror_protocol::ForkRecord {
+            parent_session_id: "session".into(),
+            inherited_sequence: crate::head(&parent),
+            source_workspace: std::fs::canonicalize(&source)
+                .expect("source directory")
+                .to_string_lossy()
+                .into_owned(),
+            destination_workspace: forked.workspace,
+        }))
+    );
+    store
+        .append(
+            &child,
+            crate::head(&history),
+            &mut [user_message("child input", "child-input")],
+        )
+        .await
+        .expect("child diverges");
+    assert_eq!(
+        rpc.service
+            .messages()
+            .await
+            .expect("parent stays unchanged"),
+        parent
+    );
+    rpc.service.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn workspace_fork_is_disabled_for_sandbox_workers() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut rpc = start_local_rpc(&directory.path().join("react.db"), directory.path()).await;
+    rpc.workspace = None;
+    let child = directory.path().join("child");
+    let error = rpc
+        .fork_workspace(Request::new(ForkWorkspaceRequest {
+            source_session_id: "session".into(),
+            session_id: Uuid::new_v4().to_string(),
+            directory: child.to_string_lossy().into_owned(),
+            name: "child".into(),
+        }))
+        .await
+        .expect_err("sandbox cannot execute host VCS commands");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(!child.exists());
     rpc.service.close().await.expect("close source");
 }
 

@@ -103,6 +103,7 @@ async fn sandboxed_worker_runs_bash_in_the_vm_and_describes_it() {
             session_id: conversation_id,
             name: "bash".to_string(),
             arguments: r#"{"command":"uname -s > made-in-vm.txt"}"#.to_string(),
+            ..Default::default()
         })
         .await
         .expect("call bash")

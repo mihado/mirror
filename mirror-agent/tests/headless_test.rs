@@ -1,3 +1,6 @@
+#[path = "headless/memory_trace.rs"]
+mod memory_trace_tests;
+
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -21,7 +24,11 @@ use tokio::task::JoinHandle;
 struct Fixture {
     workspace: tempfile::TempDir,
     output: PathBuf,
+    in_memory_output: bool,
     model_url: String,
+    firecrawl_key: Option<&'static str>,
+    you_key: Option<&'static str>,
+    tavily_key: Option<&'static str>,
     requests: mpsc::UnboundedReceiver<Value>,
     model: JoinHandle<()>,
 }
@@ -54,6 +61,7 @@ impl Fixture {
                 post(non_streaming_completion),
             )
             .route("/recover/chat/completions", post(recover_completion))
+            .route("/web/chat/completions", post(web_completion))
             .route("/empty/chat/completions", post(empty_completion))
             .route(
                 "/empty-recover/chat/completions",
@@ -82,7 +90,11 @@ impl Fixture {
         Self {
             workspace,
             output: "logs/trace.jsonl".into(),
+            in_memory_output: false,
             model_url,
+            firecrawl_key: None,
+            you_key: None,
+            tavily_key: None,
             requests: received,
             model,
         }
@@ -105,12 +117,28 @@ impl Fixture {
             ])
             .arg("--workspace")
             .arg(self.workspace.path())
-            .arg("--output")
-            .arg(&self.output)
             .args(["--max-tokens", "128"])
             .env("HOME", self.workspace.path().join("home"))
             .env("OPENAI_API_KEY", "secret-model-key")
+            .env_remove("FIRECRAWL_API_KEY")
+            .env_remove("YOU_API_KEY")
+            .env_remove("TAVILY_API_KEY")
+            .env_remove("MIRROR_WEB_PROVIDER")
             .kill_on_drop(true);
+        if let Some(key) = self.firecrawl_key {
+            command.env("FIRECRAWL_API_KEY", key);
+        }
+        if let Some(key) = self.you_key {
+            command.env("YOU_API_KEY", key);
+        }
+        if let Some(key) = self.tavily_key {
+            command.env("TAVILY_API_KEY", key);
+        }
+        if self.in_memory_output {
+            command.arg("--in-memory-output");
+        } else {
+            command.arg("--output").arg(&self.output);
+        }
         if let Some(rg) = std::env::var_os("MIRROR_RG_PATH") {
             command.env(
                 "MIRROR_RG_PATH",
@@ -266,12 +294,153 @@ async fn recover_completion(
         ),
         1 => stream(
             json!({"tool_calls":[{"index":0,"id":"good","function":{
-                "name":"bash", "arguments": r#"{"command":"printf recovered > result.txt"}"#
+                "name":"bash", "arguments": r#"{"command":"printf recovered > result.txt; printf '%s' \"${FIRECRAWL_API_KEY-unset}\" > firecrawl-key.txt; printf '%s' \"${YOU_API_KEY-unset}\" > you-key.txt; printf '%s' \"${TAVILY_API_KEY-unset}\" > tavily-key.txt"}"#
             }}]}),
             "tool_calls",
         ),
         _ => stream(json!({"content":"Task complete"}), "stop"),
     }
+}
+
+async fn web_completion(
+    State(requests): State<mpsc::UnboundedSender<Value>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    requests.send(body.clone()).expect("record request");
+    let done = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .any(|message| message["role"] == "tool");
+    let delta = if done {
+        json!({"content":"Task complete"})
+    } else {
+        json!({"tool_calls":[
+            {"index":0,"id":"search-1","function":{
+                "name":body["tools"][0]["function"]["name"],"arguments":r#"{"query":"synthetic query"}"#
+            }},
+            {"index":1,"id":"browse-1","function":{
+                "name":body["tools"][1]["function"]["name"],"arguments":r#"{"url":"https://example.com"}"#
+            }}
+        ]})
+    };
+    stream(delta, if done { "stop" } else { "tool_calls" })
+}
+
+#[tokio::test]
+async fn http_native_web_composes_with_bash_and_dispatches_both_tools() {
+    let mut fixture = Fixture::start().await;
+    let server = fixture
+        .serve(
+            "/web",
+            &[
+                "--tools",
+                "web_search,web_browse,bash",
+                "--use-native-web",
+                "--use-native-bash",
+                "--extra-body",
+                r#"{"chat_template_kwargs":{"enable_thinking":true}}"#,
+            ],
+        )
+        .await;
+    assert_eq!(server.prompt().await.status(), StatusCode::NO_CONTENT);
+    let first = fixture.request().await;
+    assert_eq!(
+        first["chat_template_kwargs"],
+        json!({
+            "builtin_tools": ["search", "browse", "bash"], "enable_thinking": true,
+        })
+    );
+    assert_eq!(first["tools"].as_array().expect("tools").len(), 3);
+    assert_eq!(first["tools"][0]["function"]["name"], "search");
+    assert_eq!(first["tools"][1]["function"]["name"], "browse");
+    assert_eq!(first["tools"][2]["function"]["name"], "bash");
+    let next = fixture.request().await;
+    assert_eq!(next["messages"][2]["tool_call_id"], "search-1");
+    assert!(next["messages"][2]["content"]
+        .as_str()
+        .expect("search result")
+        .starts_with("Tool error: YOU_API_KEY is not set."));
+    assert_eq!(next["messages"][3]["tool_call_id"], "browse-1");
+    assert!(next["messages"][3]["content"]
+        .as_str()
+        .expect("browse result")
+        .starts_with("Tool error: YOU_API_KEY is not set."));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn cli_native_browse_preserves_remote_execution_rejection() {
+    let fixture = Fixture::start().await;
+    let output = fixture
+        .command("")
+        .args([
+            "--tools",
+            "web_browse",
+            "--use-native-web",
+            "--remote",
+            &format!("{}/send_command", fixture.model_url),
+        ])
+        .output()
+        .await
+        .expect("run command");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("tool \"browse\" or its descendants do not support remote execution"));
+}
+
+#[tokio::test]
+async fn http_web_defaults_to_function_tools() {
+    let mut fixture = Fixture::start().await;
+    let server = fixture
+        .serve("/web", &["--tools", "web_search,web_browse"])
+        .await;
+    assert_eq!(server.prompt().await.status(), StatusCode::NO_CONTENT);
+    let first = fixture.request().await;
+    assert!(first.get("chat_template_kwargs").is_none());
+    assert_eq!(first["tools"].as_array().expect("tools").len(), 2);
+    assert_eq!(first["tools"][0]["function"]["name"], "web_search");
+    assert_eq!(first["tools"][1]["function"]["name"], "web_browse");
+    let next = fixture.request().await;
+    assert!(next["messages"][2]["content"]
+        .as_str()
+        .expect("search result")
+        .starts_with("Tool error: YOU_API_KEY is not set."));
+    assert!(next["messages"][3]["content"]
+        .as_str()
+        .expect("browse result")
+        .starts_with("Tool error: YOU_API_KEY is not set."));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn missing_web_key_only_fails_web_calls_without_falling_back() {
+    let mut fixture = Fixture::start().await;
+    fixture.you_key = Some("synthetic-you-key");
+    let server = fixture
+        .serve(
+            "/web",
+            &[
+                "--tools",
+                "web_search,web_browse",
+                "--web-provider",
+                "tavily",
+            ],
+        )
+        .await;
+    assert_eq!(server.prompt().await.status(), StatusCode::NO_CONTENT);
+    let _ = fixture.request().await;
+    let next = fixture.request().await;
+    assert!(next["messages"][2]["content"]
+        .as_str()
+        .expect("search result")
+        .starts_with("Tool error: TAVILY_API_KEY is not set."));
+    assert!(next["messages"][3]["content"]
+        .as_str()
+        .expect("browse result")
+        .starts_with("Tool error: TAVILY_API_KEY is not set."));
+    assert!(!next.to_string().contains("synthetic-you-key"));
+    server.stop().await;
 }
 
 async fn empty_completion(
@@ -320,6 +489,9 @@ async fn http_empty_completion_can_recover() {
 #[tokio::test]
 async fn http_builtin_bash_recovers_from_rejected_arguments() {
     let mut fixture = Fixture::start().await;
+    fixture.firecrawl_key = Some("synthetic-firecrawl-key");
+    fixture.you_key = Some("synthetic-you-key");
+    fixture.tavily_key = Some("synthetic-tavily-key");
     let server = fixture
         .serve("/recover", &["--tools", "bash", "--use-native-bash"])
         .await;
@@ -344,6 +516,28 @@ async fn http_builtin_bash_recovers_from_rejected_arguments() {
             .expect("corrected call ran"),
         "recovered"
     );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("firecrawl-key.txt"))
+            .expect("bash environment probe"),
+        "unset"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("you-key.txt"))
+            .expect("bash environment probe"),
+        "unset"
+    );
+    let model_trace = serde_json::to_string(&fixture.model_calls()).expect("model trace");
+    assert!(!model_trace.contains("synthetic-firecrawl-key"));
+    assert!(!model_trace.contains("synthetic-you-key"));
+    assert!(!model_trace.contains("synthetic-tavily-key"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tavily-key.txt"))
+            .expect("tavily key"),
+        "unset"
+    );
+    assert!(!serde_json::to_string(&fixture.trace())
+        .expect("native trace")
+        .contains("synthetic-you-key"));
     let final_request = fixture.request().await;
     assert_eq!(final_request["messages"][4]["tool_call_id"], "good");
     assert_eq!(

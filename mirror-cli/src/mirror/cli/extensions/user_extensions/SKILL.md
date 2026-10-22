@@ -32,6 +32,9 @@ They are discovered from the nearest repository root through the launch
 directory, or just the launch directory outside a repository. The authoring tool
 manages the user directory only; project extensions use `/extensions`.
 
+For an existing checkout, use `/extensions-add <host directory>`, then
+`/extensions` to enable it.
+
 ## Extension API
 
 Read [the API](../../extension.py) for signatures and

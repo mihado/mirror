@@ -534,6 +534,21 @@ def _create_jj_workspace(
   )
 
 
+def fork_destination(cwd: pathlib.Path, name: str | None) -> pathlib.Path:
+  """Reserve a managed parent directory, without creating or fetching a checkout."""
+  root = project.repository_root(cwd.resolve())
+  if root is None:
+    raise WorktreeError('forking requires a Git or Jujutsu repository')
+  repository = project.jj_repository(root)
+  if repository is None:
+    repository = pathlib.Path(
+      _git(root, ('rev-parse', '--path-format=absolute', '--git-common-dir'))
+    ).resolve()
+  path = _managed_parent(repository, root.name) / _worktree_name(name)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  return path
+
+
 def create_worktree(
   cwd: str | pathlib.Path, name: str | None = None
 ) -> Worktree:

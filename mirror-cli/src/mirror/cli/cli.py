@@ -36,6 +36,7 @@ from prompt_toolkit import cursor_shapes as _cursor_shapes
 from prompt_toolkit import document as _document
 from prompt_toolkit import enums as _enums
 from prompt_toolkit import filters as _filters
+from prompt_toolkit import formatted_text as _formatted_text
 from prompt_toolkit import history as _history
 from prompt_toolkit import key_binding as _key_binding
 from prompt_toolkit import mouse_events as _mouse_events
@@ -45,6 +46,7 @@ from prompt_toolkit.application import current as _current
 
 # prompt_toolkit exposes only the shadowing `run_in_terminal` function.
 from prompt_toolkit.application import run_in_terminal as _run_in_terminal
+from prompt_toolkit.key_binding import key_bindings as _key_bindings
 from prompt_toolkit.layout import containers as _containers
 from prompt_toolkit.layout import controls as _controls
 from prompt_toolkit.layout import dimension as _dimension
@@ -60,7 +62,7 @@ from mirror import workspace as _workspace
 from mirror.cli import actions as _actions
 from mirror.cli import agents as _agents
 from mirror.cli import api_keys as _api_keys
-from mirror.cli import bash_approvals
+from mirror.cli import bash_approvals, row_renderer
 from mirror.cli import cli_store as _cli_store
 from mirror.cli import commands as _commands
 from mirror.cli import conversation_metrics as _conversation_metrics
@@ -79,10 +81,12 @@ from mirror.cli import reducer as _reducer
 from mirror.cli import reflection as _reflection
 from mirror.cli import remote_rpc_client as _remote_rpc_client
 from mirror.cli import rendering as _rendering
+from mirror.cli import retained as _retained
 from mirror.cli import rpc_client as _rpc_client
 from mirror.cli import sandbox_shell as _sandbox_shell
 from mirror.cli import sandboxes as _sandboxes
 from mirror.cli import selection as _selection
+from mirror.cli import screen_selection as _screen_selection
 from mirror.cli import shell as _shell
 from mirror.cli import state as _state
 from mirror.cli import stream as _stream_mod
@@ -92,6 +96,7 @@ from mirror.cli import tool_approvals as _tool_approvals
 from mirror.cli import tool_groups as _tool_groups
 from mirror.cli import transcript as _transcript_mod
 from mirror.cli import transcript_view as _transcript_view
+from mirror.cli import transcript_window as _transcript_window
 from mirror.cli import user_extensions as _user_extensions
 from mirror.cli import workspace_application as _workspace_application
 from mirror.cli import workspace_controller as _workspace_controller
@@ -100,6 +105,7 @@ from mirror.cli import workspaces as _workspaces
 from mirror.cli.components import banner as _banner
 from mirror.cli.components import completion as _completion
 from mirror.cli.components import component as _component
+from mirror.cli.components import layout as _component_layout
 from mirror.cli.components import pending as _pending
 from mirror.cli.components import secret_prompt as _secret_prompt
 from mirror.cli.components import selector as _selector
@@ -206,8 +212,13 @@ class _Repl:
     extensions_loaded: asyncio.Task[None] | None = None,
     fullscreen: bool = False,
     initial_theme: str = 'dark',
+    read_only: bool = False,
   ) -> None:
     self._fullscreen = fullscreen
+    # Only the initially active view can own the CLI's one launch-screen phase.
+    self._launch_screen = active and bool(
+      worker_config.get('create_session', True)
+    )
     self._theme_repaint_pending = False
     self._tool_approvals = tool_approvals or _tool_approvals.ToolApprovals()
     self._worker_command = tuple(worker_command)
@@ -238,6 +249,7 @@ class _Repl:
     self._remote_secure = remote_secure
     self._workspace_effects = workspace_effects
     self._navigation: _containers.AnyContainer = _containers.Window(height=0)
+    self._navigation_refresh_key: Callable[[], object | None] = lambda: ()
     self._exit_on_worker_failure = exit_on_worker_failure
     self._user_extensions = user_extensions or _user_extensions.UserExtensions(
       extension_registry,
@@ -246,7 +258,9 @@ class _Repl:
       bundled=pathlib.Path(__file__).with_name('extensions'),
     )
     self._workspace_shell = (
-      _sandbox_shell.SandboxShell(
+      None
+      if read_only
+      else _sandbox_shell.SandboxShell(
         self._workspace,
         worker_command=self._worker_command,
         configuration=cast(Mapping[str, object], worker_config['sandbox']),
@@ -310,9 +324,12 @@ class _Repl:
         approval_mode=cast(str, worker_config.get('approval_mode', 'approve')),
       ),
       session=_state.SessionState(
+        read_only=read_only,
         conversation_id=conversation_id,
         remote=remote_endpoint is not None,
-        restore_pending=not bool(worker_config.get('create_session', True)),
+        replaying=not read_only,
+        restore_pending=not read_only
+        and not bool(worker_config.get('create_session', True)),
       ),
       lifecycle=_state.LifecycleState(active=active),
       workspace=str(self._workspace),
@@ -324,10 +341,14 @@ class _Repl:
     self._scrollback_limit = scrollback_limit
     self._activation_preview_pending = False
     self._client: _rpc_client.Client | None = None
+    self._inspection: _Repl | None = None
+    self._inspection_parent: _Repl | None = None
+    self._inspection_status = 'running'
+    self._children: dict[str, _Repl] = {}
     self._worker_ready = asyncio.Event()
     keymap_error: _actions.ShowText | None = None
     try:
-      remappings = _keymap.load_config()
+      remappings = () if read_only else _keymap.load_config()
     except (ValueError, OSError) as error:
       remappings = ()
       keymap_error = _actions.ShowText(
@@ -337,12 +358,13 @@ class _Repl:
       self._keybinding_layers,
       self.dispatch,
       dismiss=self._dismissal_action,
+      on_escape_interrupt=self._conversation_metrics.interrupt_requested,
       remappings=remappings,
       enabled=_filters.Condition(lambda: self._secret_input is None),
     )
     self._project_skills = (
       ()
-      if worker_config.get('sandbox') is not None
+      if read_only or worker_config.get('sandbox') is not None
       else tuple(_skills.load_skills(self._workspace))
     )
     self._extension_skills = self._extension_host.skills
@@ -423,6 +445,7 @@ class _Repl:
         _tool_groups.ToolGroup | None,
         str | None,
         str,
+        bool,
       ]
       | None
     ) = None
@@ -453,10 +476,13 @@ class _Repl:
       multiline=True,
       on_text_changed=self._on_composer_changed,
       on_cursor_position_changed=self._on_composer_changed,
-      read_only=_filters.Condition(self._modal_ui_active),
+      read_only=_filters.Condition(
+        lambda: self._state.session.read_only or self._modal_ui_active()
+      ),
     )
     self._prompt_editor: _editing.Editor | None = None
     self._app = self._build_app()
+    self._view: _workspace_application.WorkspaceApplication = self._app
     if first_render is not None:
 
       def on_render(_: _application.Application[str | None]) -> None:
@@ -464,11 +490,14 @@ class _Repl:
 
       self._app.after_render += on_render
     if keymap_error is not None:
-
-      def show_keymap_error() -> None:
+      # Workspace views never run pre_run_callables, so show the error when the
+      # view first draws, then stop listening. Use the app passed in: by then
+      # self._app may already be the shared screen.
+      def show_keymap_error(app: _application.Application[str | None]) -> None:
+        app.after_render -= show_keymap_error
         self.dispatch(keymap_error)
 
-      self._app.pre_run_callables.append(show_keymap_error)
+      self._app.after_render += show_keymap_error
     columns = max(1, self._app.output.get_size().columns)
     self.dispatch(_actions.TerminalResized(columns))
 
@@ -488,10 +517,12 @@ class _Repl:
     self, *actions: _actions.Action
   ) -> tuple[asyncio.Task[None], ...]:
     """Reduce actions, repaint once, and return the started effect tasks."""
-    if (
-      not actions
-      and self._state.extension_themes == self._extension_host.themes
-    ):
+    themes = (
+      self._inspection_parent._state.extension_themes
+      if self._inspection_parent is not None
+      else self._extension_host.themes
+    )
+    if not actions and self._state.extension_themes == themes:
       return ()
     if any(
       isinstance(action, (_actions.SetViewMode, _actions.CycleViewMode))
@@ -500,23 +531,42 @@ class _Repl:
       self._flush_tool_group()
       self._stream_pane.reset_height()
     was_running = self._running
+    transcript_only = bool(actions) and all(
+      isinstance(action, _actions.NavigateHistory) for action in actions
+    )
     next_state = self._state
     effects: list[_effects.Effect] = []
     for action in actions:
+      if isinstance(
+        action, (_actions.WorkerFailed, _actions.WorkerLoadingStarted)
+      ):
+        self._conversation_metrics.suspend()
       extension_states, extension_effects = self._extension_host.reduce(
         next_state, action
       )
       next_state, action_effects = _reducer.reduce(
         next_state, action, observed_at=time.monotonic()
       )
-      next_state = dataclasses.replace(next_state, extensions=extension_states)
+      if extension_states is not next_state.extensions:
+        transcript_only = False
+        next_state = dataclasses.replace(
+          next_state, extensions=extension_states
+        )
+      transcript_only &= not extension_effects
+      if (
+        not next_state.lifecycle.active
+        or next_state.session.pending_switch is not None
+        or next_state.turn.input_order
+      ):
+        self._launch_screen = False
       effects.extend((*action_effects, *extension_effects))
-    next_state = dataclasses.replace(
-      next_state, extension_themes=self._extension_host.themes
-    )
+    if next_state.extension_themes != themes:
+      transcript_only = False
+      next_state = dataclasses.replace(next_state, extension_themes=themes)
     self._theme_repaint_pending |= _themes.current(
       self._state.extensions, self._state.extension_themes
     ) != _themes.current(next_state.extensions, next_state.extension_themes)
+    previous_state = self._state
     self._state = next_state
     if self._theme_repaint_pending and self._can_repaint_theme():
       self._theme_repaint_pending = False
@@ -531,10 +581,29 @@ class _Repl:
       self._update_available_skills()
       self._host_tools_registry.context_changed()
     if hasattr(self, '_app'):
+      visible = self._inspection or self
       self._app.refresh_interval = (
-        1 / _ACTIVITY_ANIMATION_FPS if next_state.activity.busy else 0.1
+        1 / _ACTIVITY_ANIMATION_FPS if visible._state.activity.busy else 0.1
       )
-      self._app.invalidate()
+      if (
+        self._fullscreen
+        and next_state.lifecycle.active
+        and next_state.activity == previous_state.activity
+        and next_state.extensions is previous_state.extensions
+        and not self._modal_ui_active()
+        and any(
+          isinstance(action, _actions.ObserveStreamText) for action in actions
+        )
+        and all(
+          isinstance(action, (_actions.ObserveStreamText, _actions.SetStatus))
+          for action in actions
+        )
+      ):
+        with _current.set_app(self._app):
+          if not self._viewport.refresh():
+            self._app.invalidate()
+      else:
+        self._app.invalidate(transcript_only=transcript_only)
     tasks: list[asyncio.Task[None]] = []
     for effect in effects:
       result = self._run_effect(effect)
@@ -550,6 +619,15 @@ class _Repl:
     self, effect: _effects.Effect
   ) -> asyncio.Task[None] | tuple[asyncio.Task[None], ...] | None:
     """Execute an imperative effect emitted by the pure reducer."""
+    if self._state.session.read_only and not isinstance(
+      effect,
+      (
+        _effects.NavigateHistory,
+        _effects.CloseInspection,
+        _effects.RerenderHistory,
+      ),
+    ):
+      return None
     match effect:
       case _effects.NavigateHistory(action):
         if self._fullscreen and not self._modal_ui_active():
@@ -622,12 +700,18 @@ class _Repl:
         else:
           self._app.exit(result=result)
       case (
-        _effects.OpenNewWorkspace()
-        | _effects.CreateWorkspace()
+        _effects.CreateWorkspace()
         | _effects.OpenFolder()
-        | _effects.CloseWorkspace()
         | _effects.CreateManagedWorktree()
+        | _effects.ForkWorkspace()
         | _effects.CreateSandboxWorkspace()
+      ):
+        self._launch_screen = False
+        if self._workspace_effects is not None:
+          self._workspace_effects.put_nowait((self, effect))
+      case (
+        _effects.OpenNewWorkspace()
+        | _effects.CloseWorkspace()
         | _effects.DropManagedWorktree()
         | _effects.RenameWorktree()
         | _effects.WorkspaceTagCommand()
@@ -642,7 +726,14 @@ class _Repl:
         if self._workspace_effects is not None:
           self._workspace_effects.put_nowait((self, effect))
       case _effects.CreateRemoteAgent():
+        self._launch_screen = False
         return self._app.create_background_task(self._prepare_remote(effect))
+      case _effects.SetWebProvider(provider):
+        self._worker_configuration = self._worker_configuration.updated({
+          'web_provider': provider
+        })
+        if self._client is not None:
+          self._client.set_web_provider(provider)
       case _effects.SendInferenceConfiguration():
         self._send_inference_config()
       case _effects.CompactConversation():
@@ -691,18 +782,6 @@ class _Repl:
         )
       case _effects.SendQueuedInstruction(instruction):
         self._send_instruction(instruction)
-        _statsig_client.get().log_event(
-          _statsig_event.Event(
-            'mirror_message_queued',
-            value=1,
-            metadata={
-              'conversation_id': self._state.session.conversation_id,
-              'workspace_kind': 'remote'
-              if self._remote_endpoint is not None
-              else 'local',
-            },
-          )
-        )
       case _effects.RunTurn(instruction, rewind_to):
         message_id = None
         if rewind_to is None:
@@ -721,10 +800,29 @@ class _Repl:
         )
       case _effects.UserPromptSubmitted(instruction):
         self._log_user_prompt_submitted(instruction)
+      case _effects.InspectTask(task):
+        self._inspect(task)
+      case _effects.CloseInspection():
+        if self._inspection_parent is not None:
+          return self._inspection_parent._run_effect(effect)
+        child, self._inspection = self._inspection, None
+        if child is not None:
+          child._app = child._view
+          self._clear_screen_selection()
+          self._app.layout.focus(
+            self._task_window
+            if self._state.tasks.selected_id
+            else self._input_window
+          )
+          child.dispatch(_actions.SetActive(False))
+          if child._session_id not in self._children:
+            return self._app.create_background_task(child.close())
       case _effects.FocusComposer():
-        self._app.layout.focus(self._input_window)
+        if self._inspection is None:
+          self._app.layout.focus(self._input_window)
       case _effects.FocusTasks():
-        self._app.layout.focus(self._task_window)
+        if self._inspection is None:
+          self._app.layout.focus(self._task_window)
       case _effects.CancelTask(task_id):
         request = self._new_request()
         request.cancel_task.task_id = task_id
@@ -833,6 +931,54 @@ class _Repl:
         return self._extension_host.handle_effect(effect)
     return None
 
+  def _create_child(self, task_id: str) -> _Repl:
+    child = _Repl(
+      (),
+      {
+        'conversation_id': task_id,
+        'model': self.model,
+        'create_session': False,
+      },
+      session_id=task_id,
+      workspace=self._workspace,
+      console=self.console,
+      database=self._database,
+      extension_registry=_extension.ExtensionRegistry(),
+      user_extensions=self._user_extensions,
+      workspace_controller=self._workspace_controller,
+      exit_on_worker_failure=False,
+      fullscreen=True,
+      read_only=True,
+      active=False,
+    )
+    child._inspection_parent = self
+    child._state = dataclasses.replace(
+      child._state,
+      status_bar=self._state.status_bar,
+      extensions=self._state.extensions,
+      extension_themes=self._state.extension_themes,
+    )
+    child.dispatch(_actions.TurnStarted())
+    return child
+
+  def _inspect(self, task: _actions.Task) -> None:
+    child = self._children.get(task.id)
+    if child is None or self._inspection is not None:
+      return
+    self._inspection = child
+    child._app = self._app
+    child.dispatch(
+      _actions.SetActive(True),
+      _actions.SetViewMode(self._state.status_bar.view_mode),
+    )
+    self._clear_screen_selection()
+    self._app.layout.focus(child._input_window)
+
+  def _clear_screen_selection(self) -> None:
+    surface = self._app.layout.container
+    if isinstance(surface, _screen_selection.ScreenSelection):
+      surface.clear()
+
   async def _run_terminal_command(
     self,
     argv: tuple[str, ...],
@@ -843,6 +989,9 @@ class _Repl:
     """Suspend input and report success after a local process releases the terminal."""
     if not self._state.lifecycle.active:
       return False
+    app = _current.get_app()
+    if isinstance(app, _workspace_application.WorkspaceApplication):
+      app.finish_scroll_burst()
     running = asyncio.ensure_future(
       _run_in_terminal(
         # Change directory in the spawned child, not via fork in the gRPC host.
@@ -995,6 +1144,7 @@ class _Repl:
       on_message=on_message,
       on_error=on_error,
       host_tools_registry=self._host_tools_registry,
+      web_provider=configuration.web_provider,
       inference_config=configuration.inference_config(
         self._state.status_bar.model,
         self._state.status_bar.reasoning_effort,
@@ -1046,6 +1196,14 @@ class _Repl:
     return _models.ModelOption(
       self.model, self.model, api=inference.api, base_url=inference.base_url
     )
+
+  async def fork_workspace(
+    self, session_id: str, directory: pathlib.Path, name: str
+  ) -> pathlib.Path:
+    """Capture a host-local fork without switching or interrupting the parent."""
+    if self._client is None or self._remote_endpoint is not None:
+      raise RuntimeError('forking requires a connected host-local worker')
+    return await self._client.fork_workspace(session_id, directory, name)
 
   @property
   def conversation_id(self) -> str:
@@ -1440,12 +1598,24 @@ class _Repl:
   def _modal_ui_active(self) -> bool:
     """Whether an overlay owns the keyboard and the input is read-only."""
     return (
-      self._state.drop_confirmation is not None
+      self._inspection is not None
+      or self._state.drop_confirmation is not None
       or self._state.resume.active
       or self._state.selector.active
       or self._state.secret.active
       or self._state.rewind.active
     )
+
+  def _scroll_history(
+    self, event: _mouse_events.MouseEvent
+  ) -> _key_bindings.NotImplementedOrNone:
+    """Leave modal wheel input to its own scrollable controls."""
+    if self._inspection is not None:
+      return self._inspection._scroll_history(event)
+    if self._modal_ui_active():
+      return NotImplemented
+    self._app.begin_scroll_burst()
+    return self._viewport.mouse_handler(event)
 
   def _rewind_escape_active(self) -> bool:
     """Whether Esc should unstage a rewind rather than close an overlay."""
@@ -1616,12 +1786,7 @@ class _Repl:
     )
     if dismissal is not None:
       return dismissal
-    if (
-      self._fullscreen
-      and self._viewport.reading
-      and not self._state.activity.busy
-      and not _filters.vi_mode()
-    ):
+    if self._fullscreen and self._viewport.reading and not _filters.vi_mode():
       return _actions.NavigateHistory('latest')
     return None
 
@@ -1679,14 +1844,31 @@ class _Repl:
     )
 
   def _welcome_visible(self) -> bool:
-    # Inline sign-in uses scrollback; owned screens keep the launch layout.
-    return (
-      (self._fullscreen or self._secret_input is None)
+    """Keep the launch presentation only until its initial empty phase ends."""
+    self._launch_screen = (
+      self._launch_screen
       and not self._state.session.restore_pending
       and not self._transcript.has_conversation
       and self._stream_pane.preview is None
-      and not self._initial_input_pending()
     )
+    # Inline sign-in uses scrollback; owned screens keep the launch layout.
+    return self._launch_screen and (
+      self._fullscreen or self._secret_input is None
+    )
+
+  def _refresh_key(self) -> object | None:
+    if self._state.activity.busy or self._modal_ui_active():
+      return None
+    navigation = self._navigation_refresh_key()
+    if navigation is None:
+      return None
+    regions = tuple(
+      self._extension_host.cache_key(self._state, region)
+      for region in _extension.RenderRegion
+    )
+    if any(key is None for key in regions):
+      return None
+    return navigation, regions, self._extension_host.themes
 
   def _component_state(self) -> _state.State:
     if not self._welcome_visible():
@@ -1701,7 +1883,9 @@ class _Repl:
 
   def _build_app(self) -> _workspace_application.WorkspaceApplication:
     """Assemble activity, menus, composer, and workspace widgets."""
-    bindings = self._keymap.bindings
+    bindings = _key_bindings.DynamicKeyBindings(
+      lambda: (self._inspection or self)._keymap.bindings
+    )
     component_host = _component.ComponentHost(self._component_state)
 
     # The stream pane owns its trailing blank row and collapses when empty.
@@ -1731,6 +1915,33 @@ class _Repl:
       ],
     )
     self._composer_control = input_window.content
+
+    def jump_to_latest(event: _mouse_events.MouseEvent) -> None:
+      if (
+        event.button == _mouse_events.MouseButton.LEFT
+        and event.event_type == _mouse_events.MouseEventType.MOUSE_UP
+      ):
+        self.dispatch(_actions.NavigateHistory('latest'))
+
+    history_hint = _containers.ConditionalContainer(
+      _containers.Window(
+        _controls.FormattedTextControl(
+          lambda: [
+            (
+              '',
+              '↓ Back to bottom · Esc',
+              jump_to_latest,
+            )
+          ]
+        ),
+        height=1,
+        style='class:footer',
+        align=_containers.WindowAlign.CENTER,
+      ),
+      filter=_filters.Condition(
+        lambda: self._fullscreen and self._viewport.reading
+      ),
+    )
     self._composer_pane = _composer_pane.Pane(
       lambda: self._state,
       component_host,
@@ -1738,12 +1949,14 @@ class _Repl:
       input_window,
       worktree_window,
       fullscreen=self._fullscreen,
+      above_input=history_hint,
       get_size=lambda: self._app.output.get_size(),
       secret_active=lambda: self._secret_input is not None,
       queued_input_pending=self._queued_input_pending,
       show_activity=lambda: (
         not (
-          self._state.activity.status == 'loading…'
+          self._launch_screen
+          and self._state.activity.status == 'loading…'
           and self._worker_configuration.values.get('create_session', False)
         )
       ),
@@ -1795,7 +2008,10 @@ class _Repl:
       align=_containers.VerticalAlign.TOP,
     )
     if self._fullscreen:
-      dock = self._composer_pane.dock
+      dock = _retained.Layer(
+        self._composer_pane.dock,
+        lambda: (self._viewport.reading, self._composer_pane.paint_key()),
+      )
       pinned_header = _containers.ConditionalContainer(
         _containers.Window(
           _controls.FormattedTextControl(
@@ -1826,39 +2042,10 @@ class _Repl:
         ),
       )
 
-      def jump_to_latest(event: _mouse_events.MouseEvent) -> None:
-        if (
-          event.button == _mouse_events.MouseButton.LEFT
-          and event.event_type == _mouse_events.MouseEventType.MOUSE_UP
-        ):
-          self.dispatch(_actions.NavigateHistory('latest'))
-
-      root = _containers.HSplit([
+      root = _component_layout.Rows([
         pinned_header,
         banner_window,
-        _containers.HSplit([
-          _containers.Window(
-            self._viewport, wrap_lines=False, always_hide_cursor=True
-          ),
-          _containers.ConditionalContainer(
-            _containers.Window(
-              _controls.FormattedTextControl(
-                lambda: [
-                  (
-                    '',
-                    '↓ Back to bottom'
-                    + ('' if self._state.activity.busy else ' · Esc'),
-                    jump_to_latest,
-                  )
-                ]
-              ),
-              height=1,
-              style='class:footer',
-              align=_containers.WindowAlign.CENTER,
-            ),
-            filter=_filters.Condition(lambda: self._viewport.reading),
-          ),
-        ]),
+        _transcript_window.TranscriptWindow(self._viewport),
         dock,
       ])
     self._welcome_header_window = pinned_header
@@ -1866,6 +2053,29 @@ class _Repl:
     root.style = 'class:theme-root'
 
     def presentation() -> _containers.Container:
+      child = self._inspection
+      if child is not None:
+        status = child._inspection_status
+        role = {
+          'running': 'accent',
+          'succeeded': 'success',
+          'failed': 'error',
+        }.get(status, 'muted')
+        return _containers.HSplit([
+          _containers.Window(
+            _controls.FormattedTextControl([
+              ('class:ui.muted', '  Parent › '),
+              (
+                'class:ui.text bold',
+                f'Sub-agent {child._session_id}    ',
+              ),
+              (f'class:ui.{role}', f'● {status.capitalize()}'),
+            ]),
+            height=1,
+          ),
+          _containers.Window(height=1, char='─', style='class:ui.faint'),
+          child._view.layout.container,
+        ])
       if not self._welcome_visible():
         return root
       output = _current.get_app().output
@@ -1935,16 +2145,10 @@ class _Repl:
       refresh_interval=0.1,
     )
 
-    def sync_before_render(app: _application.Application[str | None]) -> None:
-      # Faults can remove contributions without an application action.
-      self.dispatch()
-      # Inactive workspaces do not receive the foreground app's resize events.
-      columns = max(1, app.output.get_size().columns)
-      if columns != self._state.layout.columns:
-        self.dispatch(_actions.TerminalResized(columns))
-      self._sync_prompt_editing()
+    row_renderer.install(app)
+    app.refresh_key = self._refresh_key
 
-    app.before_render += sync_before_render
+    app.before_render += self._sync_before_render
     _extended_keys.install()
     # Without this prompt_toolkit takes 1s to disambiguate ESC
     app.ttimeoutlen = 0.05
@@ -1969,7 +2173,27 @@ class _Repl:
         )
 
       app.resize_handler = resize_view
+      app.scroll_handler = self._scroll_history
     return app
+
+  def _sync_before_render(
+    self, app: _application.Application[str | None]
+  ) -> None:
+    # Faults can remove contributions without an application action.
+    self.dispatch()
+    # Inactive workspaces do not receive the foreground app's resize events.
+    columns = max(1, app.output.get_size().columns)
+    if columns != self._state.layout.columns:
+      self.dispatch(_actions.TerminalResized(columns))
+    self._sync_prompt_editing()
+    if self._inspection is not None:
+      self._inspection._app = self._app
+      self._inspection._state = dataclasses.replace(
+        self._inspection._state,
+        extensions=self._state.extensions,
+        extension_themes=self._state.extension_themes,
+      )
+      self._inspection._sync_before_render(app)
 
   def _dock_height(self) -> int:
     return self._composer_pane.height()
@@ -2005,6 +2229,7 @@ class _Repl:
       self._state.tool_group,
       approval.call_id if approval is not None else None,
       background_shortcut,
+      self._viewport.reading,
     )
     if stamp == self._live_stamp:
       return self._live_blocks_cache
@@ -2032,7 +2257,9 @@ class _Repl:
         blocks.append(tail)
       blocks.extend(
         self._streaming_answer.update(
-          preview.content, source_offset=self._committed_source_offset
+          preview.content,
+          source_offset=self._committed_source_offset,
+          preview=not self._viewport.reading,
         )
       )
       refusal = _rendering.assistant_turn_renderable(
@@ -2263,14 +2490,15 @@ class _Repl:
       if response.stream_final:
         self._stream_pane.close()
       return
-    self._conversation_metrics.observe(
-      response,
-      conversation_id=self._state.session.conversation_id,
-      replaying=self._state.session.replaying,
-      turn_duration_seconds=self._state.activity.work_duration(
-        time.monotonic()
-      ),
-    )
+    if not self._state.session.read_only:
+      self._conversation_metrics.observe(
+        response,
+        conversation_id=self._state.session.conversation_id,
+        replaying=self._state.session.replaying,
+        turn_duration_seconds=self._state.activity.work_duration(
+          time.monotonic()
+        ),
+      )
     self._extension_host.handle_message(response)
     payload = response.WhichOneof('payload')
     if payload is None:
@@ -2337,8 +2565,10 @@ class _Repl:
           self._state.session.conversation_id,
         ))
       )
-      remember: _tool_approvals.ApprovalRule | None = _tool_approvals.from_call(
-        name, call.function.arguments, scope
+      remember: _tool_approvals.ApprovalRule | None = (
+        None
+        if response.hitl_request.always_ask
+        else _tool_approvals.from_call(name, call.function.arguments, scope)
       )
       if remember is not None:
         source = agent_pb2.APPROVAL_SOURCE_REMEMBERED_EXACT
@@ -2471,12 +2701,35 @@ class _Repl:
       }
       status = statuses.get(update.status, 'failed')
       task_id = update.id
+      if (
+        self._fullscreen
+        and not self._state.session.remote
+        and not self._state.session.read_only
+        and update.tool_name == 'subagent'
+      ):
+        child = self._children.get(task_id)
+        if child is None and status == 'running':
+          child = self._children[task_id] = self._create_child(task_id)
+        if child is not None:
+          for message in update.messages:
+            child._handle_message(message)
+          child._inspection_status = status
+          if status != 'running':
+            completed = agent_pb2.SessionMessage()
+            completed.runtime_delta.turn_completed.SetInParent()
+            child._handle_message(completed)
+            del self._children[task_id]
+            if child is not self._inspection:
+              self._app.create_background_task(child.close())
+      if update.messages:
+        return
       task = None
       if update.detached and status == 'running':
         task = _actions.Task(
           id=task_id,
           tool_name=update.tool_name,
           display=update.display if update.HasField('display') else None,
+          inspectable=task_id in self._children,
         )
       foreground = not update.detached and status == 'running'
       self.dispatch(_actions.TaskChanged(task_id, task, foreground))
@@ -2566,6 +2819,13 @@ class _Repl:
         'check conversation history before sending again.'
       )
     self.dispatch(_actions.WorkerFailed(message))
+    for child in self._children.values():
+      child._abort_stream()
+      child._inspection_status = 'disconnected'
+      child.dispatch(
+        _actions.WorkerFailed('Parent disconnected.'),
+        _actions.ClearRunningToolCalls(),
+      )
     error = _rendering.error_text(message)
     self._transcript.add_decoration(error, welcome=self._fullscreen)
     if not self._state.lifecycle.active:
@@ -2752,6 +3012,7 @@ class _Repl:
 
   def _log_user_prompt_submitted(self, instruction: str) -> None:
     """Report the size of a prompt the user sent, never its content."""
+    self._conversation_metrics.steering_submitted()
     try:
       utf8_byte_count = len(instruction.encode('utf-8'))
     except UnicodeEncodeError:
@@ -2823,6 +3084,8 @@ class _Repl:
     request.session_id = self._state.session.conversation_id
     if self._client is not None and not self._state.lifecycle.quitting:
       self._client.send(request)
+      if request.HasField('detach_tools'):
+        self._conversation_metrics.tools_background_requested()
 
   def _on_session_opened(self, conversation_id: str) -> None:
     """Reset terminal state before replaying another conversation."""
@@ -2933,6 +3196,9 @@ class _Repl:
       host_tools_registry=self._host_tools_registry
       if self._remote_endpoint is None
       else None,
+      web_provider=launch_configuration.web_provider
+      if self._remote_endpoint is None
+      else None,
       inference_config=launch_configuration.inference_config(
         self._state.status_bar.model,
         self._state.status_bar.reasoning_effort,
@@ -2983,6 +3249,9 @@ class _Repl:
       _actions.WorkerStarted(),
       _actions.SessionAttached(self._state.session.conversation_id),
     )
+    self._workspace_controller.save_conversation(
+      self, self._state.session.conversation_id
+    )
     self._worker_ready.set()
     if self._remote_endpoint is None:
       self._host_tools_registry.worker_started(
@@ -2997,6 +3266,15 @@ class _Repl:
     client, self._client = self._client, None
     if client is not None:
       await client.close()
+    if self._inspection is not None:
+      self._inspection._app = self._inspection._view
+      self._children[self._inspection._session_id] = self._inspection
+      self._inspection = None
+      self._clear_screen_selection()
+      self._app.layout.focus(self._input_window)
+    for child in self._children.values():
+      await child.close()
+    self._children.clear()
 
   async def _restart_worker(
     self,
@@ -3074,6 +3352,25 @@ class _Repl:
       return None
     while True:
       api = option.api or self.model_selection.api
+      max_tokens = self._worker_configuration.values.get('max_tokens')
+      try:
+        _models.validate_selection(
+          dataclasses.replace(
+            option,
+            api=api,
+            base_url=option.base_url
+            or (
+              str(self._worker_configuration.values.get('base_url') or '')
+              if initial
+              else ''
+            ),
+          ),
+          self.reasoning_effort,
+          max_tokens=max_tokens if isinstance(max_tokens, int) else None,
+        )
+      except ValueError as error:
+        self.dispatch(_actions.ShowText(str(error), style='ui.error'))
+        return None
       if api == 'reflection':
         needs_key = not _reflection.has_key()
       elif api == 'anthropic-messages':
@@ -3259,10 +3556,16 @@ class _Repl:
     before_render: Callable[[_application.Application[str | None]], None]
     | None = None,
     screen: _workspace_application.WorkspaceApplication | None = None,
+    navigation_refresh_key: Callable[[], object | None] | None = None,
   ) -> str | None:
     """Run this view with navigation supplied by the CLI composition root."""
     self._navigation = (
       navigation if navigation is not None else _containers.Window(height=0)
+    )
+    self._navigation_refresh_key = navigation_refresh_key or (
+      lambda: (
+        None if navigation is not None or before_render is not None else ()
+      )
     )
     if before_render is not None:
       self._app.before_render += before_render
@@ -3303,7 +3606,10 @@ class _Repl:
     finally:
       self._app.finish_handoff()
       self._app = view
+      if self._inspection is not None:
+        self._inspection._app = self._inspection._view
       self._navigation = _containers.Window(height=0)
+      self._navigation_refresh_key = lambda: ()
       if before_render is not None:
         self._app.before_render -= before_render
       self._activation_preview_pending = False
@@ -3320,6 +3626,8 @@ class _Repl:
         self._sandbox_preparation.cancel()
         await asyncio.gather(self._sandbox_preparation, return_exceptions=True)
       await self._shutdown_worker()
+      await self._viewport.close()
+      await self._stream_pane.wait_for_emits()
 
   def print_resume_hint(self) -> None:
     """Print how to continue after shutdown."""
@@ -3349,15 +3657,18 @@ async def run_workspaces(
   controller: _workspace_controller.WorkspaceController,
   activate: Callable[[_workspaces.Workspace, bool], Awaitable[str | None]],
   queue: asyncio.Queue[tuple[_Repl, _effects.Effect]],
+  *,
+  workspace_changed: Callable[[], None] = lambda: None,
 ) -> None:
   """Wire workspace lifecycle and view results without a back-reference."""
   effects_task = asyncio.create_task(
-    _consume_workspace_effects(controller, queue)
+    _consume_workspace_effects(controller, queue, workspace_changed)
   )
   show_context = False
   try:
     await controller.initialize()
     while True:
+      workspace_changed()
       action = await activate(controller.selected, show_context)
       if action is None:
         break
@@ -3557,6 +3868,7 @@ async def _sandbox_command(
 async def _consume_workspace_effects(
   controller: _workspace_controller.WorkspaceController,
   queue: asyncio.Queue[tuple[_Repl, _effects.Effect]],
+  workspace_changed: Callable[[], None],
 ) -> None:
   while True:
     agent, effect = await queue.get()
@@ -3575,6 +3887,7 @@ async def _consume_workspace_effects(
       ):
         continue
       await handle_workspace_effect(controller, agent, effect)
+      workspace_changed()
     except Exception as error:  # Isolate failed commands.
       agent.show_error(str(error))
     finally:
@@ -3730,6 +4043,13 @@ async def handle_workspace_effect(
       if isinstance(selected, _workspaces.AgentWorkspace):
         if await controller.close_workspace(selected.id):
           agent.handoff('closed')
+    case _effects.ForkWorkspace(name):
+      source = controller.selected
+      if not isinstance(source, _workspaces.AgentWorkspace) or source.remote:
+        raise ValueError('Fork from a host-local workspace.')
+      pending = await controller.fork_workspace(source.id, name)
+      if await controller.select_workspace(pending.identity):
+        agent.handoff('fork')
     case _effects.CreateManagedWorktree(name):
       await controller.create(name)
     case _effects.CreateSandboxWorkspace(name):
@@ -3801,15 +4121,16 @@ async def _activate_workspace(
   theme_name: Callable[[], str] = lambda: _themes.effective('dark'),
   extension_registry: _extension.ExtensionRegistry | None = None,
 ) -> str | None:
+  def navigation_text() -> _formatted_text.StyleAndTextTuples:
+    return _worktree_tabs.render_tabs(
+      controller.workspaces,
+      workspace.identity,
+      tags=controller.tab_tags(),
+      width=_current.get_app().output.get_size().columns,
+    )
+
   navigation = _containers.Window(
-    _controls.FormattedTextControl(
-      lambda: _worktree_tabs.render_tabs(
-        controller.workspaces,
-        workspace.identity,
-        tags=controller.tab_tags(),
-        width=_current.get_app().output.get_size().columns,
-      )
-    ),
+    _controls.FormattedTextControl(navigation_text),
     height=lambda: (
       2
       if len(controller.visible_workspaces()) > 1 or controller.tab_tags()
@@ -3897,6 +4218,7 @@ async def _activate_workspace(
     label=workspace.label,
     navigation=navigation,
     before_render=refresh_picker,
+    navigation_refresh_key=navigation_text,
   )
   if screen is not None:
     return await activate(screen=screen)
@@ -3932,6 +4254,7 @@ async def run_tui(
   remote_endpoint: str | None = None,
   remote_secure: bool = True,
   trust_extensions: bool = False,
+  collect_analytics: bool = True,
 ) -> None:
   """Run independently warm agents across all local and remote workspaces."""
   session_id = uuid.uuid4().hex
@@ -3946,7 +4269,7 @@ async def run_tui(
     try:
       initial_settings = settings.read()
       install_id = initial_settings.get('install_id')
-      if isinstance(install_id, str) and install_id:
+      if collect_analytics and isinstance(install_id, str) and install_id:
         analytics_config = _statsig_config.StatsigConfig(
           user_id=f'install-{install_id}',
           session_id=session_id,
@@ -4074,10 +4397,25 @@ async def run_tui(
 
     screen = _workspace_application.WorkspaceApplication(
       full_screen=True,
+      color_depth=_themes.prompt_color_depth(),
       min_redraw_interval=1 / _MAX_REDRAW_FPS,
       refresh_interval=0.1,
       mouse_support=True,
     )
+
+    def update_title(
+      _: _application.Application[str | None] | None = None,
+    ) -> None:
+      if initial_settings.get('terminal_title') is not False:
+        selected = workspaces.selected
+        screen.set_workspace_title(
+          selected.label,
+          status=selected.state,
+          tag=workspaces.tab_tags().get(selected.identity),
+        )
+
+    screen.before_render += update_title
+    row_renderer.install(screen)
     run_selected = functools.partial(
       run_workspaces,
       workspaces,
@@ -4089,6 +4427,7 @@ async def run_tui(
         extension_registry=extension_registry,
       ),
       workspace_effects,
+      workspace_changed=update_title,
     )
     try:
       await screen.run_views(run_selected)

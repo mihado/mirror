@@ -221,12 +221,12 @@ def test_cancel_or_quit_interrupts_busy_turn_then_quits_when_idle() -> None:
   interrupted, effects = reducer.reduce(
     current, actions.CancelOrQuitRequested()
   )
-  assert effects == (_effects.SetComposerText(''), _effects.InterruptTurn())
+  assert effects == (_effects.InterruptTurn(),)
   assert interrupted.activity.busy
   repeated, effects = reducer.reduce(
     interrupted, actions.CancelOrQuitRequested()
   )
-  assert effects == (_effects.SetComposerText(''), _effects.InterruptTurn())
+  assert effects == (_effects.InterruptTurn(),)
   idle, _ = reducer.reduce(repeated, actions.TurnFinished())
   _, effects = reducer.reduce(idle, actions.CancelOrQuitRequested())
   assert effects == (_effects.ExitApp(),)
@@ -244,7 +244,7 @@ def test_approval_cancel_uses_interrupt_even_before_turn_started(
   assert current.selector.selector.cancel_action == actions.InterruptRequested()
   interrupted, effects = reducer.reduce(current, actions.InterruptRequested())
   assert interrupted.approval.request is not None
-  assert effects == (_effects.SetComposerText(''), _effects.InterruptTurn())
+  assert effects == (_effects.InterruptTurn(),)
 
 
 def test_quit_and_worktree_navigation_declare_controller_effects() -> None:
@@ -633,9 +633,7 @@ def test_explicit_rejection_keeps_next_approval_without_interrupting() -> None:
   )
 
 
-def test_interrupt_restores_queued_and_draft_text_before_requesting_stop() -> (
-  None
-):
+def test_interrupt_keeps_queued_and_draft_text() -> None:
   current, _ = reducer.reduce(_state(), actions.TurnStarted())
   current, _ = reducer.reduce(current, actions.SubmitInstruction('queued'))
   current, _ = reducer.reduce(current, actions.ComposerChanged('draft', 5))
@@ -643,12 +641,9 @@ def test_interrupt_restores_queued_and_draft_text_before_requesting_stop() -> (
   updated, effects = reducer.reduce(current, actions.InterruptRequested())
 
   assert updated.activity.status == 'interrupting…'
-  assert updated.turn.queued == ()
-  assert updated.composer == actions.ComposerState('queued\ndraft', 12)
-  assert effects == (
-    _effects.SetComposerText('queued\ndraft'),
-    _effects.InterruptTurn(),
-  )
+  assert updated.turn.queued == ('queued',)
+  assert updated.composer == actions.ComposerState('draft', 5)
+  assert effects == (_effects.InterruptTurn(),)
 
 
 def test_domain_actions_own_nested_state_transitions() -> None:

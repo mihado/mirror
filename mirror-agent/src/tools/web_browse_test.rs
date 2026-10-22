@@ -1,8 +1,43 @@
 use pretty_assertions::assert_eq;
 
 use super::*;
+use crate::tools::web_test_provider::MemoryWebProvider;
 use crate::tools::web_test_server::TestResponse;
 use crate::tools::web_test_server::TestServer;
+use crate::web::YouClient;
+
+#[tokio::test]
+async fn switching_providers_isolates_pages_and_redirect_aliases() {
+    let tool = WebBrowseTool::new(Box::new(|selection| {
+        Ok(Box::new(MemoryWebProvider(selection)))
+    }));
+    let context = ExecutionContext::default();
+    context.input().set_web_provider(WebProviderConfig::Tavily);
+    let first = tool
+        .run(args("https://example.com/page"), &context)
+        .await
+        .expect("Tavily page");
+    context
+        .input()
+        .set_web_provider(WebProviderConfig::Firecrawl);
+    let second = tool
+        .run(args("https://example.com/final"), &context)
+        .await
+        .expect("Firecrawl page");
+    context.input().set_web_provider(WebProviderConfig::Tavily);
+    let cached = tool
+        .run(args("https://example.com/final"), &context)
+        .await
+        .expect("Tavily alias");
+    let first: Value = serde_json::from_str(&first.content).expect("JSON");
+    let second: Value = serde_json::from_str(&second.content).expect("JSON");
+    let cached: Value = serde_json::from_str(&cached.content).expect("JSON");
+    assert_eq!(first["text_preview"], "Tavily");
+    assert_eq!(second["text_preview"], "Firecrawl");
+    assert_eq!(second["cached"], false);
+    assert_eq!(cached["text_preview"], "Tavily");
+    assert_eq!(cached["cached"], true);
+}
 
 fn args(url: &str) -> WebBrowseArgs {
     WebBrowseArgs {
@@ -21,42 +56,37 @@ fn args(url: &str) -> WebBrowseArgs {
 async fn previews_then_searches_the_cached_page_and_final_url() {
     let mut server = TestServer::start(vec![TestResponse::json(
         200,
-        serde_json::json!({
-            "success": true,
-            "data": {
-                "markdown": " first line \n\nneedle line\nlast line ",
-                "metadata": {
-                    "title": "Example",
-                    "url": "https://example.com/final"
-                }
-            }
-        }),
+        serde_json::json!([{
+            "markdown": " first line \n\nneedle line\nlast line ",
+            "title": "Example",
+            "url": "https://example.com/final"
+        }]),
     )])
     .await;
-    let client = FirecrawlClient::for_test(Some("secret"), &server.base_url, Vec::new());
-    let tool = WebBrowseTool::new(client);
+    let client = YouClient::for_test(Some("synthetic-you-key"), &server.base_url);
+    let tool = WebBrowseTool::new(Box::new(move |_| Ok(Box::new(client.clone()))));
 
     let preview = tool
         .run(
             args("https://example.com/page"),
-            &ExecutionContext::default(),
+            &ExecutionContext::default().with_web_provider(Some(WebProviderConfig::Firecrawl)),
         )
         .await
         .expect("preview");
-    let preview_payload: Value = serde_json::from_str(&preview.content).expect("preview JSON");
+    assert!(preview.success);
     assert_eq!(
-        preview_payload,
-        serde_json::json!({
-            "url": "https://example.com/page",
-            "final_url": "https://example.com/final",
-            "cached": false,
-            "title": "Example",
-            "text_preview": "first line\nneedle line\nlast line",
-            "estimated_text_tokens": 8,
-            "line_count": 3,
-            "truncated": false,
-            "hint": "Full page text is cached. Browse previews and search results are capped around 8000 tokens. Add a regex pattern and optional context_lines to inspect relevant parts of the page."
-        })
+        preview.content,
+        r#"{
+  "url": "https://example.com/page",
+  "final_url": "https://example.com/final",
+  "cached": false,
+  "title": "Example",
+  "text_preview": "first line\nneedle line\nlast line",
+  "estimated_text_tokens": 8,
+  "line_count": 3,
+  "truncated": false,
+  "hint": "Full page text is cached. Browse previews and search results are capped around 8000 tokens. Add a regex pattern and optional context_lines to inspect relevant parts of the page."
+}"#
     );
     assert_eq!(
         preview.display.as_deref(),
@@ -69,11 +99,20 @@ async fn previews_then_searches_the_cached_page_and_final_url() {
         .run(search_args, &ExecutionContext::default())
         .await
         .expect("search");
-    let search_payload: Value = serde_json::from_str(&searched.content).expect("search JSON");
-    assert_eq!(search_payload["cached"], true);
-    assert_eq!(search_payload["output"], "Found 1 line\n2:needle line");
-    assert_eq!(search_payload["truncated"], false);
-    assert_eq!(search_payload["timed_out"], false);
+    assert!(searched.success);
+    assert_eq!(
+        searched.content,
+        r#"{
+  "url": "https://example.com/page",
+  "final_url": "https://example.com/final",
+  "cached": true,
+  "pattern": "needle",
+  "output_mode": "content",
+  "output": "Found 1 line\n2:needle line",
+  "truncated": false,
+  "timed_out": false
+}"#
+    );
 
     let final_preview = tool
         .run(
@@ -87,13 +126,13 @@ async fn previews_then_searches_the_cached_page_and_final_url() {
         true
     );
     let request = server.request().await;
-    assert_eq!(request.path, "/scrape");
+    assert_eq!(request.path, "/v1/contents");
     assert_eq!(
         request.body,
         serde_json::json!({
-            "url": "https://example.com/page",
+            "urls": ["https://example.com/page"],
             "formats": ["markdown"],
-            "onlyMainContent": true
+            "crawl_timeout": 60
         })
     );
 }
@@ -102,17 +141,13 @@ async fn previews_then_searches_the_cached_page_and_final_url() {
 async fn supports_count_context_case_multiline_offset_and_limits() {
     let server = TestServer::start(vec![TestResponse::json(
         200,
-        serde_json::json!({
-            "success": true,
-            "data": {
-                "markdown": "before\nNeedle one\nmiddle\nneedle two\nafter",
-                "metadata": {}
-            }
-        }),
+        serde_json::json!([{
+            "markdown": "before\nNeedle one\nmiddle\nneedle two\nafter"
+        }]),
     )])
     .await;
-    let client = FirecrawlClient::for_test(Some("secret"), &server.base_url, Vec::new());
-    let tool = WebBrowseTool::new(client);
+    let client = YouClient::for_test(Some("synthetic-you-key"), &server.base_url);
+    let tool = WebBrowseTool::new(Box::new(move |_| Ok(Box::new(client.clone()))));
 
     let mut count_args = args("https://example.com");
     count_args.pattern = Some("needle".to_string());
@@ -162,14 +197,11 @@ async fn supports_count_context_case_multiline_offset_and_limits() {
 async fn reports_invalid_urls_patterns_and_regex_errors() {
     let mut server = TestServer::start(vec![TestResponse::json(
         200,
-        serde_json::json!({
-            "success": true,
-            "data": {"markdown": "page", "metadata": {}}
-        }),
+        serde_json::json!([{"markdown": "page"}]),
     )])
     .await;
-    let client = FirecrawlClient::for_test(Some("secret"), &server.base_url, Vec::new());
-    let tool = WebBrowseTool::new(client);
+    let client = YouClient::for_test(Some("synthetic-you-key"), &server.base_url);
+    let tool = WebBrowseTool::new(Box::new(move |_| Ok(Box::new(client.clone()))));
 
     let invalid_url = tool
         .run(args("javascript:alert(1)"), &ExecutionContext::default())
@@ -195,6 +227,95 @@ async fn reports_invalid_urls_patterns_and_regex_errors() {
         .expect("regex result");
     assert!(!regex_result.success);
     assert!(regex_result.content.contains("Ripgrep error (exit 2)"));
+    let _ = server.request().await;
+}
+
+#[tokio::test]
+async fn unavailable_pages_and_invalid_requests_are_not_cached() {
+    let mut server = TestServer::start(vec![
+        TestResponse::json(200, serde_json::json!([])),
+        TestResponse::text(422, "synthetic-you-key"),
+        TestResponse::json(200, serde_json::json!([{ "markdown": "recovered" }])),
+    ])
+    .await;
+    let client = YouClient::for_test(Some("synthetic-you-key"), &server.base_url);
+    let tool = WebBrowseTool::new(Box::new(move |_| Ok(Box::new(client.clone()))));
+    assert_eq!(
+        tool.run(args("https://example.com"), &ExecutionContext::default())
+            .await
+            .expect("unavailable"),
+        ToolOutput::error("This website could not be accessed. Try a different source.")
+    );
+    assert_eq!(
+        tool.run(args("https://example.com"), &ExecutionContext::default())
+            .await
+            .expect("invalid URL"),
+        ToolOutput::error("Invalid URL for You.com Contents. Try a different URL.")
+    );
+    let recovered = tool
+        .run(args("https://example.com"), &ExecutionContext::default())
+        .await
+        .expect("recovered");
+    assert!(recovered.success);
+    assert_eq!(
+        serde_json::from_str::<Value>(&recovered.content).expect("JSON")["cached"],
+        false
+    );
+    let _ = server.request().await;
+    let _ = server.request().await;
+    let _ = server.request().await;
+}
+
+#[tokio::test]
+async fn grep_reads_beyond_the_preview_and_caches_are_tool_local() {
+    let markdown = format!("{}needle 版本", "row\n".repeat(20_000));
+    let mut server = TestServer::start(vec![
+        TestResponse::json(200, serde_json::json!([{ "markdown": markdown }])),
+        TestResponse::json(200, serde_json::json!([{ "markdown": "new page" }])),
+    ])
+    .await;
+    let client = YouClient::for_test(Some("synthetic-you-key"), &server.base_url);
+    let first_client = client.clone();
+    let tool = WebBrowseTool::new(Box::new(move |_| Ok(Box::new(first_client.clone()))));
+    let preview = tool
+        .run(args("https://example.com"), &ExecutionContext::default())
+        .await
+        .expect("preview");
+    assert!(preview.success);
+    assert!(!preview.content.contains("needle"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&preview.content).expect("JSON")["truncated"],
+        true
+    );
+    let mut search = args("https://example.com");
+    search.pattern = Some("needle".into());
+    let result = tool
+        .run(search, &ExecutionContext::default())
+        .await
+        .expect("grep");
+    assert!(result.success);
+    assert_eq!(
+        result.content,
+        r#"{
+  "url": "https://example.com",
+  "final_url": "https://example.com",
+  "cached": true,
+  "pattern": "needle",
+  "output_mode": "content",
+  "output": "Found 1 line\n20001:needle 版本",
+  "truncated": false,
+  "timed_out": false
+}"#
+    );
+    let other = WebBrowseTool::new(Box::new(move |_| Ok(Box::new(client.clone()))))
+        .run(args("https://example.com"), &ExecutionContext::default())
+        .await
+        .expect("independent tool");
+    assert!(other.success);
+    let payload: Value = serde_json::from_str(&other.content).expect("JSON");
+    assert_eq!(payload["cached"], false);
+    assert_eq!(payload["text_preview"], "new page");
+    let _ = server.request().await;
     let _ = server.request().await;
 }
 

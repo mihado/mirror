@@ -81,6 +81,7 @@ fn tool_output(record: ChatRecord) -> Result<ToolOutput, String> {
         success: record.success,
         touched: Vec::new(),
         exit_code: None,
+        duration: None,
     })
 }
 

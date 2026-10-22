@@ -3,9 +3,10 @@
 from collections.abc import Callable, Sequence
 
 from prompt_toolkit import buffer, filters
+from prompt_toolkit.application import current
 from prompt_toolkit.layout import containers, controls, dimension, processors
 
-from mirror.cli import rendering, themes
+from mirror.cli import rendering, retained, themes
 from mirror.cli.components import layout
 from mirror.cli.composer import processors as composer_processors
 
@@ -49,7 +50,7 @@ def wrap_input(
 ) -> containers.HSplit:
   """Frame the input and status bar without duplicating an open menu border."""
   show_menu = filters.Condition(menu_visible)
-  input_surface = containers.HSplit(
+  editor = layout.Rows(
     [
       containers.ConditionalContainer(
         containers.Window(
@@ -74,11 +75,24 @@ def wrap_input(
         ),
       ),
       containers.Window(height=1),
+    ],
+  )
+  input_surface = layout.Rows(
+    [
+      retained.Layer(
+        editor,
+        lambda: (
+          show_menu(),
+          input_window.preferred_height(1, 1).max,
+          tuple(current.get_app().key_processor.key_buffer),
+        ),
+        animated=False,
+      ),
       status_bar,
     ],
     style='class:composer',
   )
-  return containers.HSplit([
+  return layout.Rows([
     input_surface,
     containers.Window(
       height=1,

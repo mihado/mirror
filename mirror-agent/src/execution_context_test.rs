@@ -76,3 +76,20 @@ fn inherited_approvals_follow_live_parent_permissions() {
     parent.input().set_approval_mode(AgentApprovalMode::Hitl);
     assert!(!child.tool_permissions().allow_outside_workspace());
 }
+
+#[tokio::test]
+async fn an_always_asking_call_without_an_approval_hook_is_not_approved_in_auto_mode() {
+    let context = ExecutionContext::new(
+        AgentApprovalMode::Auto,
+        None,
+        crate::TaskManagerHandle::default(),
+        None,
+        None,
+    );
+
+    let decision = context
+        .approval_decision(&ToolCall::default(), ApprovalKind::AlwaysAsk)
+        .await;
+
+    assert!(decision.is_err());
+}

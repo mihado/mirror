@@ -33,9 +33,10 @@ use crate::providers::LlmError;
 use crate::providers::StreamEvent;
 use crate::system_prompt::build_system_prompt;
 use crate::system_prompt::SystemPromptConfig;
-use crate::tools::ToolExecutor;
 use crate::tools::ToolExecutorError;
+use crate::tools::{ToolDefinition, ToolExecutor};
 use crate::AgentEvent;
+use crate::ApprovalKind;
 use crate::ExecutionContextError;
 use mirror_protocol::SystemPromptReport;
 
@@ -50,6 +51,13 @@ pub struct ReactAgent<Model> {
     compaction_model: Option<Model>,
     system_prompt: SystemPromptConfig,
     config: ReactAgentConfig,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StepOutcome {
+    Complete,
+    ToolCalls,
+    InvalidToolArguments,
 }
 
 impl<Model> ReactAgent<Model>
@@ -137,7 +145,7 @@ where
         &self,
         context_window: usize,
         system_prompt: &str,
-        tool_executor: &dyn ToolExecutor,
+        tools: &[ToolDefinition],
     ) -> Result<Compactor, ReactAgentError> {
         Ok(Compactor::new(
             CompactorConfig {
@@ -147,7 +155,7 @@ where
                 tool_result_max_chars: self.config.tool_result_max_chars,
                 prompt_injection_policy: self.system_prompt.prompt_injection_policy.clone(),
             },
-            &tool_executor.definitions(),
+            tools,
             system_prompt,
         )?)
     }
@@ -160,24 +168,24 @@ where
         &self,
         context_window: usize,
         system_prompt: &str,
-        tool_executor: &dyn ToolExecutor,
+        tools: &[ToolDefinition],
     ) -> Result<(), ReactAgentError> {
         if !self.config.disable_compaction {
-            self.compactor(context_window, system_prompt, tool_executor)?;
+            self.compactor(context_window, system_prompt, tools)?;
         }
         Ok(())
     }
 
     async fn snapshot_system_prompt(
         &self,
-        tool_executor: &dyn ToolExecutor,
+        tools: &[ToolDefinition],
     ) -> Result<(String, SystemPromptReport), ReactAgentError> {
         let config = self.system_prompt.clone();
         let (prompt, mut report) =
             tokio::task::spawn_blocking(move || build_system_prompt(&config))
                 .await
                 .map_err(|error| AgentError::InvalidInput(error.to_string()))?;
-        update_tool_report(&mut report, tool_executor);
+        update_tool_report(&mut report, tools);
         Ok((prompt, report))
     }
 
@@ -191,9 +199,10 @@ where
         }
         let context_window = self.context_window().await;
         let inference = self.inference_config.clone();
+        let tools = tool_executor.definitions_for(context.execution());
         if context.entries().is_empty() {
-            let system_prompt = self.snapshot_system_prompt(tool_executor).await?;
-            let validation = self.validate_budget(context_window, &system_prompt.0, tool_executor);
+            let system_prompt = self.snapshot_system_prompt(&tools).await?;
+            let validation = self.validate_budget(context_window, &system_prompt.0, &tools);
             let window = self.context_window_record(inference, system_prompt, None);
             if let Err(error) = validation {
                 context.publish(AgentEvent::Entries(vec![window]));
@@ -202,19 +211,31 @@ where
             context.push(AgentEvent::Entries(vec![window])).await?;
             self.report_context_usage(context, tool_executor, context_window)
                 .await?;
+            self.prewarm(context, tool_executor);
             return Ok(());
         }
         context.strip_before_active_window()?;
         if let Some(mut entry) = context.entries().first().cloned() {
             if let Some(agent_message::Payload::ContextWindow(window)) = &mut entry.payload {
                 if let Some(report) = &mut window.system_prompt_report {
-                    update_tool_report(report, tool_executor);
+                    update_tool_report(report, &tools);
                     context.publish(AgentEvent::Entries(vec![entry]));
                 }
             }
         }
         self.report_context_usage(context, tool_executor, context_window)
-            .await
+            .await?;
+        self.prewarm(context, tool_executor);
+        Ok(())
+    }
+
+    fn prewarm(&self, context: &ReactContext, tool_executor: &dyn ToolExecutor) {
+        self.model.prewarm(CompletionRequest {
+            messages: active_messages(context.entries()),
+            tools: tool_executor.definitions_for(context.execution()),
+            max_tokens: None,
+            inference: self.inference_config.clone(),
+        });
     }
 
     /// Compact on request using the automatic policy, without a completion turn.
@@ -250,19 +271,25 @@ where
                 tokio::time::sleep(retry_delay).await;
             }
             match self.step(context, tool_executor).await {
-                Ok(unfinished) => {
+                Ok(StepOutcome::InvalidToolArguments) => {
+                    // Tool feedback is already committed; keep incomplete retries independent.
+                    incomplete_completions = 0;
+                }
+                Ok(outcome) => {
+                    exceptions = 0;
                     retry_delay = Duration::ZERO;
                     incomplete_completions = 0;
-                    let pending = context.flush_pending();
+                    let pending = context.take_pending().await?;
                     let has_model_input = pending
                         .iter()
                         .any(|entry| !entry.to_llm_messages().is_empty());
                     if !pending.is_empty() {
                         context.push(AgentEvent::Entries(pending)).await?;
                     }
-                    if !unfinished && !has_model_input {
+                    if outcome == StepOutcome::Complete && !has_model_input {
                         return Ok(());
                     }
+                    continue;
                 }
                 Err(ReactAgentError::IncompleteCompletion) => {
                     incomplete_completions += 1;
@@ -275,6 +302,7 @@ where
                             "warning",
                         )]))
                         .await?;
+                    continue;
                 }
                 Err(error @ ReactAgentError::Model(LlmError::ContextOverflow(_)))
                     if self.config.disable_compaction =>
@@ -288,19 +316,19 @@ where
                             "error",
                         )]))
                         .await?;
-                    exceptions += 1;
-                    retry_delay = retry_delay.saturating_add(Duration::from_secs(1));
-                    if self.config.max_exceptions > 0 && exceptions >= self.config.max_exceptions {
-                        context
-                            .push(AgentEvent::Entries(vec![assistant_text(&format!(
-                                "Reached the maximum of {} exceptions without completing the task.",
-                                self.config.max_exceptions
-                            ))]))
-                            .await?;
-                        return Ok(());
-                    }
                 }
                 Err(error) => return Err(error),
+            }
+            exceptions += 1;
+            retry_delay = retry_delay.saturating_add(Duration::from_secs(1));
+            if self.config.max_exceptions > 0 && exceptions >= self.config.max_exceptions {
+                context
+                    .push(AgentEvent::Entries(vec![assistant_text(&format!(
+                        "Reached the maximum of {} exceptions without completing the task.",
+                        self.config.max_exceptions
+                    ))]))
+                    .await?;
+                return Ok(());
             }
         }
         context
@@ -316,7 +344,7 @@ where
         &mut self,
         context: &mut ReactContext,
         tool_executor: &dyn ToolExecutor,
-    ) -> Result<bool, ReactAgentError> {
+    ) -> Result<StepOutcome, ReactAgentError> {
         if let Some(inference) = context.execution().inference_config() {
             self.update_inference(inference);
         }
@@ -391,7 +419,13 @@ where
         if calls.is_empty() && (!has_answer || truncated) {
             return Err(ReactAgentError::IncompleteCompletion);
         }
-        Ok(!calls.is_empty())
+        if calls.is_empty() {
+            return Ok(StepOutcome::Complete);
+        }
+        if self.config.max_exceptions > 0 && calls.iter().all(has_invalid_arguments) {
+            return Ok(StepOutcome::InvalidToolArguments);
+        }
+        Ok(StepOutcome::ToolCalls)
     }
 
     async fn maybe_compact(
@@ -405,7 +439,11 @@ where
             context.system_prompt()?;
             return Ok(active_messages(context.entries()));
         }
-        let compactor = self.compactor(context_window, context.system_prompt()?, tool_executor)?;
+        let compactor = self.compactor(
+            context_window,
+            context.system_prompt()?,
+            &tool_executor.definitions_for(context.execution()),
+        )?;
         if compactor.should_compact(context.entries(), &[]) {
             self.compact(context, tool_executor, context_window, inference)
                 .await
@@ -421,8 +459,9 @@ where
         context_window: usize,
         inference: Option<&InferenceConfig>,
     ) -> Result<Vec<chat_record::Message>, ReactAgentError> {
-        let system_prompt = self.snapshot_system_prompt(tool_executor).await?;
-        let compactor = self.compactor(context_window, &system_prompt.0, tool_executor)?;
+        let tools = tool_executor.definitions_for(context.execution());
+        let system_prompt = self.snapshot_system_prompt(&tools).await?;
+        let compactor = self.compactor(context_window, &system_prompt.0, &tools)?;
         context.push(AgentEvent::CompactionStarted).await?;
         let (warnings, request) = compactor.prepare_with(context.entries(), &[]);
         if !warnings.is_empty() {
@@ -473,7 +512,7 @@ where
         let started = Instant::now();
         let events = self.model.stream(CompletionRequest {
             messages,
-            tools: tool_executor.definitions(),
+            tools: tool_executor.definitions_for(context.execution()),
             max_tokens: Some(max_tokens.try_into().unwrap_or(u32::MAX)),
             inference: inference.cloned(),
         });
@@ -579,11 +618,16 @@ where
         let execution = context.execution().clone();
         let mut allowed = Vec::with_capacity(calls.len());
         for call in calls {
-            let needs_approval = call
-                .function
-                .as_ref()
-                .is_some_and(|function| tool_executor.needs_approval(&function.name));
-            allowed.push(approve_tool(context, call, needs_approval).await?);
+            let kind = call.function.as_ref().and_then(|function| {
+                if tool_executor.always_asks(&function.name) {
+                    Some(ApprovalKind::AlwaysAsk)
+                } else if tool_executor.needs_approval(&function.name) {
+                    Some(ApprovalKind::Ordinary)
+                } else {
+                    None
+                }
+            });
+            allowed.push(approve_tool(context, call, kind).await?);
         }
         let outputs = tool_executor
             .execute(batch_id, calls, &allowed, &execution)
@@ -633,11 +677,15 @@ where
             context.system_prompt()?;
             return Ok(prompt_size(
                 context.entries(),
-                estimate_tools(&tool_executor.definitions()),
+                estimate_tools(&tool_executor.definitions_for(context.execution())),
             ));
         }
         Ok(self
-            .compactor(context_window, context.system_prompt()?, tool_executor)?
+            .compactor(
+                context_window,
+                context.system_prompt()?,
+                &tool_executor.definitions_for(context.execution()),
+            )?
             .prompt_tokens(context.entries()))
     }
 
@@ -683,9 +731,16 @@ where
     }
 }
 
-fn update_tool_report(report: &mut SystemPromptReport, tool_executor: &dyn ToolExecutor) {
-    let tools = tool_executor.definitions();
-    report.tool_tokens = Some(estimate_tools(&tools) as u64);
+fn has_invalid_arguments(call: &ToolCall) -> bool {
+    call.function.as_ref().is_some_and(|function| {
+        // Typed tools treat empty arguments as an empty object.
+        !function.arguments.trim().is_empty()
+            && serde_json::from_str::<serde_json::Value>(&function.arguments).is_err()
+    })
+}
+
+fn update_tool_report(report: &mut SystemPromptReport, tools: &[ToolDefinition]) {
+    report.tool_tokens = Some(estimate_tools(tools) as u64);
     report.tools = tools
         .iter()
         .map(|tool| mirror_protocol::system_prompt_report::Part {
@@ -698,7 +753,7 @@ fn update_tool_report(report: &mut SystemPromptReport, tool_executor: &dyn ToolE
 #[derive(Debug, Clone, Copy)]
 pub struct ReactAgentConfig {
     pub max_iterations: usize,
-    /// Maximum retryable exceptions per run; zero disables the limit.
+    /// Consecutive retryable failures, including all-invalid JSON tool turns; zero disables the limit.
     pub max_exceptions: usize,
     pub compaction_threshold: Option<usize>,
     /// Keep the complete history and fail on context exhaustion instead of compacting.
@@ -816,9 +871,9 @@ fn tool_record(call: &ToolCall, result: ToolOutput) -> AgentMessage {
 async fn approve_tool(
     context: &mut ReactContext,
     call: &ToolCall,
-    needs_approval: bool,
+    kind: Option<ApprovalKind>,
 ) -> Result<bool, ReactAgentError> {
-    let decision = if needs_approval {
+    let decision = if let Some(kind) = kind {
         context
             .push(AgentEvent::Entries(vec![AgentMessage::tool_approval(
                 call,
@@ -826,7 +881,7 @@ async fn approve_tool(
                 ApprovalSource::Unspecified,
             )]))
             .await?;
-        context.execution().approval_decision(call).await?
+        context.execution().approval_decision(call, kind).await?
     } else {
         crate::ApprovalDecision::new(true, ApprovalSource::NotRequired)
     };

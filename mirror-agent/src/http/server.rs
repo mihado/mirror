@@ -1,11 +1,15 @@
 //! Sandbox-local HTTP access to one already-configured agent.
 
+use std::convert::Infallible;
+
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tokio::sync::watch;
 
 use super::{PromptError, PromptRunner};
 
@@ -14,14 +18,48 @@ use super::{PromptError, PromptRunner};
 #[error("{1}")]
 pub struct HttpError(StatusCode, String);
 
+/// Snapshot handles for the optional trace routes.
+#[derive(Clone, Debug)]
+pub struct SessionTrace {
+    pub native: watch::Receiver<Vec<Bytes>>,
+    pub model_calls: watch::Receiver<Vec<Bytes>>,
+}
+
 /// Expose one configured agent; the caller owns listener and shutdown lifetimes.
-pub fn router(runner: PromptRunner) -> Router {
-    Router::new()
+pub fn router(runner: PromptRunner, trace: Option<SessionTrace>) -> Router {
+    let mut router = Router::new()
         .route("/message", post(prompt))
+        .with_state(runner);
+    if let Some(trace) = trace {
+        router = router.merge(
+            Router::new()
+                .route("/trace", get(native_trace))
+                .route("/trace/model-calls", get(model_calls))
+                .with_state(trace),
+        );
+    }
+    router
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(middleware::from_fn(guard_request))
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
-        .with_state(runner)
+}
+
+async fn native_trace(State(trace): State<SessionTrace>) -> Response {
+    trace_response(trace.native)
+}
+
+async fn model_calls(State(trace): State<SessionTrace>) -> Response {
+    trace_response(trace.model_calls)
+}
+
+fn trace_response(trace: watch::Receiver<Vec<Bytes>>) -> Response {
+    let snapshot = trace.borrow().clone();
+    let chunks = futures_util::stream::iter(snapshot.into_iter().map(Ok::<_, Infallible>));
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(chunks),
+    )
+        .into_response()
 }
 
 async fn guard_request(request: Request, next: Next) -> Result<Response, HttpError> {

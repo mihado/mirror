@@ -206,6 +206,10 @@ impl Tool for SearchMemoryTool {
         )
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn run(
         &self,
         args: SearchMemoryArgs,

@@ -3,8 +3,8 @@ use std::path::Path;
 
 use prost::Message;
 
-use crate::run_once::read_request;
-use crate::{prepare_checkout, RepositoryDefinition, RunOnceError};
+use crate::tool_runner::{read_request, RunOnceError};
+use crate::{prepare_checkout, RepositoryDefinition};
 use mirror_agent::system_prompt::{
     gather_environment_info, load_workspace_context, load_workspace_skills, EnvironmentInfo,
     ResolvedInstructions,
@@ -18,13 +18,10 @@ pub enum PrepareRepositoryError {
     Prepare(#[from] std::io::Error),
 }
 
-/// What `prepare-repository` writes: the checkout's prompt context and facts
-/// about the sandbox that holds it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreparedContext {
     #[serde(flatten)]
     pub context: ResolvedInstructions,
-    /// Absent from guests that predate environment facts.
     #[serde(default)]
     pub environment: Option<EnvironmentInfo>,
 }

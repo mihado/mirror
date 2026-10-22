@@ -2,7 +2,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "mirror-agent-py",
   "mirror-agent",
   "mirror-sandbox",
   "mirror-sandbox/providers/microsandbox",

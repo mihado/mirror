@@ -1396,6 +1396,7 @@ async def test_remote_transport_attaches_without_owning_worker() -> None:
 @pytest.mark.parametrize(
   'finish_loading, interrupt', [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.no_xdist
 async def test_run_tui_accepts_input_before_extensions_finish_loading(
   tmp_path: pathlib.Path,
   capfd: pytest.CaptureFixture[str],
@@ -1434,6 +1435,7 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
     before_render: Callable[[_application.Application[str | None]], None]
     | None = None,
     screen: cli._workspace_application.WorkspaceApplication | None = None,
+    navigation_refresh_key: Callable[[], object | None] | None = None,
   ) -> str | None:
     active.append(repl)
     return await activate(
@@ -1443,6 +1445,7 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
       navigation=navigation,
       before_render=before_render,
       screen=screen,
+      navigation_refresh_key=navigation_refresh_key,
     )
 
   monkeypatch.setattr(user_extensions.UserExtensions, 'start', load_extensions)
@@ -1521,6 +1524,7 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
   [('reflection', 'Reflection'), ('anthropic-messages', 'Anthropic')],
 )
 @pytest.mark.parametrize('cancel', [False, True])
+@pytest.mark.no_xdist
 async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -1561,6 +1565,7 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
     before_render: Callable[[_application.Application[str | None]], None]
     | None = None,
     screen: cli._workspace_application.WorkspaceApplication | None = None,
+    navigation_refresh_key: Callable[[], object | None] | None = None,
   ) -> str | None:
     active.append(repl)
     return await activate(
@@ -1570,6 +1575,7 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
       navigation=navigation,
       before_render=before_render,
       screen=screen,
+      navigation_refresh_key=navigation_refresh_key,
     )
 
   async def load_extensions(
@@ -2792,7 +2798,7 @@ def _task_result(
 
 
 def _approval_requested(
-  call_id: str, name: str, arguments: str = '{}'
+  call_id: str, name: str, arguments: str = '{}', *, always_ask: bool = False
 ) -> agent_pb2.SessionMessage:
   return agent_pb2.SessionMessage(
     hitl_request=agent_pb2.HITLRequest(
@@ -2800,7 +2806,8 @@ def _approval_requested(
         id=call_id,
         type='function',
         function=agent_pb2.FunctionCall(name=name, arguments=arguments),
-      )
+      ),
+      always_ask=always_ask,
     )
   )
 
@@ -3233,6 +3240,7 @@ async def test_failed_worker_keeps_commands_available(
 
 
 @pytest.mark.asyncio
+@pytest.mark.no_xdist
 async def test_worker_failure_leaves_reverse_search(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3515,6 +3523,7 @@ async def test_worktree_navigation_keeps_a_visible_frame_between_tabs() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.no_xdist
 async def test_welcome_tab_and_shift_tab_keep_selected_workspace_visible() -> (
   None
 ):
@@ -3534,9 +3543,13 @@ async def test_welcome_tab_and_shift_tab_keep_selected_workspace_visible() -> (
     dont_extend_height=True,
     wrap_lines=False,
   )
-  async with _visual_repl(200, 40) as (first, stream):
+  async with _visual_repl(200, 40, fullscreen=True) as (first, stream):
     second = _repl(
-      conversation_id='second', model='second-model', create_session=True
+      conversation_id='second',
+      model='second-model',
+      create_session=True,
+      active=False,
+      fullscreen=True,
     )
     pipe = first._app.input
     assert isinstance(pipe, _input_base.PipeInput)
@@ -3611,6 +3624,7 @@ async def test_welcome_tab_and_shift_tab_keep_selected_workspace_visible() -> (
     ((), 'in-progress', 2, 10),
   ],
 )
+@pytest.mark.no_xdist
 async def test_activate_workspace_reserves_navigation_rows(
   tmp_path: pathlib.Path,
   others: tuple[workspaces.PendingWorkspace, ...],
@@ -4197,7 +4211,7 @@ def test_a_loaded_skill_is_drawn_under_the_message_that_named_it() -> None:
     '',
     '›  $create-tool',
     '',
-    '◆  loaded $create-tool',
+    '◆  Loaded $create-tool',
   ]
 
 
@@ -4649,7 +4663,7 @@ def test_skill_read_preview_gains_path_and_settles_as_loaded() -> None:
     )
   )
   pending = _pending.render(repl._state)
-  assert '◆  loading $prs' in _ansi_text(pending)
+  assert '◆  Loading $prs' in _ansi_text(pending)
 
   _handle(
     repl,
@@ -4672,7 +4686,7 @@ def test_skill_read_preview_gains_path_and_settles_as_loaded() -> None:
   result = {'role': 'tool', 'tool_call_id': 'c1', 'content': 'instructions'}
   rendered = _handle(repl, _delta(result))
   assert rendered is not None
-  assert _render_to_text(rendered).strip() == '◆  loaded $prs'
+  assert _render_to_text(rendered).strip() == '◆  Loaded $prs'
 
 
 def test_stream_aborted_clears_pending_tool_call() -> None:
@@ -5412,10 +5426,12 @@ def test_dispatch_batches_state_effects_and_invalidation(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   repl = _repl()
-  invalidations: list[None] = []
+  invalidations: list[bool] = []
   effects: list[_effects.Effect] = []
   monkeypatch.setattr(
-    repl._app, 'invalidate', lambda: invalidations.append(None)
+    repl._app,
+    'invalidate',
+    lambda *, transcript_only=False: invalidations.append(transcript_only),
   )
   monkeypatch.setattr(repl, '_run_effect', effects.append)
 
@@ -5433,7 +5449,7 @@ def test_dispatch_batches_state_effects_and_invalidation(
     _effects.DetachTools(),
     _effects.DetachTools(),
   ]
-  assert invalidations == [None]
+  assert invalidations == [False]
 
 
 def test_activity_is_shown_below_prompt_when_busy() -> None:
@@ -5615,7 +5631,7 @@ async def test_saved_startup_keeps_the_conversation_layout(
 
 
 @pytest.mark.asyncio
-async def test_saved_startup_shows_welcome_only_after_an_empty_replay() -> None:
+async def test_saved_startup_empty_replay_keeps_normal_layout() -> None:
   async with _visual_repl(fullscreen=True, create_session=False) as (
     repl,
     stream,
@@ -5624,7 +5640,7 @@ async def test_saved_startup_shows_welcome_only_after_an_empty_replay() -> None:
     assert 'Reflection mirror' not in before
     await repl._on_worker_message(_replay_done('conv-1'))
     await _settle(repl)
-    assert 'Reflection mirror' in _capture_frame(repl, stream)
+    assert 'Reflection mirror' not in _capture_frame(repl, stream)
 
 
 @pytest.mark.asyncio
@@ -5667,6 +5683,7 @@ async def test_new_startup_keeps_banner_live() -> None:
     '{',
   ],
 )
+@pytest.mark.no_xdist
 async def test_startup_reports_invalid_keybindings_and_uses_defaults(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: pathlib.Path,
@@ -6570,6 +6587,48 @@ async def test_inference_changes_during_rust_turn_without_restarting_worker(
   ]
 
 
+@pytest.mark.asyncio
+async def test_gemini_switch_is_validated_before_persistence_and_restores_routing(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv('HOME', str(tmp_path))
+  monkeypatch.delenv('GEMINI_API_KEY', raising=False)
+  monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-other-key')
+  repl = _repl(output=_output_base.DummyOutput(), workspace_path=tmp_path)
+  previous = repl.model_selection
+  _models.save_last_selection(previous)
+  option = _models.ModelOption('gemini-4-argon', 'Gemini 4 Argon', api='gemini')
+  try:
+    await _dispatch_and_wait(repl, _actions.ModelResolved(option))
+    assert repl.model_selection == previous
+    assert _models.load_last_selection() == previous
+    monkeypatch.setenv('GEMINI_API_KEY', 'synthetic-gemini-key')
+    repl.dispatch(_actions.TurnStarted())
+    await _dispatch_and_wait(repl, _actions.ModelResolved(option))
+    assert repl.model_selection == _models.ModelOption(
+      'gemini-4-argon', 'gemini-4-argon', api='gemini'
+    )
+    saved = cli_main._startup_model((), None)
+    assert saved is not None
+    assert (saved.model_id, saved.api, saved.base_url) == (
+      'gemini-4-argon',
+      'gemini',
+      '',
+    )
+    invalid = _models.ModelOption('unverified-model', 'Unknown', api='gemini')
+    await _dispatch_and_wait(repl, _actions.ModelResolved(invalid))
+    assert _models.load_last_selection() == saved
+    assert repl.model == 'gemini-4-argon'
+    record = (
+      pathlib.Path(os.environ['MIRROR_MODELS_CONFIG']).parent
+      / 'last_model.json'
+    )
+    assert 'synthetic-' not in record.read_text()
+  finally:
+    await repl.close()
+
+
 def test_agent_message_executes_through_client() -> None:
   repl = _repl()
   sent: list[agent_pb2.AgentMessage] = []
@@ -6599,7 +6658,7 @@ def test_submit_then_interrupt_is_queued_before_worker_connects() -> None:
 
   repl._client = _Client()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
   repl.dispatch(_actions.WorkerLoadingStarted())
-  repl._input.text = 'do not run this'
+  repl._input.text = 'run this next'
 
   _submit(repl)
   repl.dispatch(_actions.InterruptRequested())
@@ -6608,9 +6667,9 @@ def test_submit_then_interrupt_is_queued_before_worker_connects() -> None:
     'message',
     'interrupt',
   ]
-  assert sent[0].message.chat.user.content == 'do not run this'
-  assert repl._input.text == 'do not run this'
-  assert not repl._state.turn.queued
+  assert sent[0].message.chat.user.content == 'run this next'
+  assert repl._input.text == ''
+  assert repl._state.turn.queued == ('run this next',)
 
 
 @pytest.mark.asyncio
@@ -7054,7 +7113,6 @@ async def test_sending_after_a_rewind_confirms_before_forking(
   assert len(sent) == 1
   assert sent[0].session_id == 'forked'
   assert sent[0].message.chat.user.content == 'try something else'
-  assert not sent[0].message.chat.HasField('rewind_to')
   assert repl._input.text == ''
   assert [record.id for record in await parent.messages()] == [
     first.id,
@@ -7151,7 +7209,6 @@ async def test_remote_rewind_forks_then_sends_only_to_child(
       == 'forked'
     )
     assert message.message.chat.user.content == 'revised draft'
-    assert not message.message.chat.HasField('rewind_to')
     assert mirror.forks == [
       mirror_pb2.ForkSessionRequest(
         source_session_id='parent', at_entry_id='remote-history'
@@ -8676,6 +8733,9 @@ async def test_up_arrow_recalls_persistent_history(
       record=True, width=80, theme=themes.rich_theme()
     )
 
+    # History loading does not invalidate an idle UI.
+    async with contextlib.aclosing(repl._input.history.load()) as history:
+      await anext(history, None)
     loaded = asyncio.Event()
     pressed = asyncio.Event()
 
@@ -8727,6 +8787,7 @@ def _input_styles(repl: cli._Repl) -> set[str]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.no_xdist
 async def test_ctrl_r_search_finds_past_prompt(
   tmp_path: pathlib.Path,
 ) -> None:
@@ -9102,6 +9163,57 @@ async def test_fullscreen_tool_status_stays_in_conversation_until_result(
 
     repl._handle_message(_turn_completed())
     assert status not in _frame_text(repl, terminal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fullscreen', [False, True])
+async def test_mixed_tool_groups_remain_visible_between_results(
+  fullscreen: bool,
+) -> None:
+  async with _visual_repl(fullscreen=fullscreen, rows=48) as (repl, terminal):
+    repl.dispatch(
+      _actions.SetReplaying(False),
+      _actions.SetViewMode(_actions.ViewMode.DEFAULT),
+      _actions.TurnStarted(),
+    )
+    repl._handle_message(_delta({'role': 'user', 'content': 'Check files'}))
+    repl._handle_message(
+      _stream_tool_call(index=0, name='bash', arguments='{"command":"echo ok"}')
+    )
+    repl._handle_message(
+      _stream_tool_call(index=1, name='read', arguments='{"file_path":"a.py"}')
+    )
+    assembling = _frame_text(repl, terminal)
+    assert 'Running echo ok' in assembling
+    assert 'Exploring' in assembling
+    assert 'Reading a.py' in assembling
+
+    repl._handle_message(
+      _tool_batch_final((
+        ('bash', 'bash', '{"command":"echo ok"}'),
+        ('read', 'read', '{"file_path":"a.py"}'),
+      ))
+    )
+    running = _frame_text(repl, terminal)
+    assert 'Running echo ok' in running
+    assert 'Reading a.py' in running
+    assert running.index('Running echo ok') < running.index('Reading a.py')
+
+    repl._handle_message(
+      _delta({'role': 'tool', 'tool_call_id': 'read', 'content': 'source'})
+    )
+    partial = _frame_text(repl, terminal)
+    assert partial.count('Running echo ok') == 1
+    assert partial.count('Explored') == 1
+    assert '1 read' in partial
+    assert 'Reading a.py' not in partial
+
+    repl._handle_message(
+      _delta({'role': 'tool', 'tool_call_id': 'bash', 'content': 'ok'})
+    )
+    completed = _frame_text(repl, terminal)
+    assert 'Running echo ok' not in completed
+    assert 'Ran echo ok' in _rendering.strip_ansi(repl._render_history())
 
 
 @pytest.mark.asyncio
@@ -9647,10 +9759,11 @@ def test_compact_bash_failure_has_one_line_preview() -> None:
   ]
 
 
-def test_compact_running_bash_wraps_its_command() -> None:
+@pytest.mark.parametrize('separator', [' ', '\n  '])
+def test_compact_running_bash_stays_on_one_row(separator: str) -> None:
   repl = _NoEmitRepl()
   repl.dispatch(_actions.TerminalResized(40), _actions.TurnStarted())
-  command = 'cd /workspace/project && bazel test //project/toolbox/mirror:all'
+  command = f'cd /workspace/project &&{separator}bazel test //project/toolbox/mirror:all'
   _start_calls(
     repl,
     [
@@ -9666,11 +9779,12 @@ def test_compact_running_bash_wraps_its_command() -> None:
   )
   rendered = _rendering.strip_ansi(_ansi_text(_pending.render(repl._state)))
   assert [line.rstrip() for line in rendered.splitlines()] == [
-    '·  Running cd /workspace/project &&',
-    '   bazel test',
-    '   //project/toolbox/mirror:all',
+    '·  Running cd /workspace/project && baz…',
   ]
-  assert _pending.rows(repl._state) == 3
+  assert _pending.rows(repl._state) == 1
+  assert repl._state.stream.running[0].arguments_json == json.dumps({
+    'command': command
+  })
 
 
 def test_compact_unanswered_bash_wraps_its_command() -> None:
@@ -10136,6 +10250,7 @@ async def test_custom_themes_picker_selection_and_persistence(
   selector = repl._state.selector.selector
   assert selector is not None
   assert tuple(choice.value for choice in selector.choices) == (
+    themes.AUTO,
     *themes.NAMES,
     'test-themes:night',
     'test-themes:day',
@@ -10197,8 +10312,8 @@ async def test_theme_discovery_does_not_import_unapproved_or_disabled_providers(
   assert repl._state.selector.selector is not None
   assert tuple(
     choice.value for choice in repl._state.selector.selector.choices
-  ) == (*themes.NAMES, 'test-themes:night', 'test-themes:day')
-  assert repl._state.selector.selector.current == 'dark'
+  ) == (themes.AUTO, *themes.NAMES, 'test-themes:night', 'test-themes:day')
+  assert repl._state.selector.selector.current == themes.AUTO
   assert (
     repl._state.extensions.configuration(themes.EXTENSION_ID)['name']
     == 'unapproved:night'
@@ -10285,7 +10400,7 @@ async def test_custom_theme_reload_removed_id_preserves_selection(
   assert repl._state.selector.selector is not None
   assert tuple(
     choice.value for choice in repl._state.selector.selector.choices
-  ) == (*themes.NAMES, 'test-themes:late', 'test-themes:day')
+  ) == (themes.AUTO, *themes.NAMES, 'test-themes:late', 'test-themes:day')
 
 
 @pytest.mark.asyncio
@@ -10306,10 +10421,9 @@ async def test_custom_theme_runtime_fault_removes_contributions_until_reload(
   ) == themes.prompt_style('dark').get_attrs_for_style_str('class:ui.accent')
   await repl._run_slash('/themes')
   assert repl._state.selector.selector is not None
-  assert (
-    tuple(choice.value for choice in repl._state.selector.selector.choices)
-    == themes.NAMES
-  )
+  assert tuple(
+    choice.value for choice in repl._state.selector.selector.choices
+  ) == (themes.AUTO, *themes.NAMES)
   await repl._user_extensions.reload('test-themes')
   assert (
     repl._app.style.get_attrs_for_style_str('class:ui.accent').color == '123456'
@@ -10334,7 +10448,7 @@ async def test_themes_report_invalid_names_and_save_errors(
     assert 'Could not save theme:' in _render_welcome_notices(repl)
     assert (tmp_path / 'config.json').read_text() == 'invalid json'
     assert repl._state.extensions.configuration(themes.EXTENSION_ID) == {
-      'name': 'dark'
+      'name': themes.AUTO
     }
   finally:
     await repl.close()
@@ -11424,17 +11538,14 @@ async def test_extensions_selector_enter_toggles_live_widget(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-  ('first_index', 'first_enabled'), [(0, False), (1, True)]
+  ('action', 'first_enabled', 'second_enabled'),
+  [('1', True, True), ('2', True, False), ('3', False, False)],
 )
-@pytest.mark.parametrize(
-  ('second_index', 'second_enabled'), [(0, False), (1, True)]
-)
-async def test_extension_approval_advances_through_two_extensions(
+async def test_extension_approval_reviews_two_extensions_together(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
-  first_index: int,
+  action: str,
   first_enabled: bool,
-  second_index: int,
   second_enabled: bool,
 ) -> None:
   monkeypatch.setenv('MIRROR_EXTENSIONS_ENABLED', 'true')
@@ -11469,16 +11580,21 @@ async def test_extension_approval_advances_through_two_extensions(
       await asyncio.sleep(0.05)
       request = repl._state.selector.selector
       assert request is not None
-      assert str(first / 'extension.py') in request.title
+      assert [choice.prefix for choice in request.choices[:2]] == ['○', '○']
+      assert str(first / 'extension.py') in request.choices[0].detail
+      assert str(second / 'extension.py') in request.choices[1].detail
       assert registry.extension_ids() == ()
-      pipe.send_text(str(first_index + 1))
+      pipe.send_text('2')
+      await asyncio.sleep(0.05)
+      assert repl._state.selector.active
+      assert registry.extension_ids() == ()
+      pipe.send_text('\x1b[B\x1b[B\r')
       await asyncio.sleep(0.05)
       request = repl._state.selector.selector
       assert request is not None
-      assert str(second / 'extension.py') in request.title
-      assert ('bug_report' in registry.extension_ids()) is first_enabled
-      assert 'usage_telemetry' not in registry.extension_ids()
-      pipe.send_text(str(second_index + 1))
+      assert request.choices[0].prefix == '●'
+      assert registry.extension_ids() == ()
+      pipe.send_text(action)
       await asyncio.sleep(0.05)
       assert not repl._state.selector.active
       assert ('usage_telemetry' in registry.extension_ids()) is second_enabled
@@ -11523,21 +11639,26 @@ async def test_extension_consent_resolves_matching_workspace_prompts(
     selector = second._state.selector.selector
     assert first._state.selector.active and selector is not None
     request = selector.cancel_action
-    assert isinstance(request, _actions.ExtensionConsent)
+    assert isinstance(request, _actions.ExtensionConsentBatch)
+    [reviewed] = request.requests
     await manager.change(
       second._extension_context,
-      _actions.ExtensionConsent(request.key, enabled, request.revision),
+      _actions.ExtensionConsentBatch((
+        _actions.ExtensionConsent(reviewed.key, enabled, reviewed.revision),
+      )),
     )
     await manager.change(
       first._extension_context,
-      _actions.ExtensionConsent(request.key, not enabled, request.revision),
+      _actions.ExtensionConsentBatch((
+        _actions.ExtensionConsent(reviewed.key, not enabled, reviewed.revision),
+      )),
     )
     assert not first._state.selector.active
     assert not second._state.selector.active
     assert ('clock' in first._state.extensions) is (enabled is True)
     assert ('clock' in second._state.extensions) is (enabled is True)
     saved = config.Config(tmp_path / 'config.json').read().get('extensions')
-    assert config.extension_choices(saved).get(request.key) is enabled
+    assert config.extension_choices(saved).get(reviewed.key) is enabled
   finally:
     await first.close()
     await second.close()
@@ -12623,6 +12744,28 @@ async def test_single_approval_and_rejection_are_not_remembered(
 
 
 @pytest.mark.asyncio
+async def test_always_asking_request_ignores_remembered_approval(
+  tmp_path: pathlib.Path,
+) -> None:
+  path = tmp_path / 'approvals.json'
+  repl = _repl(approvals=tool_approvals.ToolApprovals(path))
+  sent: list[agent_pb2.ClientMessage] = []
+  repl._send_request = sent.append
+  repl._handle_message(_approval_requested('first', 'escalate'))
+  repl.dispatch(_actions.AcceptSelection(1))
+  await _settle(repl)
+  assert path.exists()
+
+  repl._handle_message(
+    _approval_requested('repeat', 'escalate', always_ask=True)
+  )
+  assert repl._state.approval.request is not None
+  assert repl._state.approval.request.call_id == 'repeat'
+  assert 'Remember' not in '\n'.join(_render_approval(repl))
+  assert sent[-1].hitl_response.call_id == 'first'
+
+
+@pytest.mark.asyncio
 async def test_failed_remember_approves_once_with_notice(
   tmp_path: pathlib.Path,
 ) -> None:
@@ -12796,12 +12939,16 @@ class _StreamingWorker(_RemoteEcho):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-  'key', ['\x1b', '\x03', '\x1b\x1b[<35;10;5M', '\x1b[27u']
+  ('key', 'navigation'),
+  [
+    ('\x1b', _actions.NavigateHistory('latest')),
+    ('\x03', _actions.NavigateHistory('latest')),
+    ('\x1b\x1b[<35;10;5M', _actions.NavigateHistory('latest')),
+    ('\x1b[27u', _actions.NavigateHistory('latest')),
+    ('\x03', _actions.NavigateHistory('oldest')),
+  ],
 )
-@pytest.mark.parametrize(
-  'navigation',
-  [_actions.NavigateHistory('latest'), _actions.NavigateHistory('oldest')],
-)
+@pytest.mark.no_xdist
 async def test_interrupt_stops_continuous_streaming(
   key: str, navigation: _actions.NavigateHistory
 ) -> None:
@@ -12863,9 +13010,10 @@ async def test_interrupt_stops_continuous_streaming(
         repl.dispatch(navigation)
         await asyncio.wait_for(painted.wait(), 2)
         assert repl._viewport.reading == (navigation.direction == 'oldest')
-        assert 'Back to bottom · Esc' not in '\n'.join(
-          _screen_lines(terminal.getvalue().decode(), rows=24)
-        )
+        assert (
+          'Back to bottom · Esc'
+          in '\n'.join(_screen_lines(terminal.getvalue().decode(), rows=24))
+        ) == repl._viewport.reading
         pipe.send_text(key)
         await asyncio.wait_for(remote.interrupted.wait(), 2)
         await asyncio.wait_for(settled.wait(), 2)

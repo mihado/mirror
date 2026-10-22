@@ -30,6 +30,8 @@ class EventClient:
     # config and environment behavior
     self._config = config
     self._environment: environment_lib.Environment | None = None
+    # Observers must not bridge an opt-out when collection is enabled again.
+    self.collection_epoch = 0
     # flags
     self._toggling = asyncio.Lock()
     self._shutting_down = asyncio.Event()
@@ -58,6 +60,7 @@ class EventClient:
     async with self._toggling:
       if self._config is None or self.enabled:
         return
+      self.collection_epoch += 1
       self._shutting_down.clear()
       self._http = httpx2.AsyncClient(
         timeout=constants.REQUEST_TIMEOUT,

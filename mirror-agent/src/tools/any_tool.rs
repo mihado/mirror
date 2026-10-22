@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use serde_json::{Map, Value};
+
 use crate::tools::ToolDefinition;
 use crate::tools::ToolOutput;
 use crate::ExecutionContext;
@@ -19,11 +21,20 @@ pub trait AnyTool: Send + Sync {
     /// Whether calls require human approval.
     fn needs_approval(&self) -> bool;
 
+    fn always_asks(&self) -> bool {
+        false
+    }
+
     /// The model-facing function definition.
     fn definition(&self) -> ToolDefinition;
 
     /// Whether this tool and its descendants support remote execution.
     fn supports_remote(&self) -> bool {
+        false
+    }
+
+    /// Whether calls may run at the same time as other concurrency-safe calls.
+    fn is_concurrency_safe(&self) -> bool {
         false
     }
 
@@ -75,8 +86,16 @@ impl<T: Tool> AnyTool for T {
         Tool::needs_approval(self)
     }
 
+    fn always_asks(&self) -> bool {
+        Tool::always_asks(self)
+    }
+
     fn supports_remote(&self) -> bool {
         Tool::supports_remote(self)
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        Tool::is_concurrency_safe(self)
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -93,7 +112,7 @@ impl<T: Tool> AnyTool for T {
         context: &'a ExecutionContext,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
-            let args = match parse_arguments(arguments, Tool::name(self)) {
+            let args = match parse_arguments(arguments, Tool::name(self), &Tool::parameters(self)) {
                 Ok(args) => args,
                 Err(output) => return output,
             };
@@ -108,7 +127,7 @@ impl<T: Tool> AnyTool for T {
         remote: &'a super::RemoteToolExecutor,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
-            let args = match parse_arguments(arguments, Tool::name(self)) {
+            let args = match parse_arguments(arguments, Tool::name(self), &Tool::parameters(self)) {
                 Ok(args) => args,
                 Err(output) => return output,
             };
@@ -122,14 +141,19 @@ impl<T: Tool> AnyTool for T {
 fn parse_arguments<T: serde::de::DeserializeOwned>(
     arguments: &str,
     name: &str,
+    parameters: &Map<String, Value>,
 ) -> Result<T, ToolOutput> {
     let arguments = if arguments.trim().is_empty() {
         "{}"
     } else {
         arguments
     };
-    serde_json::from_str(arguments)
-        .map_err(|error| ToolOutput::failure(format!("Invalid arguments for tool {name}: {error}")))
+    let invalid = |error: serde_json::Error| {
+        ToolOutput::failure(format!("Invalid arguments for tool {name}: {error}"))
+    };
+    let mut value = serde_json::from_str::<Value>(arguments).map_err(invalid)?;
+    super::argument_coercion::coerce_to_schema(&mut value, &Value::Object(parameters.clone()));
+    serde_json::from_value(value).map_err(invalid)
 }
 
 fn tool_error(error: ToolError) -> ToolOutput {

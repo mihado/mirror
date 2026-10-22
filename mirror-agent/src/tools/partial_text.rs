@@ -1,18 +1,18 @@
 //! Text of a known length of which only a prefix may be held.
 
 /// Text of a known length of which only a prefix may be held.
-pub(super) struct PartialText {
+pub(crate) struct PartialText {
     /// The text, or a prefix of it at least as long as the character cap.
-    pub(super) kept: String,
+    pub(crate) kept: String,
     /// The whole text's length in characters.
-    pub(super) chars: usize,
+    pub(crate) chars: usize,
     /// The whole text's line breaks.
-    pub(super) newlines: usize,
+    pub(crate) newlines: usize,
 }
 
 impl PartialText {
     /// Text held whole.
-    pub(super) fn whole(text: String) -> Self {
+    pub(crate) fn whole(text: String) -> Self {
         Self {
             chars: text.chars().count(),
             newlines: text.matches('\n').count(),
@@ -21,12 +21,12 @@ impl PartialText {
     }
 
     /// Whether `kept` is the whole text.
-    pub(super) fn is_whole(&self) -> bool {
+    pub(crate) fn is_whole(&self) -> bool {
         self.kept.chars().count() == self.chars
     }
 
     /// This text followed by `next`, held for as long as this one is whole.
-    pub(super) fn concat(mut self, next: Self) -> Self {
+    pub(crate) fn concat(mut self, next: Self) -> Self {
         if self.is_whole() {
             self.kept.push_str(&next.kept);
         }

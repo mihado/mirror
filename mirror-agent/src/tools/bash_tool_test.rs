@@ -854,6 +854,7 @@ async fn real_remote_commands_match_local_model_text() {
         "printf '%s' \"$(printf '\"quoted\"')\"",
         "printf '%s|%s|%s|%s|%s|%s' \"$TERM\" \"$NO_COLOR\" \"${COLORTERM-unset}\" \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\"",
         "printf '%s' \"${OPENAI_API_KEY-unset}\"",
+        "printf '%s' \"${GEMINI_API_KEY-unset}\"",
     ] {
         let arguments = json!({"command": command}).to_string();
         let context = ExecutionContext::default();

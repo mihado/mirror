@@ -29,12 +29,31 @@ fn translates_task_updates_to_runtime_deltas() {
                     detached: true,
                     ..
                 })),
+                ..
             })),
             ..
         }] if id == "1234"
             && tool_name == "bash"
             && *status == ProtocolTaskStatus::Succeeded as i32
     );
+}
+
+#[test]
+fn child_entries_hide_configuration() {
+    let mut entry = AgentMessage {
+        inference: Some(InferenceConfig::default()),
+        payload: Some(agent_message::Payload::ContextWindow(
+            mirror_protocol::ContextWindowRecord {
+                system_prompt: "synthetic-secret".into(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    redact_child_entry(&mut entry);
+    assert_eq!(entry.inference, None);
+    assert_matches!(entry.payload, Some(agent_message::Payload::ContextWindow(window))
+        if window.system_prompt.is_empty());
 }
 
 #[test]

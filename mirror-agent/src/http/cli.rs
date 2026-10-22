@@ -6,22 +6,24 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mirror_agent::local::LocalWorkspace;
+use mirror_agent::mcp::{discover_mcp_connections, mcp_tools, LocalMcpConnection};
 use mirror_agent::memory::{
     open_memory, MemoryEnvironment, SqliteMemoryDatabase, SqliteMemoryStore,
 };
 use mirror_agent::providers::{
     is_reasoning_effort, reasoning_effort_expectation, ModelApi, ModelProvider, ModelProviderConfig,
 };
-use mirror_agent::react::{ContextHooks, ReactAgent, ReactAgentConfig};
+use mirror_agent::react::{ContextHooks, InMemoryStore, ReactAgent, ReactAgentConfig};
 use mirror_agent::system_prompt::{pinned_memories_path, NestedInstructions, SystemPromptConfig};
 use mirror_agent::tools::{
     validate_tools, AnyTool, BashTool, DirectToolExecutor, EditTool, FindTool, GrepTool, LsTool,
-    ReadTool, RemoteToolExecutor, ToolError, ToolExecutor, WriteTool,
+    ReadTool, RemoteToolExecutor, ToolError, ToolExecutor, WebBrowseTool, WebSearchTool, WriteTool,
 };
-use mirror_agent::{AgentApprovalMode, InferenceConfig, ReactAgentService};
+use mirror_agent::web::{web_provider_from_config, WebProviderConfig};
+use mirror_agent::{AgentApprovalMode, InferenceConfig, ReactAgentService, Store};
 use uuid::Uuid;
 
-use super::{router, JsonlStore, PromptRunner, TracedModel};
+use super::{router, JsonlStore, MemoryTrace, PromptRunner, SessionTrace, TracedModel};
 
 #[derive(Parser)]
 #[command(
@@ -42,9 +44,16 @@ enum Command {
         agent: AgentArgs,
         #[arg(long, default_value = "127.0.0.1:4097")]
         bind: SocketAddr,
-        /// Append each committed conversation record to this JSONL file.
-        #[arg(long, default_value = "mirror.jsonl")]
-        output: PathBuf,
+        /// Write trace files; defaults to mirror.jsonl unless --in-memory-output is set.
+        #[arg(
+            long,
+            default_value = "mirror.jsonl",
+            default_value_if("in_memory_output", "true", None)
+        )]
+        output: Option<PathBuf>,
+        /// Expose unauthenticated trace snapshots; combine with --output to also write files.
+        #[arg(long)]
+        in_memory_output: bool,
     },
 }
 
@@ -74,6 +83,12 @@ struct AgentArgs {
     /// local workspace; the store's contents reach the model endpoint.
     #[arg(long)]
     memory_dir: Option<PathBuf>,
+    /// MCP connection declarations as a JSON array, supplied by the trusted launcher.
+    #[arg(long, value_name = "JSON")]
+    mcp_connections: Option<String>,
+    /// Web search and browse backend (you, tavily, or firecrawl); defaults to You.com.
+    #[arg(long)]
+    web_provider: Option<WebProviderConfig>,
     /// A level name (`none`, `low`, `medium`, `high`, `xhigh`, `max`) or a
     /// non-negative integer budget for endpoints that take one.
     #[arg(long, value_parser = reasoning_effort)]
@@ -101,7 +116,7 @@ struct AgentArgs {
     disable_compaction: bool,
     #[arg(long, default_value_t = 1000)]
     max_iterations: usize,
-    /// Maximum retryable exceptions per turn; zero disables the limit.
+    /// Consecutive retryable failures, including all-invalid JSON tool turns; zero disables the limit.
     #[arg(long, default_value_t = 0)]
     max_exceptions: usize,
     #[arg(long, default_value_t = 2000)]
@@ -118,6 +133,9 @@ struct AgentArgs {
     /// Advertise bash as a system builtin through the Reflection eval proxy.
     #[arg(long)]
     use_native_bash: bool,
+    /// Advertise selected web tools as the system builtins search and browse.
+    #[arg(long)]
+    use_native_web: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -129,6 +147,10 @@ enum ToolName {
     Grep,
     Find,
     Ls,
+    #[value(name = "web_search", alias = "web-search")]
+    WebSearch,
+    #[value(name = "web_browse", alias = "web-browse")]
+    WebBrowse,
 }
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
@@ -136,12 +158,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         agent,
         bind,
         output,
+        in_memory_output,
     } = Cli::parse().command;
-    let output = std::path::absolute(output)?;
-    let parent = output.parent().ok_or("output must name a trace file")?;
-    tokio::fs::create_dir_all(parent).await?;
-    let runner = agent.start(output).await?;
-    let result = serve(&runner, bind).await;
+    let output = output.map(std::path::absolute).transpose()?;
+    if let Some(output) = &output {
+        let parent = output.parent().ok_or("output must name a trace file")?;
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let (runner, traces) = agent.start(output, in_memory_output).await?;
+    let result = serve(&runner, bind, traces).await;
     let closed = runner.close().await;
     result?;
     closed?;
@@ -149,9 +174,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 }
 
 impl AgentArgs {
-    async fn start(&self, output: PathBuf) -> Result<PromptRunner, Box<dyn Error>> {
+    async fn start(
+        &self,
+        output: Option<PathBuf>,
+        in_memory_output: bool,
+    ) -> Result<(PromptRunner, Option<SessionTrace>), Box<dyn Error>> {
         let limits = self.limits()?;
-        let mut inference = InferenceConfig {
+        let inference = InferenceConfig {
             model: self.model.clone(),
             api: Some(
                 match self.api {
@@ -160,6 +189,7 @@ impl AgentArgs {
                         "openai-chat-completions-non-streaming"
                     }
                     ModelApi::Reflection => "reflection",
+                    ModelApi::Gemini => "gemini",
                     ModelApi::Responses => "openai-responses",
                     ModelApi::CodexResponses => "openai-codex-responses",
                     ModelApi::AnthropicMessages => "anthropic-messages",
@@ -171,7 +201,7 @@ impl AgentArgs {
             temperature: self.temperature,
             top_p: self.top_p,
             seed: self.seed,
-            extra_body: self.extra_body.clone(),
+            extra_body: self.native_extra_body()?,
         };
         self.api.validate_sampling(&inference)?;
         let remote = self.remote.is_some();
@@ -183,6 +213,24 @@ impl AgentArgs {
         } else {
             self.workspace.canonicalize()?
         };
+        let default_web_provider = self.web_provider;
+        let make_provider = move |selection: Option<WebProviderConfig>| {
+            web_provider_from_config(selection.or(default_web_provider))
+        };
+        let web_search = Arc::new(WebSearchTool::new(Box::new(make_provider)).with_name(
+            if self.use_native_web {
+                "search"
+            } else {
+                "web_search"
+            },
+        ));
+        let web_browse = Arc::new(WebBrowseTool::new(Box::new(make_provider)).with_name(
+            if self.use_native_web {
+                "browse"
+            } else {
+                "web_browse"
+            },
+        ));
         let mut tools = self
             .tools
             .iter()
@@ -202,6 +250,8 @@ impl AgentArgs {
                     ToolName::Find => Arc::new(FindTool::new(&workspace)?),
                     ToolName::Ls if remote => Arc::new(LsTool::remote()),
                     ToolName::Ls => Arc::new(LsTool::new(&workspace)?),
+                    ToolName::WebSearch => web_search.clone(),
+                    ToolName::WebBrowse => web_browse.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -227,33 +277,17 @@ impl AgentArgs {
             tools.extend(memory.tools);
             hooks.push(memory.hooks);
         }
-        if self.use_native_bash {
-            if !matches!(
-                self.api,
-                ModelApi::ChatCompletions | ModelApi::ChatCompletionsNonStreaming
-            ) {
-                return Err("--use-native-bash requires a Chat Completions API".into());
+        if let Some(config) = &self.mcp_connections {
+            let connections: Vec<LocalMcpConnection> =
+                serde_json::from_str(config).map_err(|_| {
+                    "invalid --mcp-connections: expected a JSON array of MCP connections"
+                })?;
+            if remote && connections.iter().any(|connection| !connection.is_http()) {
+                return Err(
+                    "--remote supports HTTP MCP connections, not host stdio servers".into(),
+                );
             }
-            let bash_name = tools
-                .iter()
-                .find(|tool| tool.name() == "bash")
-                .ok_or("--use-native-bash requires --tools bash")?
-                .name();
-            let mut extra: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(self.extra_body.as_deref().unwrap_or("{}"))?;
-            if extra.contains_key("tools") {
-                return Err("--use-native-bash conflicts with extra-body tools".into());
-            }
-            let kwargs = extra
-                .entry("chat_template_kwargs")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or("chat_template_kwargs must be an object")?;
-            if kwargs.contains_key("builtin_tools") {
-                return Err("--use-native-bash conflicts with extra-body builtin_tools".into());
-            }
-            kwargs.insert("builtin_tools".into(), serde_json::json!([bash_name]));
-            inference.extra_body = Some(serde_json::to_string(&extra)?);
+            tools.extend(mcp_tools(discover_mcp_connections(&connections).await)?);
         }
         let prompt = SystemPromptConfig {
             custom_prompt: self.system_prompt.clone(),
@@ -270,9 +304,33 @@ impl AgentArgs {
             None => Box::new(DirectToolExecutor::new(tools)),
         };
         let model = self.provider(&id).await?;
-        let store = JsonlStore::create(&output)?;
         let inference_provider = model.clone();
-        let model = TracedModel::create(model, &output.with_extension("model-calls.jsonl")).await?;
+        let mut store: Box<dyn Store> = match &output {
+            Some(output) => Box::new(JsonlStore::create(output)?),
+            None => Box::new(InMemoryStore::default()),
+        };
+        let (calls, traces) = if in_memory_output {
+            let (traced, native) = MemoryTrace::new(store);
+            store = Box::new(traced);
+            let (calls, model_calls) = tokio::sync::watch::channel(Vec::new());
+            (
+                Some(calls),
+                Some(SessionTrace {
+                    native,
+                    model_calls,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+        let model = TracedModel::create(
+            model,
+            output
+                .map(|path| path.with_extension("model-calls.jsonl"))
+                .as_deref(),
+            calls,
+        )
+        .await?;
         let agent = ReactAgent::new(
             model,
             inference_provider,
@@ -284,7 +342,7 @@ impl AgentArgs {
         let (service, runtime) = ReactAgentService::start(
             agent,
             executor,
-            Box::new(store),
+            store,
             id,
             AgentApprovalMode::Auto,
             Vec::new(),
@@ -296,7 +354,61 @@ impl AgentArgs {
         .await?;
         tokio::spawn(runtime);
         service.set_inference_config(inference).await?;
-        Ok(PromptRunner::new(service, self.turn_timeout_seconds))
+        Ok((
+            PromptRunner::new(service, self.turn_timeout_seconds),
+            traces,
+        ))
+    }
+
+    fn native_extra_body(&self) -> Result<Option<String>, Box<dyn Error>> {
+        if !self.use_native_bash && !self.use_native_web {
+            return Ok(self.extra_body.clone());
+        }
+        let flag = if self.use_native_bash {
+            "--use-native-bash"
+        } else {
+            "--use-native-web"
+        };
+        if !matches!(
+            self.api,
+            ModelApi::ChatCompletions | ModelApi::ChatCompletionsNonStreaming
+        ) {
+            return Err(format!("{flag} requires a Chat Completions API").into());
+        }
+        if self.use_native_bash && !self.tools.contains(&ToolName::Bash) {
+            return Err("--use-native-bash requires --tools bash".into());
+        }
+        if self.use_native_web
+            && !self.tools.contains(&ToolName::WebSearch)
+            && !self.tools.contains(&ToolName::WebBrowse)
+        {
+            return Err("--use-native-web requires --tools web_search or web_browse".into());
+        }
+        let builtins: Vec<_> = self
+            .tools
+            .iter()
+            .filter_map(|tool| match tool {
+                ToolName::Bash if self.use_native_bash => Some("bash"),
+                ToolName::WebSearch if self.use_native_web => Some("search"),
+                ToolName::WebBrowse if self.use_native_web => Some("browse"),
+                _ => None,
+            })
+            .collect();
+        let mut extra: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(self.extra_body.as_deref().unwrap_or("{}"))?;
+        if extra.contains_key("tools") {
+            return Err(format!("{flag} conflicts with extra-body tools").into());
+        }
+        let kwargs = extra
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("chat_template_kwargs must be an object")?;
+        if kwargs.contains_key("builtin_tools") {
+            return Err(format!("{flag} conflicts with extra-body builtin_tools").into());
+        }
+        kwargs.insert("builtin_tools".into(), serde_json::json!(builtins));
+        Ok(Some(serde_json::to_string(&extra)?))
     }
 
     async fn provider(&self, id: &str) -> Result<ModelProvider, Box<dyn Error>> {
@@ -316,7 +428,7 @@ impl AgentArgs {
                 context_window: self.context_window,
                 api: self.api,
                 model: self.model.clone(),
-                api_key: if self.api == ModelApi::Reflection {
+                api_key: if matches!(self.api, ModelApi::Reflection | ModelApi::Gemini) {
                     None
                 } else {
                     std::env::var("OPENAI_API_KEY").ok()
@@ -355,8 +467,12 @@ impl AgentArgs {
     }
 }
 
-async fn serve(runner: &PromptRunner, bind: SocketAddr) -> Result<(), Box<dyn Error>> {
-    let router = router(runner.clone());
+async fn serve(
+    runner: &PromptRunner,
+    bind: SocketAddr,
+    traces: Option<SessionTrace>,
+) -> Result<(), Box<dyn Error>> {
+    let router = router(runner.clone(), traces);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let signal = shutdown_signal()?;
     println!("MIRROR_HTTP_ADDRESS=http://{}", listener.local_addr()?);
@@ -408,6 +524,188 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    fn parse_agent(args: &[&str]) -> AgentArgs {
+        let Command::Serve { agent, .. } = Cli::try_parse_from(
+            ["mirror-agent", "serve", "--model", "test-model"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .expect("parse server arguments")
+        .command;
+        agent
+    }
+
+    #[test]
+    fn native_web_marks_only_selected_web_tools_for_non_streaming() {
+        let agent = parse_agent(&[
+            "--api",
+            "openai-chat-completions-non-streaming",
+            "--tools",
+            "bash,web_browse",
+            "--use-native-web",
+        ]);
+        let extra: serde_json::Value = serde_json::from_str(
+            &agent
+                .native_extra_body()
+                .expect("valid native options")
+                .expect("extra body"),
+        )
+        .expect("JSON");
+        assert_eq!(
+            extra,
+            serde_json::json!({"chat_template_kwargs":{"builtin_tools":["browse"]}})
+        );
+    }
+
+    #[test]
+    fn native_web_requires_selected_web_tools() {
+        let agent = parse_agent(&["--use-native-web"]);
+        assert_eq!(
+            agent
+                .native_extra_body()
+                .expect_err("missing web tools")
+                .to_string(),
+            "--use-native-web requires --tools web_search or web_browse"
+        );
+    }
+
+    #[test]
+    fn native_bash_still_requires_bash() {
+        let agent = parse_agent(&["--tools", "web_search", "--use-native-bash"]);
+        assert_eq!(
+            agent
+                .native_extra_body()
+                .expect_err("missing bash")
+                .to_string(),
+            "--use-native-bash requires --tools bash"
+        );
+    }
+
+    #[test]
+    fn native_web_rejects_other_apis() {
+        let agent = parse_agent(&[
+            "--api",
+            "openai-responses",
+            "--tools",
+            "web_search",
+            "--use-native-web",
+        ]);
+        assert_eq!(
+            agent
+                .native_extra_body()
+                .expect_err("unsupported API")
+                .to_string(),
+            "--use-native-web requires a Chat Completions API"
+        );
+    }
+
+    #[test]
+    fn native_web_rejects_tool_overrides() {
+        let agent = parse_agent(&[
+            "--tools",
+            "web_search",
+            "--use-native-web",
+            "--extra-body",
+            r#"{"tools":[]}"#,
+        ]);
+        assert_eq!(
+            agent
+                .native_extra_body()
+                .expect_err("tool override")
+                .to_string(),
+            "--use-native-web conflicts with extra-body tools"
+        );
+    }
+
+    #[test]
+    fn native_web_rejects_builtin_overrides() {
+        let agent = parse_agent(&[
+            "--tools",
+            "web_search",
+            "--use-native-web",
+            "--extra-body",
+            r#"{"chat_template_kwargs":{"builtin_tools":[]}}"#,
+        ]);
+        assert_eq!(
+            agent
+                .native_extra_body()
+                .expect_err("builtin override")
+                .to_string(),
+            "--use-native-web conflicts with extra-body builtin_tools"
+        );
+    }
+
+    #[test]
+    fn native_web_rejects_non_object_template_kwargs() {
+        let agent = parse_agent(&[
+            "--tools",
+            "web_search",
+            "--use-native-web",
+            "--extra-body",
+            r#"{"chat_template_kwargs":false}"#,
+        ]);
+        assert_eq!(
+            agent
+                .native_extra_body()
+                .expect_err("invalid template kwargs")
+                .to_string(),
+            "chat_template_kwargs must be an object"
+        );
+    }
+
+    #[test]
+    fn file_output_remains_the_default() {
+        let Command::Serve {
+            output,
+            in_memory_output,
+            ..
+        } = Cli::try_parse_from(["mirror-agent", "serve", "--model", "test"])
+            .expect("default output")
+            .command;
+        assert_eq!(output, Some(PathBuf::from("mirror.jsonl")));
+        assert!(!in_memory_output);
+    }
+
+    #[test]
+    fn memory_output_does_not_default_to_a_file() {
+        let Command::Serve {
+            output,
+            in_memory_output,
+            ..
+        } = Cli::try_parse_from([
+            "mirror-agent",
+            "serve",
+            "--model",
+            "test",
+            "--in-memory-output",
+        ])
+        .expect("memory output")
+        .command;
+        assert_eq!(output, None);
+        assert!(in_memory_output);
+    }
+
+    #[test]
+    fn memory_output_composes_with_an_explicit_file() {
+        let Command::Serve {
+            output,
+            in_memory_output,
+            ..
+        } = Cli::try_parse_from([
+            "mirror-agent",
+            "serve",
+            "--model",
+            "test",
+            "--in-memory-output",
+            "--output",
+            "trace.jsonl",
+        ])
+        .expect("both outputs")
+        .command;
+        assert_eq!(output, Some(PathBuf::from("trace.jsonl")));
+        assert!(in_memory_output);
+    }
 
     #[test]
     fn exception_limit_is_disabled_by_default() {

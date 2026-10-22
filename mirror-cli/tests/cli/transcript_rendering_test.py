@@ -27,6 +27,20 @@ def _lines(
   return [line.rstrip() for line in rendered.splitlines()]
 
 
+def test_fork_record_renders_parent_without_workspace_paths(
+  compact_history: transcript.Transcript,
+) -> None:
+  entry = agent_pb2.AgentMessage(
+    fork=agent_pb2.ForkRecord(
+      parent_session_id='parent',
+      inherited_sequence=5,
+      source_workspace='/old/[repo]',
+      destination_workspace='/new/repo',
+    )
+  )
+  assert _lines(compact_history, entry) == ['◆  Forked from parent']
+
+
 @pytest.mark.parametrize('width', [11, 32, 80])
 def test_code_panel_keeps_content_and_fits_terminal(width: int) -> None:
   rendered = rendering.strip_ansi(

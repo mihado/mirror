@@ -40,7 +40,6 @@ use mirror_agent::system_prompt::SystemPromptConfig;
 use mirror_agent::tools::validate_tools;
 use mirror_agent::tools::AnyTool;
 use mirror_agent::tools::DirectToolExecutor;
-use mirror_agent::tools::FirecrawlClient;
 use mirror_agent::tools::SandboxRoutedTool;
 use mirror_agent::tools::SubagentTool;
 use mirror_agent::tools::Task;
@@ -48,6 +47,7 @@ use mirror_agent::tools::WebBrowseTool;
 use mirror_agent::tools::WebSearchTool;
 use mirror_agent::tools::WORKSPACE_TOOL_NAMES;
 use mirror_agent::tools::{native_tool, ToolError};
+use mirror_agent::web::{web_provider_from_config, WebProviderConfig};
 use mirror_agent::AgentApprovalMode;
 use mirror_agent::AgentRpc;
 use mirror_agent::HostTool;
@@ -84,6 +84,7 @@ struct WorkerConfig {
     create_session: Option<bool>,
     allow_workspace_mismatch: Option<bool>,
     memory_dir: Option<PathBuf>,
+    web_provider: Option<WebProviderConfig>,
     #[serde(default)]
     include_environment: bool,
     #[serde(default)]
@@ -179,7 +180,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         (Some(sandbox), true) => Some(sandbox.environment().await?),
         (None, true) => Some(gather_environment_info(&workspace)),
     };
-    let firecrawl = FirecrawlClient::from_env()?;
     let mut api = config
         .model_api
         .as_deref()
@@ -240,11 +240,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         subagent = subagent.with_resolved_context(resolved.clone());
     }
     tools.push(Arc::new(Task));
-    let has_web_tools = firecrawl.is_configured();
-    if has_web_tools {
-        tools.push(Arc::new(WebSearchTool::new(firecrawl.clone())));
-        tools.push(Arc::new(WebBrowseTool::new(firecrawl)));
-    }
+    let default_web_provider = config.web_provider;
+    let make_provider = move |selection: Option<WebProviderConfig>| {
+        web_provider_from_config(selection.or(default_web_provider))
+    };
+    tools.push(Arc::new(WebSearchTool::new(Box::new(make_provider))));
+    tools.push(Arc::new(WebBrowseTool::new(Box::new(make_provider))));
     tools.push(Arc::new(subagent));
     let memory = match &config.memory_dir {
         Some(directory) => open_memory(MemoryEnvironment {
@@ -280,7 +281,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .filter(|name| {
                 has_mcp || !matches!(name.as_str(), "mcp_search" | "mcp_describe" | "mcp_call")
             })
-            .filter(|name| has_web_tools || !matches!(name.as_str(), "web_search" | "web_browse"))
             .map(|name| {
                 tools
                     .iter()
@@ -340,7 +340,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
         ..SystemPromptConfig::default()
     };
     let skills = resolve_prompt_instructions(&prompt_config).skills;
-    let tool_executor = DirectToolExecutor::new(tools);
+    let tool_executor =
+        DirectToolExecutor::new(tools).with_tool_visibility(move |name, context| {
+            !matches!(name, "web_search" | "web_browse")
+                || context
+                    .web_provider()
+                    .or(default_web_provider)
+                    .unwrap_or_default()
+                    .is_configured()
+        });
     let agent = ReactAgent::new(
         model.clone(),
         model,
@@ -397,7 +405,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let (service, runtime) = startup?;
     tokio::spawn(runtime);
     let service_control = service.clone();
-    let mirror_rpc = LocalMirrorRpc::new(service.clone(), database);
+    let mirror_rpc = LocalMirrorRpc::new(
+        service.clone(),
+        database,
+        config.sandbox.is_none().then_some(workspace),
+    );
     let rpc = AgentRpc::new(service);
     let rpc_control = rpc.clone();
     let listener = tokio::net::TcpListener::bind(&config.rpc_address).await?;
@@ -487,6 +499,7 @@ fn worker_config() -> Result<WorkerConfig, Box<dyn Error>> {
         create_session: Some(true),
         allow_workspace_mismatch: Some(false),
         memory_dir: None,
+        web_provider: None,
         include_environment: false,
         exit_on_stdin_close: false,
         checkpoints_enabled: None,

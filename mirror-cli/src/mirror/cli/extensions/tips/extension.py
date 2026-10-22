@@ -170,18 +170,29 @@ class TipsExtension(extension.Extension[_State, _SetVisibility, None]):
       )
     )
 
+  def _visible(
+    self, global_state: state.State, extension_state: _State
+  ) -> bool:
+    return (
+      self.configuration(global_state).get('visible') is not False
+      and global_state.activity.busy
+      and not global_state.session.replaying
+      and extension_state.started_at is not None
+      and time.monotonic() - extension_state.started_at >= 15
+      and extension_state.tip in global_state.extension_tips
+    )
+
+  @override
+  def cache_key(
+    self, global_state: state.State, extension_state: _State
+  ) -> object:
+    return (self._visible(global_state, extension_state), extension_state.tip)
+
   @override
   def render(
     self, global_state: state.State, extension_state: _State
   ) -> containers.AnyContainer | None:
-    if (
-      self.configuration(global_state).get('visible') is False
-      or not global_state.activity.busy
-      or global_state.session.replaying
-      or extension_state.started_at is None
-      or time.monotonic() - extension_state.started_at < 15
-      or extension_state.tip not in global_state.extension_tips
-    ):
+    if not self._visible(global_state, extension_state):
       return None
     return containers.Window(
       controls.FormattedTextControl(

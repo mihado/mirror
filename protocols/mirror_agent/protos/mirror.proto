@@ -16,6 +16,8 @@ service MirrorRPC {
   rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc ForkSession(ForkSessionRequest) returns (ForkSessionResponse);
+  // Host-local only: fork the idle conversation and current repository files.
+  rpc ForkWorkspace(ForkWorkspaceRequest) returns (ForkWorkspaceResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
 }
 
@@ -71,6 +73,20 @@ message ForkSessionRequest {
   // Initial visibility. Unspecified inherits the source scope; local workers
   // accept unspecified/private and reject public scope.
   SessionScope scope = 4;
+}
+
+message ForkWorkspaceRequest {
+  string source_session_id = 1;
+  // Caller-generated UUID, retained for recovery if the response is lost.
+  string session_id = 2;
+  // New absolute checkout root; it must not already exist.
+  string directory = 3;
+  string name = 4;
+}
+
+message ForkWorkspaceResponse {
+  // The child working directory, preserving the source's repository-relative cwd.
+  string workspace = 1;
 }
 
 message ForkSessionResponse {
