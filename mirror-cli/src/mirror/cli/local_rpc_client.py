@@ -28,13 +28,26 @@ _WORKER_LAUNCHER = (
 )
 
 
-def _signal_group(pid: int, sig: signal.Signals) -> bool:
-  """Signal `pid`'s process group; False if it is already gone."""
+async def _signal_group(
+  process: asyncio.subprocess.Process, sig: signal.Signals
+) -> None:
+  """Signal the worker's group, tolerating an already-exited worker."""
   try:
-    os.killpg(pid, sig)
-    return True
+    os.killpg(process.pid, sig)
+    return
   except ProcessLookupError:
-    return False
+    return
+  except PermissionError as error:
+    # macOS reports EPERM for a group containing only an unreaped zombie.
+    try:
+      await asyncio.wait_for(process.wait(), timeout=3)
+    except TimeoutError:
+      raise error from None
+  # Retry after reaping: surviving descendants must still receive the signal.
+  try:
+    os.killpg(process.pid, sig)
+  except ProcessLookupError:
+    pass
 
 
 class Transport:
@@ -155,7 +168,7 @@ class Transport:
         await asyncio.wait_for(process.wait(), timeout=3)
       except TimeoutError:
         pass
-      _signal_group(process.pid, signal.SIGKILL)
+      await _signal_group(process, signal.SIGKILL)
       await process.wait()
     if self._log_tasks:
       _, pending = await asyncio.wait(self._log_tasks, timeout=1)

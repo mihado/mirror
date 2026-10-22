@@ -180,7 +180,7 @@ async def test_discovery_registers_and_unloads_opt_in_children(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-  ('choice', 'enabled'), [('enable', True), ('disable', False)]
+  ('choice', 'enabled'), [('approve-all', True), ('reject-all', False)]
 )
 @pytest.mark.parametrize('foreground_first', [False, True])
 async def test_start_remembers_selector_consent_without_prompting_again(
@@ -210,12 +210,12 @@ async def test_start_remembers_selector_consent_without_prompting_again(
       await manager.on_foreground(context)
     opened = dispatched.pop()
     assert isinstance(opened, actions.OpenSelector)
-    assert opened.selector.selected == 'disable'
+    assert opened.selector.choices[0].prefix == '○'
     assert opened.selector.numbered
-    assert str(source) in opened.selector.title
-    assert 'unsandboxed' in opened.selector.title
+    assert 'unsandboxed' in str(opened.selector.header)
+    assert str(source) in opened.selector.choices[0].detail
     request = opened.selector.on_select(choice)
-    assert isinstance(request, actions.ExtensionConsent)
+    assert isinstance(request, actions.ExtensionConsentBatch)
     await manager.change(context, request)
     assert bool(registry.extension_ids()) is enabled
   finally:
@@ -237,7 +237,7 @@ async def test_start_remembers_selector_consent_without_prompting_again(
 
 
 @pytest.mark.asyncio
-async def test_escape_leaves_consent_undecided_and_prompts_next_extension(
+async def test_escape_defers_entire_batch_until_next_launch(
   tmp_path: pathlib.Path,
 ) -> None:
   root = tmp_path / 'extensions'
@@ -260,13 +260,20 @@ async def test_escape_leaves_consent_undecided_and_prompts_next_extension(
     await manager.on_foreground(context)
     opened = dispatched.pop()
     assert isinstance(opened, actions.OpenSelector)
-    assert str(first / 'extension.py') in opened.selector.title
-    assert opened.selector.cancel_action is not None
-    assert isinstance(opened.selector.cancel_action, actions.ExtensionConsent)
+    assert [choice.label for choice in opened.selector.choices[:2]] == [
+      'a',
+      'b',
+    ]
+    assert isinstance(
+      opened.selector.cancel_action, actions.ExtensionConsentBatch
+    )
+    dispatched.clear()
     await manager.change(context, opened.selector.cancel_action)
-    opened = dispatched.pop()
-    assert isinstance(opened, actions.OpenSelector)
-    assert str(second / 'extension.py') in opened.selector.title
+    await manager.apply_settings()
+    await manager.on_foreground(context)
+    assert not any(
+      isinstance(action, actions.OpenSelector) for action in dispatched
+    )
     assert not registry.extension_ids()
     assert not (tmp_path / 'config.json').exists()
     restarted = user_extensions.UserExtensions(registry, root)
@@ -274,7 +281,10 @@ async def test_escape_leaves_consent_undecided_and_prompts_next_extension(
     await restarted.on_foreground(context)
     opened = dispatched.pop()
     assert isinstance(opened, actions.OpenSelector)
-    assert str(first / 'extension.py') in opened.selector.title
+    assert [choice.label for choice in opened.selector.choices[:2]] == [
+      'a',
+      'b',
+    ]
   finally:
     await registry.close()
 
@@ -333,8 +343,8 @@ async def test_pending_consent_does_not_override_a_new_saved_decision(
     opened = dispatched.pop()
     assert isinstance(opened, actions.OpenSelector)
     settings.set_extension(str(source), False)
-    request = opened.selector.on_select('enable')
-    assert isinstance(request, actions.ExtensionConsent)
+    request = opened.selector.on_select('approve-all')
+    assert isinstance(request, actions.ExtensionConsentBatch)
     await manager.change(context, request)
     assert config.extension_choices(settings.read().get('extensions')) == {
       str(source): False

@@ -6,38 +6,131 @@ import asyncio
 import base64
 import os
 import signal
+import sys
 from collections.abc import Awaitable, Callable
 from typing import override
 
-from prompt_toolkit import keys
+from prompt_toolkit import keys, mouse_events
 from prompt_toolkit.application import application, current
 from prompt_toolkit.key_binding import key_bindings, key_processor
+from prompt_toolkit.output import vt100
+from rich import text
 
-from mirror.cli import screen_selection, terminal
+from mirror.cli import (
+  actions,
+  rendering,
+  row_renderer,
+  screen_selection,
+  scroll_burst,
+  terminal,
+  workspace_tags,
+)
+from mirror.cli.components import worktree_tabs
 
 
 def copy_text(text: str) -> None:
-  """Request a terminal clipboard write without reading it or running OS helpers."""
+  """Request a clipboard write, bridging direct local Apple Terminal sessions."""
   data = text.encode('utf-8')
   if len(data) > 75_000:
     raise ValueError('Text exceeds the terminal clipboard limit of 75 KB.')
   encoded = base64.b64encode(data).decode('ascii')
-  output = current.get_app().output
+  app = current.get_app()
+  output = app.output
   output.write_raw(f'\x1b]52;c;{encoded}\x1b\\')
   output.flush()
+  if (
+    isinstance(app, WorkspaceApplication)
+    and app.is_running
+    and output.stdout is not None
+    and output.stdout.isatty()
+    and terminal.needs_local_clipboard(sys.platform, os.environ)
+  ):
+    app.copy_to_system_clipboard(data)
+
+
+def _title_text(label: str, width: int = 80) -> str:
+  label = ' '.join(rendering.strip_ansi(label).split())
+  label = ''.join(character for character in label if character.isprintable())
+  title = text.Text(label.strip())
+  # Bound zero-width characters as well as cells.
+  title.truncate(width, overflow='ellipsis')
+  return title.plain[:width]
+
+
+def invalidate_transcript() -> None:
+  """Schedule transcript damage without rebuilding unrelated workspace chrome."""
+  app = current.get_app()
+  if isinstance(app, WorkspaceApplication):
+    app.invalidate(transcript_only=True)
+  else:
+    app.invalidate()
 
 
 class WorkspaceApplication(application.Application[str | None]):
   """A prompt-toolkit application that can hand off without moving the frame."""
+
+  refresh_key: Callable[[], object | None] | None = None
+  """Inputs that can change without invalidation; None preserves periodic refresh."""
+  _refresh_stamp: object | None = None
+  _last_draw = 0.0
+  _clipboard_task: asyncio.Task[None] | None = None
+  _clipboard_pending: (
+    tuple[Callable[[bytes], Awaitable[None]], bytes] | None
+  ) = None
 
   _preserve_frame_on_exit = False
   _handoff_pending = False
   _between_views = False
   _selected_view: application.Application[str | None] | None = None
   _view_result: asyncio.Future[str | None] | None = None
+  _scroll_burst: scroll_burst.ScrollBurst | None = None
+  _terminal_title: str | None = None
   resize_handler: Callable[[], None] | None = None
+  scroll_handler: (
+    Callable[[mouse_events.MouseEvent], key_bindings.NotImplementedOrNone]
+    | None
+  ) = None
   rendering: bool = False
   """Whether frame-local UI measurements can be shared by the active draw."""
+
+  def copy_to_system_clipboard(
+    self,
+    data: bytes,
+    write: Callable[[bytes], Awaitable[None]] = terminal.write_local_clipboard,
+  ) -> asyncio.Task[None]:
+    """Serialize helper writes, retaining only the newest pending selection."""
+    self._clipboard_pending = (write, data)
+    if self._clipboard_task is None or self._clipboard_task.done():
+      self._clipboard_task = self.create_background_task(
+        self._flush_clipboard()
+      )
+    return self._clipboard_task
+
+  async def _flush_clipboard(self) -> None:
+    try:
+      while self._clipboard_pending is not None:
+        write, data = self._clipboard_pending
+        self._clipboard_pending = None
+        await write(data)
+    finally:
+      self._clipboard_pending = None
+
+  ui_revision: object = object()
+  """Identity of the latest invalidation affecting more than the transcript."""
+
+  animation_revision: object = object()
+  """Identity of the latest clock tick for time-dependent chrome."""
+
+  def refresh_animations(self) -> None:
+    """Advance timed widgets without invalidating static retained layers."""
+    self.animation_revision = object()
+    super().invalidate()
+
+  @override
+  def invalidate(self, *, transcript_only: bool = False) -> None:
+    if not transcript_only:
+      self.ui_revision = object()
+    super().invalidate()
 
   @override
   def _on_resize(self) -> None:
@@ -52,6 +145,65 @@ class WorkspaceApplication(application.Application[str | None]):
       self.invalidate()
     else:
       super()._on_resize()
+
+  @override
+  async def run_async(
+    self,
+    pre_run: Callable[[], None] | None = None,
+    set_exception_handler: bool = True,
+    handle_sigint: bool = True,
+    slow_callback_duration: float = 0.5,
+  ) -> str | None:
+    try:
+      return await super().run_async(
+        pre_run, set_exception_handler, handle_sigint, slow_callback_duration
+      )
+    finally:
+      self._clipboard_pending = None
+      self.finish_scroll_burst()
+      if self._terminal_title is not None:
+        self.output.clear_title()
+        self.output.flush()
+        self._terminal_title = None
+
+  def set_workspace_title(
+    self,
+    label: str,
+    *,
+    status: actions.WorktreeAgentState | None = None,
+    tag: workspace_tags.WorkspaceTag | None = None,
+  ) -> None:
+    """Publish a bounded workspace label only when the terminal title changes."""
+    if (
+      isinstance(self.output, vt100.Vt100_Output) and self.output.term == 'dumb'
+    ):
+      return
+    badge = worktree_tabs.status_indicator(status)[0] if status else ''
+    # Names distinguish tags that share an icon and differ only by color.
+    tag_label = _title_text(f'{tag.icon} {tag.name}', 24) if tag else ''
+    label = ' · '.join(part for part in (tag_label, _title_text(label)) if part)
+    value = _title_text(
+      f'{badge} Mirror · {label}' if label else f'{badge} Mirror'
+    )
+    if value != self._terminal_title:
+      self.output.set_title(value)
+      self.output.flush()
+      self._terminal_title = value
+
+  def begin_scroll_burst(self) -> None:
+    """Protect accepted wheel dispatch, including the first event's allocations."""
+    if self._scroll_burst is not None and self._accepts_input:
+      self._scroll_burst.touch()
+
+  def finish_scroll_burst(self) -> None:
+    """Restore scheduling before handing off terminal or application ownership."""
+    if self._scroll_burst is not None:
+      self._scroll_burst.close()
+
+  @override
+  def suspend_to_background(self, suspend_group: bool = True) -> None:
+    self.finish_scroll_burst()
+    super().suspend_to_background(suspend_group)
 
   async def run_views(
     self, run_workspaces: Callable[[], Awaitable[None]]
@@ -81,6 +233,8 @@ class WorkspaceApplication(application.Application[str | None]):
 
   def enable_views(self) -> None:
     """Keep one terminal application alive while selected workspace views change."""
+    self.finish_scroll_burst()
+    self._scroll_burst = scroll_burst.ScrollBurst(self)
     self._selected_view = None
     self._view_result = None
     self._between_views = True
@@ -129,6 +283,7 @@ class WorkspaceApplication(application.Application[str | None]):
     accept_buffered_input: Callable[[], bool] = lambda: True,
   ) -> str | None:
     """Select retained layout and editor state without replacing terminal ownership."""
+    self.finish_scroll_burst()
     if self.full_screen:
       if not isinstance(
         view.layout.container, screen_selection.ScreenSelection
@@ -137,6 +292,12 @@ class WorkspaceApplication(application.Application[str | None]):
           view.layout.container, self._copy_selection
         )
       self._screen_selection = view.layout.container
+      self._screen_selection.scroll_handler = (
+        self._scroll_view
+        if isinstance(view, WorkspaceApplication)
+        and view.scroll_handler is not None
+        else None
+      )
       self._screen_selection.clear()
     self._selected_view = view
     self._between_views = False
@@ -180,12 +341,24 @@ class WorkspaceApplication(application.Application[str | None]):
       self.key_processor.process_keys()
       return await result
     finally:
+      self.finish_scroll_burst()
       if self._screen_selection is not None:
         self._screen_selection.clear()
       self._accepts_input = False
       self._selected_view = None
       self._view_result = None
       self._between_views = True
+
+  def _scroll_view(
+    self, event: mouse_events.MouseEvent
+  ) -> key_bindings.NotImplementedOrNone:
+    """Route wheel input to the active workspace view."""
+    view = self._selected_view
+    if (
+      not isinstance(view, WorkspaceApplication) or view.scroll_handler is None
+    ):
+      return NotImplemented
+    return view.scroll_handler(event)
 
   def _copy_selection(self, text: str) -> None:
     try:
@@ -195,12 +368,14 @@ class WorkspaceApplication(application.Application[str | None]):
 
   def finish_views(self) -> None:
     """Release a selected view when the owning application stops."""
+    self.finish_scroll_burst()
     result = getattr(self, '_view_result', None)
     if result is not None and not result.done():
       result.set_result(None)
 
   def exit_for_handoff(self, result: str) -> None:
     """Exit to the supervisor without prompt-toolkit's final content render."""
+    self.finish_scroll_burst()
     pending = getattr(self, '_view_result', None)
     if pending is not None:
       if not pending.done():
@@ -230,11 +405,31 @@ class WorkspaceApplication(application.Application[str | None]):
     self.create_background_task(self._auto_refresh())
 
   async def _auto_refresh(self) -> None:
-    """Use live refresh intervals instead of prompt-toolkit's startup snapshot."""
-    while interval := self.refresh_interval:
-      await asyncio.sleep(interval)
-      if self.refresh_interval:
+    """Poll legacy inputs without repainting unchanged or recent frames."""
+    loop = asyncio.get_running_loop()
+    delay = self.refresh_interval
+    while delay:
+      await asyncio.sleep(delay)
+      if not self.refresh_interval:
+        break
+      # Retry when due instead of skipping an entire animation interval.
+      delay = self.refresh_interval - (loop.time() - self._last_draw)
+      if delay > 0:
+        continue
+      stamp = self._refresh_token()
+      if stamp is None:
+        self.refresh_animations()
+      elif stamp != self._refresh_stamp:
         self.invalidate()
+      delay = self.refresh_interval
+
+  def _refresh_token(self) -> object | None:
+    view = self._selected_view or self
+    if isinstance(view, WorkspaceApplication) and view.refresh_key is not None:
+      key = view.refresh_key()
+      if key is not None:
+        return view, key
+    return None
 
   @override
   def _redraw(self, render_as_done: bool = False) -> None:
@@ -249,11 +444,15 @@ class WorkspaceApplication(application.Application[str | None]):
     # scrolling a full-height frame. The next worktree replaces this frame.
     if render_as_done and self._preserve_frame_on_exit:
       return
+    row_renderer.install(self)
     try:
       if self.full_screen:
         self.output.write_raw(terminal.SYNC_BEGIN)
       self.rendering = True
       super()._redraw(render_as_done)
+      if self.loop is not None:
+        self._last_draw = self.loop.time()
+      self._refresh_stamp = self._refresh_token()
     finally:
       self.rendering = False
       if self.full_screen:

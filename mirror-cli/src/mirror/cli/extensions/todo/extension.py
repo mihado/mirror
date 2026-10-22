@@ -136,6 +136,12 @@ class TodoExtension(extension.Extension[TodoState, _Persist, None]):
     context.enqueue(message)
 
   @override
+  def cache_key(
+    self, global_state: _state.State, extension_state: TodoState
+  ) -> object:
+    return (global_state.layout.columns, extension_state)
+
+  @override
   def render(
     self,
     global_state: _state.State,

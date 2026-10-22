@@ -164,6 +164,23 @@ def test_store_handles_a_fresh_database(
     assert (tmp_path / 'state.db-shm').stat().st_mode & 0o777 == 0o600
 
 
+def test_workspace_conversation_survives_preference_updates(
+  tmp_path: pathlib.Path,
+) -> None:
+  database = tmp_path / 'cli.db'
+  with cli_store.Store(database) as store:
+    store.set_worktree_alias('repo', 'tab', 'Reviewer')
+    store.set_workspace_conversation('repo', 'tab', 'child', tmp_path)
+    store.set_worktree_preferences(
+      'repo', 'tab', client_pb2.WorkspacePreferences(tag_id='review')
+    )
+  with cli_store.Store(database) as store:
+    overlay = store.worktree_overlays('repo')['tab']
+    assert overlay.conversation_id == 'child'
+    assert overlay.alias == 'Reviewer'
+    assert overlay.tag_id == 'review'
+
+
 def test_worktree_overlays_store_aliases_and_preferences(
   tmp_path: pathlib.Path,
 ) -> None:

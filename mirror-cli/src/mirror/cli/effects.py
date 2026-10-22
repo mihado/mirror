@@ -25,7 +25,7 @@ class ChangeExtension:
 
   request: (
     actions.ToggleExtension
-    | actions.ExtensionConsent
+    | actions.ExtensionConsentBatch
     | actions.AddExtension
     | actions.UpdateExtensions
     | actions.RemoveExtension
@@ -139,6 +139,13 @@ class CloseWorkspace:
 
 
 @dataclasses.dataclass(frozen=True)
+class ForkWorkspace:
+  """Create a snapshot-backed child without switching away from its parent."""
+
+  name: str | None
+
+
+@dataclasses.dataclass(frozen=True)
 class CreateManagedWorktree:
   """Create and select a supervised worktree."""
 
@@ -231,6 +238,13 @@ class SendInferenceConfiguration:
 
 
 @dataclasses.dataclass(frozen=True)
+class SetWebProvider:
+  """Update local retrieval without restarting the worker."""
+
+  provider: str
+
+
+@dataclasses.dataclass(frozen=True)
 class DetachTools:
   """Tell the worker to stop awaiting task-backed tools."""
 
@@ -294,6 +308,18 @@ class FocusComposer:
 @dataclasses.dataclass(frozen=True)
 class FocusTasks:
   """Move prompt-toolkit focus to the task list."""
+
+
+@dataclasses.dataclass(frozen=True)
+class InspectTask:
+  """Show an existing task's read-only conversation."""
+
+  task: actions.Task
+
+
+@dataclasses.dataclass(frozen=True)
+class CloseInspection:
+  """Return to the parent without changing either agent."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -486,6 +512,7 @@ type CoreEffect = (
   | CreateWorkspace
   | CloseWorkspace
   | CreateManagedWorktree
+  | ForkWorkspace
   | CreateSandboxWorkspace
   | DropManagedWorktree
   | RenameWorktree
@@ -499,6 +526,7 @@ type CoreEffect = (
   | SelectWorkspace
   | SaveWorktreePreferences
   | SendInferenceConfiguration
+  | SetWebProvider
   | DetachTools
   | SetWorkerApprovalMode
   | SendApprovalDecision
@@ -510,6 +538,8 @@ type CoreEffect = (
   | FocusComposer
   | FocusTasks
   | CancelTask
+  | InspectTask
+  | CloseInspection
   | StartNewConversation
   | CompactConversation
   | LoadRewindTurns

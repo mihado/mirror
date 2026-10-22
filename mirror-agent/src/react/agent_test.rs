@@ -198,6 +198,78 @@ async fn empty_truncated_answers_compact_before_retrying() {
     );
 }
 
+struct PrewarmRecorder {
+    prewarmed: std::sync::mpsc::Sender<CompletionRequest>,
+}
+
+impl Llm for PrewarmRecorder {
+    fn model(&self) -> &str {
+        "prewarm-recorder"
+    }
+
+    fn stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> impl futures_core::Stream<Item = Result<StreamEvent, LlmError>> + Send {
+        futures_util::stream::empty()
+    }
+
+    fn prewarm(&self, request: CompletionRequest) {
+        self.prewarmed
+            .send(request)
+            .expect("test receiver is alive");
+    }
+}
+
+#[tokio::test]
+async fn initialize_prewarms_the_model_with_the_new_context() {
+    let (prewarmed, requests) = std::sync::mpsc::channel();
+    let tool_executor = DirectToolExecutor::new(vec![Arc::new(crate::tools::WebSearchTool::new(
+        Box::new(|selection| {
+            Ok(Box::new(
+                crate::tools::web_test_provider::MemoryWebProvider(selection),
+            ))
+        }),
+    ))])
+    .with_tool_visibility(|_, context| {
+        context.web_provider() == Some(crate::web::WebProviderConfig::Tavily)
+    });
+    let mut agent = ReactAgent::new(
+        PrewarmRecorder { prewarmed },
+        test_provider(4_000).await,
+        None,
+        &tool_executor,
+        SystemPromptConfig {
+            custom_prompt: Some("system".to_string()),
+            ..SystemPromptConfig::default()
+        },
+        ReactAgentConfig::default(),
+    )
+    .expect("agent");
+    let (mut context, _events) = ReactContext::new(
+        "session",
+        Vec::new(),
+        Box::new(InMemoryStore::default()),
+        execution_context(),
+    );
+
+    agent
+        .initialize(&mut context, &tool_executor)
+        .await
+        .expect("initialize");
+
+    let request = requests.try_recv().expect("initialize prewarms once");
+    assert_matches!(
+        request.messages.as_slice(),
+        [chat_record::Message::System(system)] if system.content.contains("system")
+    );
+    assert_eq!(request.max_tokens, None);
+    assert!(
+        request.tools.is_empty(),
+        "prewarm must respect tool visibility"
+    );
+}
+
 #[tokio::test]
 async fn compaction_keeps_only_the_active_window_resident() {
     let mut store = InMemoryStore::default();

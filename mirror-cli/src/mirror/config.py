@@ -11,7 +11,7 @@ import json
 import logging
 import pathlib
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Literal, cast
 
 type JsonValue = (
@@ -49,6 +49,22 @@ def analytics_enabled(settings: dict[str, object]) -> bool:
 def checkpoints_enabled(settings: dict[str, object]) -> bool:
   """Whether the user explicitly permits repository checkpoints."""
   return settings.get('checkpoints_enabled') is True
+
+
+def web_provider(
+  settings: Mapping[str, object],
+) -> Literal['you', 'tavily', 'firecrawl'] | None:
+  """Read explicit selection; None preserves the default You.com setup."""
+  value = settings.get('web_provider')
+  if value is None:
+    return None
+  if value == 'you':
+    return 'you'
+  if value == 'tavily':
+    return 'tavily'
+  if value == 'firecrawl':
+    return 'firecrawl'
+  raise ValueError('web_provider must be "you", "tavily", or "firecrawl"')
 
 
 def same_config(left: JsonObject, right: JsonObject) -> bool:
@@ -138,9 +154,12 @@ class Config:
     except FileNotFoundError:
       signature = None
     if self._cached is None or signature != self._signature:
-      data: object = (
-        json.loads(self.path.read_text()) if signature is not None else {}
-      )
+      try:
+        data: object = (
+          json.loads(self.path.read_text()) if signature is not None else {}
+        )
+      except json.JSONDecodeError as error:
+        raise ValueError(f'{self.path}: invalid JSON: {error}') from error
       if not isinstance(data, dict):
         raise ValueError(f'Config must be a JSON object: {self.path}')
       self._cached = cast(dict[str, object], data)

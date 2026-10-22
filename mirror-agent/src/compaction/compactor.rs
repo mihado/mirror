@@ -226,7 +226,11 @@ impl Compactor {
         conversation.retain(|entry| {
             matches!(
                 entry.payload,
-                Some(agent_message::Payload::Chat(_) | agent_message::Payload::TaskResult(_))
+                Some(
+                    agent_message::Payload::Chat(_)
+                        | agent_message::Payload::TaskResult(_)
+                        | agent_message::Payload::Fork(_)
+                )
             )
         });
         let start = recent_start(&conversation, self.recent_max_chars);
@@ -759,6 +763,15 @@ mod tests {
                 checkpoint: None,
                 content: "old material ".repeat(1000),
             })),
+            AgentMessage {
+                payload: Some(agent_message::Payload::Fork(mirror_protocol::ForkRecord {
+                    parent_session_id: "parent".into(),
+                    inherited_sequence: 2,
+                    source_workspace: "/old/repo".into(),
+                    destination_workspace: "/new/repo".into(),
+                })),
+                ..Default::default()
+            },
             recent_user.clone(),
             recent_answer.clone(),
             snapshot("todo", "latest"),
@@ -766,7 +779,9 @@ mod tests {
         let compactor = compactor();
         let (_, request) = compactor.prepare_with(&entries, &[]);
         let request = request.expect("older context needs summarization");
-        assert_matches!(&request.messages[1], chat_record::Message::User(user) if !user.content.contains("recent question"));
+        assert_matches!(&request.messages[1], chat_record::Message::User(user)
+            if !user.content.contains("recent question")
+                && user.content.contains("current workspace is \"/new/repo\""));
         let result = compactor
             .finish(
                 &entries,

@@ -135,7 +135,7 @@ impl Tool for EditTool {
     }
 }
 
-pub(super) fn replace_text(text: &str, args: &EditArgs) -> Result<(String, usize), ToolError> {
+pub(crate) fn replace_text(text: &str, args: &EditArgs) -> Result<(String, usize), ToolError> {
     let exact_count = text.matches(&args.old_string).count();
     let (updated, count) = if exact_count > 0 {
         validate_count(exact_count, args)?;
@@ -162,7 +162,7 @@ pub(super) fn replace_text(text: &str, args: &EditArgs) -> Result<(String, usize
     Ok((updated, count))
 }
 
-pub(super) fn format_result(
+pub(crate) fn format_result(
     text: &str,
     updated: &str,
     count: usize,

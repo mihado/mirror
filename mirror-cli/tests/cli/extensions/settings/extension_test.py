@@ -23,6 +23,67 @@ from mirror.cli.extensions.memory import extension as memory_extension
 from mirror.cli.extensions.settings import extension as settings_extension
 from mirror.cli.extensions.settings import setting_template
 from mirror.cli.extensions.settings.definitions import history_detail
+from mirror.cli.extensions.web_provider import (
+  extension as web_provider_extension,
+)
+
+
+@pytest.mark.asyncio
+async def test_web_provider_selector_persists_without_restarting_sessions(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv('YOU_API_KEY', 'synthetic-you-key')
+  monkeypatch.setenv('TAVILY_API_KEY', 'synthetic-web-key')
+  monkeypatch.delenv('FIRECRAWL_API_KEY', raising=False)
+  harness = _harness(tmp_path)
+  harness.settings.update(lambda values: values.update(approval_mode='approve'))
+  plugin = web_provider_extension.WebProviderExtension()
+  await plugin.handle_effect(harness.context, web_provider_extension.Choose())
+  opened = harness.dispatched[-1]
+  assert isinstance(opened, actions.OpenSelector)
+  assert opened.selector.choices == (
+    selection.Choice('you', 'You.com', 'you · key set'),
+    selection.Choice('tavily', 'Tavily', 'tavily · key set'),
+    selection.Choice(
+      'firecrawl', 'Firecrawl', 'firecrawl · set $FIRECRAWL_API_KEY'
+    ),
+  )
+
+  await plugin.handle_effect(
+    harness.context, web_provider_extension.Choose('tavily')
+  )
+  assert config.Config(harness.settings.path).read() == {
+    'approval_mode': 'approve',
+    'web_provider': 'tavily',
+  }
+  assert harness.dispatched[-2] == actions.SetWebProvider('tavily')
+  assert 'API_KEY' not in str(harness.dispatched[-1])
+  assert harness.restarts == []
+
+
+@pytest.mark.asyncio
+async def test_web_provider_requires_missing_key_without_changing_settings(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv('TAVILY_API_KEY', ' \t ')
+  harness = _harness(tmp_path)
+  plugin = web_provider_extension.WebProviderExtension()
+  await plugin.handle_effect(harness.context, web_provider_extension.Choose())
+  opened = harness.dispatched[-1]
+  assert isinstance(opened, actions.OpenSelector)
+  assert opened.selector.choices[1].detail == 'tavily · set $TAVILY_API_KEY'
+  await plugin.handle_effect(
+    harness.context, web_provider_extension.Choose('tavily')
+  )
+  assert not harness.settings.path.exists()
+  assert harness.dispatched[-1] == actions.ShowText(
+    'Set $TAVILY_API_KEY in your launch environment to use tavily. Web provider unchanged.',
+    style='ui.warning',
+  )
+  assert harness.restarts == []
+
 
 _EXAMPLE_MENU = setting_template.Menu(
   'settings',

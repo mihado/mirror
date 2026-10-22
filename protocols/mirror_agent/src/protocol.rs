@@ -92,6 +92,17 @@ impl AgentMessage {
                     ),
                 })]
             }
+            agent_message::Payload::Fork(fork) => {
+                vec![chat_record::Message::User(UserMessage {
+                    checkpoint: None,
+                    content: format!(
+                        "This conversation was forked from session {}. Earlier messages describe \
+                         work in {:?}. The current workspace is {:?}. Continue in this checkout; \
+                         verify inherited absolute paths before using them.",
+                        fork.parent_session_id, fork.source_workspace, fork.destination_workspace
+                    ),
+                })]
+            }
             agent_message::Payload::Extension(extension) => extension
                 .model_message
                 .clone()

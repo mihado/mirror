@@ -58,8 +58,12 @@ class Selector[ActionT]:
   selected: str | None = None
   empty: str = 'No choices available.'
   keep_open: bool = False
-  # Replace search with 1–9 shortcuts for the first nine choices.
+  # Replace search with 1–9 shortcuts, using pinned actions when present.
   numbered: bool = False
+  # Keep trailing actions visible outside the scrolling choices' row limit.
+  pinned_count: int = 0
+  # Wrap row details within the scrolling viewport's physical line budget.
+  wrap_details: bool = False
   # Async producers supply ranked choices via SelectorResultsLoaded.
   prefiltered: bool = False
   loading: bool = False
@@ -75,3 +79,8 @@ class Selector[ActionT]:
   header: console.RenderableType = ''
   # Preserve filenames or other meaningful suffixes when labels are too wide.
   truncate_labels_from_start: bool = False
+
+  @property
+  def numbered_from(self) -> int:
+    """Number pinned actions when present, otherwise number the whole list."""
+    return len(self.choices) - self.pinned_count if self.pinned_count else 0

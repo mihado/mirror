@@ -170,6 +170,10 @@ impl Tool for GrepTool {
         true
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn run_remote(
         &self,
         args: GrepArgs,

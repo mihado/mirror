@@ -1,8 +1,10 @@
 """Cross-directory resume confirmation; choices use the generic selector."""
 
 from typing import override
+
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout import containers, controls, dimension
+
 from mirror import workspace
 from mirror.cli import state
 from mirror.cli.components import component, menu
@@ -23,6 +25,10 @@ def scope_tabs(
 
 
 class Resume(component.Component):
+  @override
+  def cache_key(self, state: state.State) -> object:
+    return (state.resume.confirmation, state.workspace)
+
   @override
   def render(self, state: state.State) -> containers.AnyContainer:
     info = state.resume.confirmation

@@ -49,7 +49,7 @@ from mirror.cli import (
   workspace_controller,
   workspace_files,
 )
-from mirror.cli.components import component
+from mirror.cli.components import component, layout
 from mirror.cli.composer import editing
 from mirror.cli.statsig.events import client as statsig_client
 from mirror.cli.statsig.events import event as statsig_event
@@ -336,6 +336,17 @@ class Extension[StateT, EffectT, ContextT](abc.ABC):
     extension_state: StateT,
   ) -> containers.AnyContainer | None:
     """Render global and extension state, or return no content."""
+    del global_state, extension_state
+    return None
+
+  def cache_key(
+    self, global_state: state.State, extension_state: StateT
+  ) -> object | None:
+    """Identify unchanged render inputs; the default refreshes every frame.
+
+    Opt in only when render output and geometry depend entirely on this key.
+    Clock-driven widgets and callbacks without a revision must return None.
+    """
     del global_state, extension_state
     return None
 
@@ -794,6 +805,46 @@ class ExtensionView:
 
   _interactive = False
 
+  def cache_key(
+    self, state: state.State, region: RenderRegion
+  ) -> object | None:
+    """Retain a region only when every visible provider identifies its inputs."""
+    state = dataclasses.replace(
+      state, extension_tips=self.tips, extension_themes=self.themes
+    )
+    keys: list[object] = []
+    for name, extension in self._items.items():
+      boundary = self._boundary(name)
+      try:
+        if (
+          extension.render_region() is not region
+          or name not in state.extensions
+        ):
+          continue
+        extension_state = state.extensions[name]
+        if extension_state is None:
+          continue
+        key = extension.cache_key(state, extension_state)
+        if key is None:
+          return None
+        keys.append((
+          extension,
+          boundary,
+          extension.render_order(),
+          extension.status_separator(),
+          key,
+        ))
+      except Exception as error:  # Cache hooks share the render fault boundary.
+        boundary.fail(error)
+        return None
+    return (
+      self._interactive,
+      tuple(
+        (name, boundary.error) for name, boundary in self._boundaries.items()
+      ),
+      tuple(keys),
+    )
+
   def __init__(
     self,
     extensions: Mapping[str, _LoadedExtension],
@@ -924,7 +975,7 @@ class ExtensionView:
         else containers.Window(width=0)
       )
     if region is RenderRegion.WIDGET_BELOW_PROMPT:
-      return containers.HSplit(
+      return layout.Rows(
         [
           child
           for child in children
@@ -933,7 +984,7 @@ class ExtensionView:
         padding=1,
       )
     if region in _WIDGET_REGIONS:
-      return containers.HSplit(children)
+      return layout.Rows(children)
     separated: list[containers.AnyContainer] = []
     for _, separator, child in ordered:
       if separator and (separated or region is RenderRegion.STATUS_LEFT):
@@ -943,7 +994,7 @@ class ExtensionView:
       separated.append(child)
     if region is RenderRegion.STATUS_RIGHT:
       separated.append(self._status_separator(' '))
-    return containers.VSplit(separated)
+    return layout.Columns(separated)
 
   def _status_separator(self, text: str) -> containers.Window:
     return containers.Window(
@@ -1008,6 +1059,16 @@ class ExtensionHost(ExtensionView):
     return ExtensionStatus(
       workspace, 'disabled' if error is not None else status, error
     )
+
+  @override
+  def cache_key(
+    self, state: state.State, region: RenderRegion
+  ) -> object | None:
+    if not self._started:
+      state = dataclasses.replace(
+        state, extensions=extension_state.ExtensionStates()
+      )
+    return super().cache_key(state, region)
 
   @override
   def render(
@@ -1469,6 +1530,10 @@ class _ExtensionComponent(component.Component):
   def __init__(self, host: ExtensionView, region: RenderRegion) -> None:
     self._host = host
     self._region = region
+
+  @override
+  def cache_key(self, state: state.State) -> object | None:
+    return self._host.cache_key(state, self._region)
 
   @override
   def render(self, state: state.State) -> containers.AnyContainer:

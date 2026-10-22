@@ -6,6 +6,7 @@ import locale
 import os
 import platform
 
+from mirror import distribution
 from mirror.cli.statsig import constants
 
 
@@ -30,7 +31,7 @@ class Environment:
 def detect() -> Environment:
   """Detect the current install's environment; unknown facts are left empty."""
   try:
-    app_version = importlib.metadata.version('mirror')
+    app_version = distribution.installed().version
   except importlib.metadata.PackageNotFoundError:
     app_version = ''
   try:

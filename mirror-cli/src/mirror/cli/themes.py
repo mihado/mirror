@@ -6,14 +6,18 @@ import dataclasses
 import functools
 import os
 import re
+import select
+import termios
+import time
+import tty
 import types
 from collections.abc import Mapping, Sequence
-from typing import cast, overload, override
+from typing import Literal, cast, overload, override
 
 from prompt_toolkit import styles as prompt_styles
 from prompt_toolkit.output import color_depth
 from prompt_toolkit.styles import base
-from rich import color, style, theme
+from rich import color, console, style, theme
 
 from mirror import config
 from mirror.cli import extension_state
@@ -21,7 +25,11 @@ from mirror.cli import extension_state
 EXTENSION_ID = 'core/themes'
 CONFIG_KEY = 'builtin/themes'
 NAMES = ('dark', 'light', 'terminal', 'mono')
+# Chooses `dark` or `light` from the terminal background; not a palette itself.
+AUTO = 'auto'
 DEFAULT_BACKGROUND = 'default'
+# `dark` or `light`; overrides detection, and records it for child processes.
+BACKGROUND_ENVIRONMENT = 'MIRROR_TERMINAL_BACKGROUND'
 
 # Color choices are persisted user data, not selection or health indicators.
 TAG_COLORS = (
@@ -76,44 +84,47 @@ _DARK = {
   'welcome-reflection-deep': '#383838',
   'welcome-dots': '#3a3a3a',
 }
+# Mirrors `_DARK` role for role: the same hues at matching contrast on a white
+# background. Fills stay at or below `#ececec` so prompt-toolkit's 256-color
+# quantization keeps them visible instead of rounding them to white.
 _LIGHT = {
   'canvas': '',
   'text': 'default',
-  'muted': '#53625a',
-  'highlight': '#202020',
-  'faint': '#69746f',
-  'accent': '#1e3207',
-  'info': '#355f85',
-  'success': '#36652e',
-  'warning': '#855000',
-  'error': '#a12222',
-  'input': '#20382a on #eeeeee',
-  'message': '#202020 on #eeeeee',
-  'selected': 'bold #ffffff on #1e3207 not reverse',
+  'muted': '#666666',
+  'highlight': '#000000',
+  'faint': '#8a8a8a',
+  'accent': '#26754a',
+  'info': '#2766a8',
+  'success': '#17702f',
+  'warning': '#8a5d00',
+  'error': '#c41e2a',
+  'input': '#20382a on #e8e8e8',
+  'message': '#000000 on #e8e8e8',
+  'selected': 'bold #0f2a1a on #b9e0c3 not reverse',
   'view-default': 'bold #000000 on #5f87af not reverse',
   'view-focus': 'bold #000000 on #87af87 not reverse',
   'view-detail': 'bold #000000 on #af87af not reverse',
   'addition': 'on #d1eed9',
   'deletion': 'on #f8dada',
-  'code': 'on #f3f3f3',
-  'code-rail': '#355f85',
-  'heading': '#625295',
-  'quote-rail': '#625295',
-  'inline-code': '#345d61 on #eeeeee',
-  'link': 'underline #355f85',
-  'tool-heading': '#53625a',
-  'menu': '#20382a on #e5eee8',
-  'menu-accent': '#1e3207',
-  'menu-muted': '#53625a',
-  'menu-selected': 'bold #ffffff on #1e3207 not reverse',
-  'menu-selected-detail': 'not bold #e5eee8 on #1e3207 not reverse',
-  'menu-scroll': '#53625a',
-  'menu-disabled': '#aab7ac',
-  'welcome-logo': '#1e3207',
-  'welcome-axis': '#c0c6c2',
-  'welcome-reflection': '#8c9690',
-  'welcome-reflection-deep': '#c0c6c2',
-  'welcome-dots': '#d0d4d1',
+  'code': 'on #ececec',
+  'code-rail': '#5f87af',
+  'heading': '#5050c8',
+  'quote-rail': '#5050c8',
+  'inline-code': '#1f6f6d on #e8e8e8',
+  'link': 'underline #2766a8',
+  'tool-heading': '#626262',
+  'menu': '#2f4f3d on #e0ebe4',
+  'menu-accent': '#26754a',
+  'menu-muted': '#5f6f66',
+  'menu-selected': 'bold #ffffff on #26754a not reverse',
+  'menu-selected-detail': 'not bold #d5eadc on #26754a not reverse',
+  'menu-scroll': '#8fa197',
+  'menu-disabled': '#c8cec9',
+  'welcome-logo': '#26754a',
+  'welcome-axis': '#d0d0d0',
+  'welcome-reflection': '#a8a8a8',
+  'welcome-reflection-deep': '#d0d0d0',
+  'welcome-dots': '#d0d0d0',
 }
 _TERMINAL = {
   'canvas': '',
@@ -182,6 +193,18 @@ _MONO = dict.fromkeys(_DARK, 'default') | {
   'welcome-reflection-deep': 'dim',
   'welcome-dots': 'dim',
 }
+
+# Pygments/Rich syntax themes for code blocks and diffs. Token colors must read
+# on each palette's own code and diff fills; ANSI palettes use the terminal's
+# normal (not bright) colors, which terminal schemes keep legible on their own
+# background.
+_SYNTAX = {
+  'dark': {'code': 'monokai', 'diff': 'ansi_dark'},
+  'light': {'code': 'default', 'diff': 'default'},
+  'terminal': {'code': 'ansi_light', 'diff': 'ansi_light'},
+  'mono': {'code': 'ansi_light', 'diff': 'ansi_light'},
+}
+_SYNTAX_STYLE = 'mirror.syntax'
 
 # Custom palettes need not repeat component colors when overriding shared roles.
 _FALLBACK_ROLES = {
@@ -384,23 +407,27 @@ def configured(
   settings: Mapping[str, object], available: Sequence[Theme] = ()
 ) -> str:
   """Unknown settings fall back without importing code or changing consent."""
-  value = settings.get('name', 'dark')
-  names = (*NAMES, *(item.id for item in available))
-  return value if isinstance(value, str) and value in names else 'dark'
+  value = settings.get('name', AUTO)
+  names = (AUTO, *NAMES, *(item.id for item in available))
+  return value if isinstance(value, str) and value in names else AUTO
 
 
-def saved(settings: Mapping[str, object]) -> str:
-  """Resolve the same built-in preference for views without an extension host."""
+def preference(settings: Mapping[str, object]) -> str:
+  """Read the startup preference, retaining custom IDs before extensions load."""
   try:
     overrides = config.extension_overrides(
       settings.get('extensions'), CONFIG_KEY
     )
     resolved = config.resolve_extension(overrides)
   except ValueError:
-    return effective('dark')
-  return effective(
-    configured(resolved.config) if resolved.enabled is True else 'dark'
-  )
+    return AUTO
+  name = resolved.config.get('name', AUTO)
+  return name if resolved.enabled is True and isinstance(name, str) else AUTO
+
+
+def saved(settings: Mapping[str, object]) -> str:
+  """Resolve the same built-in preference for views without an extension host."""
+  return effective(configured({'name': preference(settings)}))
 
 
 @overload
@@ -418,13 +445,101 @@ def effective(
 def effective(
   name: str | Theme, environment: Mapping[str, str] | None = None
 ) -> str | Theme:
-  """Respect explicit terminal capabilities without querying its background."""
+  """Respect terminal capabilities and resolve `auto` from its background."""
   environment = os.environ if environment is None else environment
-  return (
-    'mono'
-    if 'NO_COLOR' in environment or environment.get('TERM') == 'dumb'
-    else name
+  if 'NO_COLOR' in environment or environment.get('TERM') == 'dumb':
+    return 'mono'
+  if name == AUTO:
+    return background(environment) or 'dark'
+  return name
+
+
+def background(environment: Mapping[str, str]) -> str | None:
+  """The terminal background, `dark` or `light`, if the environment knows it.
+
+  An explicit or detected `MIRROR_TERMINAL_BACKGROUND` wins over `COLORFGBG`,
+  which some terminals export as `foreground;background` ANSI color indices.
+  """
+  explicit = environment.get(BACKGROUND_ENVIRONMENT, '').strip().lower()
+  if explicit in {'dark', 'light'}:
+    return explicit
+  index = environment.get('COLORFGBG', '').rpartition(';')[2]
+  if not index.isdigit():
+    return None
+  # Black, the dim colors, and bright black are dark; the rest are light.
+  return 'dark' if int(index) in {0, 1, 2, 3, 4, 5, 6, 8} else 'light'
+
+
+_BACKGROUND_REPLY = re.compile(
+  rb'\x1b\]11;rgba?:([0-9a-f]{1,4})/([0-9a-f]{1,4})/([0-9a-f]{1,4})',
+  re.IGNORECASE,
+)
+# Every VT100-compatible terminal answers Primary Device Attributes, and in
+# order, so its reply proves any background reply has already arrived.
+_ATTRIBUTES_REPLY = re.compile(rb'\x1b\[\?[0-9;]*c')
+
+
+def parse_background_reply(reply: bytes) -> str | None:
+  """Classify an OSC 11 `rgb:RRRR/GGGG/BBBB` reply as `dark` or `light`."""
+  match = _BACKGROUND_REPLY.search(reply)
+  if match is None:
+    return None
+  red, green, blue = (
+    int(channel, 16) / (16 ** len(channel) - 1) for channel in match.groups()
   )
+  return 'light' if 0.299 * red + 0.587 * green + 0.114 * blue > 0.5 else 'dark'
+
+
+def detect_background(timeout: float = 0.5) -> None:
+  """Ask the terminal for its background before a full-screen app reads input.
+
+  The answer is recorded in `MIRROR_TERMINAL_BACKGROUND` for `auto`. An
+  explicit value is kept, and a terminal that does not answer leaves
+  `COLORFGBG` or the dark default in charge.
+  """
+  if (
+    effective('dark') == 'mono'
+    or os.environ.get(BACKGROUND_ENVIRONMENT)
+    or not (os.isatty(0) and os.isatty(1))
+  ):
+    return
+  try:
+    descriptor = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+  except OSError:
+    return
+  try:
+    reply = _query_background(descriptor, timeout)
+  finally:
+    os.close(descriptor)
+  if detected := parse_background_reply(reply):
+    os.environ[BACKGROUND_ENVIRONMENT] = detected
+
+
+def _query_background(descriptor: int, timeout: float) -> bytes:
+  try:
+    previous = termios.tcgetattr(descriptor)
+  except termios.error:
+    return b''
+  reply = b''
+  try:
+    tty.setcbreak(descriptor, termios.TCSANOW)
+    os.write(descriptor, b'\x1b]11;?\x1b\\\x1b[c')
+    deadline = time.monotonic() + timeout
+    while not _ATTRIBUTES_REPLY.search(reply):
+      remaining = deadline - time.monotonic()
+      if (
+        remaining <= 0 or not select.select([descriptor], [], [], remaining)[0]
+      ):
+        break
+      chunk = os.read(descriptor, 1024)
+      if not chunk:
+        break
+      reply += chunk
+  except OSError:
+    pass
+  finally:
+    termios.tcsetattr(descriptor, termios.TCSANOW, previous)
+  return reply
 
 
 def prompt_color_depth() -> color_depth.ColorDepth | None:
@@ -459,12 +574,13 @@ def current(
 @functools.lru_cache(maxsize=128)
 def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
   """Build a read-only-in-use framework theme, never mutate global styles."""
+  palette = name.base if isinstance(name, Theme) else name
   values = {
     'dark': _DARK,
     'light': _LIGHT,
     'terminal': _TERMINAL,
     'mono': _MONO,
-  }[name.base if isinstance(name, Theme) else name]
+  }[palette]
   if isinstance(name, Theme):
     values = values | dict(name.styles)
     for role, source in _FALLBACK_ROLES.items():
@@ -488,6 +604,8 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
     color=resolved['ui.input'].bgcolor or color.Color.default(),
     bgcolor=resolved['ui.canvas'].bgcolor,
   )
+  # Syntax themes are not styles; carry the choice for render-time lookup.
+  resolved[_SYNTAX_STYLE] = style.Style(meta=_SYNTAX[palette])
   resolved['ui.menu-edge'] = style.Style(
     color=resolved['ui.menu'].bgcolor or color.Color.default(),
     bgcolor=resolved['ui.canvas'].bgcolor or color.Color.default(),
@@ -521,6 +639,12 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
     },
   })
   return theme.Theme(resolved)
+
+
+def syntax_theme(target: console.Console, kind: Literal['code', 'diff']) -> str:
+  """The palette's Pygments/Rich syntax theme for `code` blocks or `diff`s."""
+  carrier = target.get_style(_SYNTAX_STYLE, default=style.Style())
+  return cast(str, carrier.meta.get(kind) or _SYNTAX['dark'][kind])
 
 
 def _prompt_color(value: color.Color) -> str:

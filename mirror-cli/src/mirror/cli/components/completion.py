@@ -62,6 +62,11 @@ def _command_selection(
 
 
 class Completion(component.Component):
+  @override
+  def cache_key(self, state: state.State) -> object | None:
+    # Visible choices include shortcut callbacks owned by the current view.
+    return () if not visible(state) else None
+
   def __init__(
     self,
     shortcut_hint: Callable[[actions.Action | None], str] = lambda _: '',

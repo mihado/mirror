@@ -78,6 +78,7 @@ impl TestServer {
                     .env_clear()
                     .env("PATH", &path)
                     .env("OPENAI_API_KEY", "synthetic-remote-model-key")
+                    .env("GEMINI_API_KEY", "synthetic-gemini-key")
                     .kill_on_drop(true)
                     .output()
                     .await
@@ -116,29 +117,50 @@ impl Drop for TestServer {
 }
 
 pub(crate) struct TestResponse {
-    status: u16,
+    status: Option<u16>,
     body: String,
+    content_length: Option<usize>,
 }
 
 impl TestResponse {
+    pub fn disconnected() -> Self {
+        Self {
+            status: None,
+            body: String::new(),
+            content_length: None,
+        }
+    }
+
+    pub fn truncated() -> Self {
+        Self {
+            status: Some(200),
+            body: "[".into(),
+            content_length: Some(10),
+        }
+    }
+
     pub fn json(status: u16, body: serde_json::Value) -> Self {
         Self {
-            status,
+            status: Some(status),
+            content_length: None,
             body: body.to_string(),
         }
     }
 
     pub fn text(status: u16, body: impl Into<String>) -> Self {
         Self {
-            status,
+            status: Some(status),
+            content_length: None,
             body: body.into(),
         }
     }
 }
 
 pub(crate) struct TestRequest {
+    pub method: String,
     pub path: String,
     pub authorization: Option<String>,
+    pub api_key: Option<String>,
     pub body: serde_json::Value,
 }
 
@@ -178,6 +200,11 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> TestRequest {
         name.eq_ignore_ascii_case("authorization")
             .then(|| value.trim().to_string())
     });
+    let api_key = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("x-api-key")
+            .then(|| value.trim().to_string())
+    });
     let body_bytes = &bytes[header_end..header_end + content_length];
     let body = if content_length == 0 {
         serde_json::Value::Null
@@ -187,14 +214,23 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> TestRequest {
         })
     };
     TestRequest {
+        method: headers
+            .split_whitespace()
+            .next()
+            .expect("request method")
+            .to_string(),
         path,
         authorization,
+        api_key,
         body,
     }
 }
 
 async fn write_response(stream: &mut tokio::net::TcpStream, response: TestResponse) {
-    let reason = match response.status {
+    let Some(status) = response.status else {
+        return;
+    };
+    let reason = match status {
         200 => "OK",
         401 => "Unauthorized",
         429 => "Too Many Requests",
@@ -203,8 +239,8 @@ async fn write_response(stream: &mut tokio::net::TcpStream, response: TestRespon
     };
     let headers = format!(
         "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status,
-        response.body.len()
+        status,
+        response.content_length.unwrap_or(response.body.len())
     );
     stream
         .write_all(headers.as_bytes())

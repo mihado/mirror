@@ -415,8 +415,28 @@ def test_theme_change_repaints_cached_rows_without_moving_the_reading_position()
   selected_theme = 'light'
   light = view.create_content(80, 8)
   assert _text(light) == before
-  assert 'bg:#eeeeee' in light.get_line(0)[0][0]
+  assert 'bg:#e8e8e8' in light.get_line(0)[0][0]
   assert view.reading
+
+
+def test_streaming_code_uses_the_current_palette_and_matches_settled() -> None:
+  source = _source()
+  code = '```python\nvalue = "hello"\n```'
+  live = [rendering.assistant_render(code)]
+  selected_theme = 'dark'
+  view = transcript_view.TranscriptView(
+    source.blocks, lambda: live, theme_name=lambda: selected_theme
+  )
+  dark = _paint(view, 40, 8, selected_theme)
+  selected_theme = 'light'
+  light = _paint(view, 40, 8, selected_theme)
+  assert light.display[2].strip() == '┃ value = "hello"'
+  assert light.buffer[2][5].fg != dark.buffer[2][5].fg
+  source.append(_answer('final', code))
+  view.settle_live('final')
+  live.clear()
+  settled = _paint(view, 40, 8, selected_theme)
+  assert light.buffer[2] == settled.buffer[2]
 
 
 def test_settled_blocks_are_reused_when_output_is_appended() -> None:
@@ -845,7 +865,7 @@ def test_sticky_summary_is_shaded_but_normal_user_message_is_unchanged(
     summary.buffer[0][2].bg
     == {
       'dark': '282828',
-      'light': 'eeeeee',
+      'light': 'e8e8e8',
       'terminal': 'default',
       'mono': 'default',
     }[name]

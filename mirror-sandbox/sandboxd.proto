@@ -7,8 +7,6 @@ service Sandboxd {
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc Execute(ExecuteRequest) returns (stream ExecuteEvent);
   rpc Cancel(CancelRequest) returns (CancelResponse);
-  // The first request starts a process; subsequent requests carry stdin.
-  // Half-closing stdin does not cancel the process. Cancel uses its call_id.
   rpc RunCommand(stream RunCommandRequest) returns (stream RunCommandResponse);
   // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
@@ -64,7 +62,6 @@ message RunCommandResult {
     int32 exit_code = 1;
     string rejected = 2;
     string failed = 3;
-    // True only after the process group has been observed stopped.
     bool cancelled = 4;
     bool deadline_exceeded = 5;
   }
@@ -74,6 +71,31 @@ message EgressProxyConfig {
   string host = 1;
   uint32 port = 2;
   string ca_pem = 3;
+  repeated GuestProfile profiles = 4;
+  uint32 local_proxy_port = 5;
+}
+message GuestProfile {
+  string name = 1;
+  map<string, string> environment = 2;
+  repeated GuestFile files = 3;
+  repeated StaticEndpoint endpoints = 4;
+}
+message GuestFile {
+  string path = 1;
+  uint32 mode = 2;
+  bytes contents = 3;
+}
+message StaticEndpoint {
+  string listen = 1;
+  repeated StaticRoute routes = 2;
+  map<string, string> response_headers = 3;
+}
+message StaticRoute {
+  string path = 1;
+  map<string, string> required_headers = 2;
+  uint32 status = 3;
+  map<string, string> response_headers = 4;
+  bytes body = 5;
 }
 message EgressIdentity {
   uint64 request_id = 1;
@@ -89,4 +111,11 @@ message EgressUpdate {
 message EgressEvent {
   uint64 request_id = 1;
   bool installed = 2;
+  GuestReady ready = 3;
+}
+message GuestReady {
+  oneof outcome {
+    bool ready = 1;
+    string failed = 2;
+  }
 }

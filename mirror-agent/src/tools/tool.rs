@@ -29,8 +29,20 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    fn always_asks(&self) -> bool {
+        false
+    }
+
     /// Whether this tool and its descendants support remote execution.
     fn supports_remote(&self) -> bool {
+        false
+    }
+
+    /// Whether calls may run at the same time as other concurrency-safe calls.
+    ///
+    /// Return true only when a call changes nothing that another call could
+    /// observe. Other calls run alone, after every earlier call in the batch.
+    fn is_concurrency_safe(&self) -> bool {
         false
     }
 
@@ -150,6 +162,90 @@ mod tests {
         ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::success("ran"))
         }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct TypedArgs {
+        count: u32,
+        ratio: f64,
+        flag: bool,
+        items: Vec<String>,
+        label: String,
+        limit: Option<u32>,
+    }
+
+    struct TypedTool;
+
+    impl Tool for TypedTool {
+        type Args = TypedArgs;
+
+        fn name(&self) -> &str {
+            "typed"
+        }
+
+        fn description(&self) -> &str {
+            "Echo typed arguments."
+        }
+
+        fn parameters(&self) -> Map<String, Value> {
+            Map::from_iter([
+                ("type".to_string(), Value::String("object".to_string())),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "flag": {"type": "boolean"},
+                        "items": {"type": "array", "items": {"type": "string"}},
+                        "label": {"type": "string"},
+                        "limit": {"type": ["integer", "null"]},
+                    }),
+                ),
+            ])
+        }
+
+        async fn run(
+            &self,
+            args: Self::Args,
+            _context: &ExecutionContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::to_string(&args).expect("serialize arguments"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_coerces_stringified_arguments_to_their_schema_types() {
+        let result = crate::tools::AnyTool::execute(
+            &TypedTool,
+            r#"{"count":"15.0","ratio":"0.5","flag":"TRUE","items":["a"],"label":"7","limit":10.0}"#,
+            &ExecutionContext::default(),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            ToolOutput::success(
+                r#"{"count":15,"ratio":0.5,"flag":true,"items":["a"],"label":"7","limit":10}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_strings_that_are_not_a_value_of_the_schema_type() {
+        let result = crate::tools::AnyTool::execute(
+            &TypedTool,
+            r#"{"count":"1.5","ratio":1,"flag":true,"items":[],"label":"x","limit":null}"#,
+            &ExecutionContext::default(),
+        )
+        .await;
+
+        assert_matches!(result, ToolOutput { success: false, .. });
+        assert!(result
+            .content
+            .starts_with("Invalid arguments for tool typed: invalid type: string \"1.5\""));
     }
 
     #[test]

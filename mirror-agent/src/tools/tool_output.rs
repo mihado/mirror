@@ -1,5 +1,7 @@
 //! Normalized completed tool output.
 
+use std::time::Duration;
+
 use mirror_protocol::MetadataRecord;
 use mirror_protocol::TouchedPath;
 
@@ -15,6 +17,8 @@ pub struct ToolOutput {
     pub success: bool,
     pub touched: Vec<TouchedPath>,
     pub exit_code: Option<i32>,
+    /// Time awaiting the tool, excluding approval and batch queueing.
+    pub duration: Option<Duration>,
 }
 
 impl ToolOutput {
@@ -26,6 +30,7 @@ impl ToolOutput {
             success: true,
             touched: Vec::new(),
             exit_code: None,
+            duration: None,
         }
     }
 
@@ -37,6 +42,7 @@ impl ToolOutput {
             success: false,
             touched: Vec::new(),
             exit_code: None,
+            duration: None,
         }
     }
 
@@ -48,6 +54,7 @@ impl ToolOutput {
             success: false,
             touched: Vec::new(),
             exit_code: None,
+            duration: None,
         }
     }
 
@@ -63,12 +70,14 @@ impl ToolOutput {
         self
     }
 
-    /// The facts recorded beside the content in history; `None` when the tool
-    /// reported none, so a record without facts carries no metadata at all.
+    /// Tool and execution facts recorded beside the content in history.
     pub fn metadata(&self) -> Option<MetadataRecord> {
-        (!self.touched.is_empty() || self.exit_code.is_some()).then(|| MetadataRecord {
-            touched: self.touched.clone(),
-            exit_code: self.exit_code,
-        })
+        (!self.touched.is_empty() || self.exit_code.is_some() || self.duration.is_some()).then(
+            || MetadataRecord {
+                touched: self.touched.clone(),
+                exit_code: self.exit_code,
+                tool_duration_seconds: self.duration.map(|duration| duration.as_secs_f64()),
+            },
+        )
     }
 }

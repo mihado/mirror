@@ -25,6 +25,7 @@ from mirror.protocol import (
   mirror_pb2_grpc,
 )
 
+from mirror import config
 from mirror.cli import host_tools as _host_tools
 from mirror.cli import safety, system_prompt
 
@@ -102,6 +103,11 @@ class WorkerConfiguration:
     return inference
 
   @property
+  def web_provider(self) -> str | None:
+    """The local retrieval selection, independent of inference settings."""
+    return config.web_provider(self._values)
+
+  @property
   def remote_workspace(self) -> mirror_pb2.Workspace | None:
     """The workspace a new hosted session starts in, if one was selected."""
     workspace = self._values.get('remote_workspace')
@@ -132,6 +138,10 @@ class _AgentRPCStub(Protocol):
 
 
 class _MirrorRPCStub(Protocol):
+  def ForkWorkspace(  # noqa: N802, generated RPC name
+    self, request: mirror_pb2.ForkWorkspaceRequest
+  ) -> Awaitable[mirror_pb2.ForkWorkspaceResponse]: ...
+
   def ForkSession(  # noqa: N802
     self, request: mirror_pb2.ForkSessionRequest
   ) -> Awaitable[mirror_pb2.ForkSessionResponse]: ...
@@ -180,8 +190,10 @@ class Client:
     on_error: ErrorHandler,
     host_tools_registry: _host_tools.HostToolRegistry | None = None,
     inference_config: agent_pb2.InferenceConfig | None = None,
+    web_provider: str | None = None,
   ) -> None:
     self._transport = transport
+    self._web_provider = web_provider
     self._conversation_id = conversation_id
     self._on_message = on_message
     self._on_error = on_error
@@ -207,6 +219,22 @@ class Client:
           set_inference_config=inference_config,
         )
       )
+
+    if web_provider is not None:
+      self.set_web_provider(web_provider)
+
+  def set_web_provider(self, provider: str) -> None:
+    """Apply retrieval selection through the ordered session control stream."""
+    if provider not in ('you', 'tavily', 'firecrawl'):
+      raise ValueError('web_provider must be you, tavily, or firecrawl')
+    self.send(
+      agent_pb2.ClientMessage(
+        session_id=self._conversation_id,
+        message_id=uuid.uuid4().hex,
+        set_web_provider=agent_pb2.SetWebProvider(provider=provider),
+      )
+    )
+    self._web_provider = provider
 
   async def __aenter__(self) -> Client:
     """Start a client and close it when its owning scope exits."""
@@ -314,6 +342,23 @@ class Client:
       )
     return await self._call_worker_tool(name, arguments)
 
+  async def fork_workspace(
+    self, session_id: str, directory: pathlib.Path, name: str
+  ) -> pathlib.Path:
+    """Fork into a checkout while retaining a caller-known recovery identity."""
+    if self._channel is None:
+      raise RuntimeError('AgentRPC client is not connected')
+    stub = cast(_MirrorRPCStub, mirror_pb2_grpc.MirrorRPCStub(self._channel))
+    response = await stub.ForkWorkspace(
+      mirror_pb2.ForkWorkspaceRequest(
+        source_session_id=self._conversation_id,
+        session_id=session_id,
+        directory=str(directory),
+        name=name,
+      )
+    )
+    return pathlib.Path(response.workspace)
+
   async def fork_session(self, entry_id: str) -> str:
     if self._channel is None:
       raise RuntimeError('AgentRPC client is not connected')
@@ -351,6 +396,7 @@ class Client:
         session_id=self._conversation_id,
         name=name,
         arguments=json.dumps(arguments),
+        web_provider=self._web_provider,
       )
     )
     return _host_tools.ToolResult(

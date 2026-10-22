@@ -313,22 +313,31 @@ async fn collect_subagent_result(
     let mut has_trace = false;
     let mut turn_error = None;
     loop {
-        match events.recv().await {
-            Ok(ReactServiceEvent::TurnCompleted) => break,
-            Ok(ReactServiceEvent::TurnError(error)) => turn_error = Some(error),
-            Ok(ReactServiceEvent::Agent(AgentEvent::ContextUsage { .. })) if !has_trace => {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(error) => {
+                return ToolOutput::error(format!("subagent event stream failed: {error}"))
+            }
+        };
+        if let ReactServiceEvent::Agent(event) = &event {
+            task.agent_event(event.clone());
+        }
+        match event {
+            ReactServiceEvent::TurnCompleted => break,
+            ReactServiceEvent::TurnError(error) => turn_error = Some(error),
+            ReactServiceEvent::Agent(AgentEvent::ContextUsage { .. }) if !has_trace => {
                 update_display(&task, &mut display, "Thinking…".to_string());
             }
-            Ok(ReactServiceEvent::Agent(AgentEvent::CompactionStarted)) if !has_trace => {
+            ReactServiceEvent::Agent(AgentEvent::CompactionStarted) if !has_trace => {
                 update_display(&task, &mut display, "Compacting context…".to_string());
             }
-            Ok(ReactServiceEvent::Agent(AgentEvent::StreamFinal { entry, .. })) => {
+            ReactServiceEvent::Agent(AgentEvent::StreamFinal { entry, .. }) => {
                 if let Some(next) = record_entry(&task, &entry) {
                     has_trace = true;
                     update_display(&task, &mut display, next);
                 }
             }
-            Ok(ReactServiceEvent::Agent(AgentEvent::Entries(entries))) => {
+            ReactServiceEvent::Agent(AgentEvent::Entries(entries)) => {
                 for entry in &entries {
                     if let Some(next) = record_entry(&task, entry) {
                         has_trace = true;
@@ -336,10 +345,7 @@ async fn collect_subagent_result(
                     }
                 }
             }
-            Ok(_) => {}
-            Err(error) => {
-                return ToolOutput::error(format!("subagent event stream failed: {error}"))
-            }
+            _ => {}
         }
     }
     if let Some(error) = turn_error {
@@ -472,6 +478,7 @@ fn record_entry(task: &TaskContext, entry: &AgentMessage) -> Option<String> {
         }
         Some(agent_message::Payload::Chat(ChatRecord { message: None, .. }))
         | Some(agent_message::Payload::ToolApproval(_))
+        | Some(agent_message::Payload::Fork(_))
         | None => None,
     }
 }

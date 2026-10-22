@@ -18,6 +18,10 @@ class Tasks(component.Component):
   """Running background tasks shown below the prompt."""
 
   @override
+  def cache_key(self, state: state.State) -> object:
+    return (state.tasks, state.status_bar.view_mode, state.layout.columns)
+
+  @override
   def render(self, state: state.State) -> containers.AnyContainer:
     """Render task rows from immutable application state."""
     return containers.Window(
@@ -47,6 +51,8 @@ def _content(state: state.State) -> StyleAndTextTuples:
     tree = f'  {connector} '
     selected = task.id == state.tasks.selected_id
     hint = ' · press x to cancel' if selected else ''
+    if selected and task.inspectable:
+      hint = ' · Enter to view · x to cancel'
     label = f'{task.tool_name} · {task.id} · {task.display or "running…"}{hint}'
     label_width = state.layout.columns - utils.get_cwidth(tree)
     style = 'class:task-selected' if selected else 'class:task'

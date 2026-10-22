@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import shlex
 from collections.abc import Callable, Sequence
 
 from mirror import config
@@ -60,6 +61,7 @@ class CommandId(enum.Enum):
   RENAME = 'rename'
   TAG = 'tag'
   REWIND = 'rewind'
+  FORK = 'fork'
   WORKSPACES = 'workspaces'
   WORKTREE = 'worktree'
   SANDBOX = 'sandbox'
@@ -254,6 +256,10 @@ def _handle_close(_: CommandContext, args: str) -> actions.Action:
   return actions.CloseWorkspace()
 
 
+def _handle_fork(_: CommandContext, args: str) -> actions.Action:
+  return actions.ForkWorkspace(args or None)
+
+
 def _handle_worktree(_: CommandContext, args: str) -> actions.Action:
   return actions.CreateWorktree(args or None)
 
@@ -273,11 +279,18 @@ def _handle_extensions(_: CommandContext, args: str) -> actions.Action:
 
 
 def _handle_extensions_add(_: CommandContext, args: str) -> actions.Action:
-  if not args:
-    return actions.ShowText(
-      'Usage: /extensions-add <GitHub URL>', style='ui.warning'
-    )
-  return actions.AddExtension(args.strip())
+  try:
+    arguments = shlex.split(args)
+  except ValueError as error:
+    return actions.ShowText(str(error), style='ui.warning')
+  match arguments:
+    case [source] if source:
+      return actions.AddExtension(source)
+    case _:
+      return actions.ShowText(
+        'Usage: /extensions-add <GitHub URL or host directory>',
+        style='ui.warning',
+      )
 
 
 def _handle_extensions_update(_: CommandContext, args: str) -> actions.Action:
@@ -377,6 +390,14 @@ COMMANDS: tuple[CommandDef, ...] = (
     id=CommandId.CLOSE,
   ),
   CommandDef(
+    'fork',
+    'Fork this conversation and current files into a new worktree tab',
+    _handle_fork,
+    id=CommandId.FORK,
+    arguments=OptionalArguments('[name]'),
+    edit_arguments_on_select=True,
+  ),
+  CommandDef(
     'worktree',
     'Create a worktree workspace from the remote default branch',
     _handle_worktree,
@@ -424,10 +445,10 @@ COMMANDS: tuple[CommandDef, ...] = (
   ),
   CommandDef(
     'extensions-add',
-    'Add an extension from a GitHub repository',
+    'Add a GitHub or host-local extension source',
     _handle_extensions_add,
     id=CommandId.EXTENSIONS_ADD,
-    arguments=RequiredArguments('<GitHub URL>'),
+    arguments=RequiredArguments('<GitHub URL or host directory>'),
     available_when_busy=True,
   ),
   CommandDef(
@@ -439,7 +460,7 @@ COMMANDS: tuple[CommandDef, ...] = (
   ),
   CommandDef(
     'extensions-remove',
-    'Choose a GitHub extension to remove',
+    'Choose an extension source to remove',
     _handle_extensions_remove,
     id=CommandId.EXTENSIONS_REMOVE,
     available_when_busy=True,

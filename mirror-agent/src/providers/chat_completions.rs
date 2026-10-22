@@ -66,7 +66,7 @@ impl ChatCompletions {
         let messages = request
             .messages
             .iter()
-            .map(serialize_message)
+            .map(|message| serialize_message(message, self.is_gemini()))
             .collect::<Result<Vec<_>, _>>()?;
         let mut body = Map::from_iter([
             ("model".to_string(), json!(self.config.model)),
@@ -124,6 +124,10 @@ impl ChatCompletions {
         }
         apply_extra_body(&mut body, request.inference.as_ref())?;
         Ok(Value::Object(body))
+    }
+
+    fn is_gemini(&self) -> bool {
+        self.config.base_url.trim_end_matches('/') == super::model_provider::GEMINI_BASE_URL
     }
 
     fn is_openrouter(&self) -> bool {
@@ -213,11 +217,14 @@ impl ChatCompletions {
             if !streaming {
                 let completion: ApiCompletion = response.json().await
                     .map_err(|error| request_error(&model, error))?;
-                yield StreamEvent::Final(completion.finish(&model)?);
+                yield StreamEvent::Final(completion.finish(&model, self.is_gemini())?);
                 return;
             }
 
-            let mut state = CompletionState::default();
+            let mut state = CompletionState {
+                gemini: self.is_gemini(),
+                ..Default::default()
+            };
             let mut completed = false;
             let mut events = response.bytes_stream().eventsource();
             while let Some(event) = events.next().await {
@@ -244,7 +251,10 @@ impl ChatCompletions {
                 ))?;
             }
             yield StreamEvent::Final(state.finish()?);
-        }
+        }.map(move |event| event.map_err(|error| match error {
+            LlmError::Request(detail) => LlmError::Request(redact_key(detail, &self.config.api_key)),
+            LlmError::ContextOverflow(detail) => LlmError::ContextOverflow(redact_key(detail, &self.config.api_key)),
+        }))
     }
 }
 
@@ -271,6 +281,7 @@ struct ApiDelta<Call = ApiToolCallFragment> {
     refusal: Option<String>,
     reasoning_details: Option<Vec<Value>>,
     tool_calls: Option<Vec<Call>>,
+    extra_content: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -278,6 +289,7 @@ struct ApiToolCallFragment {
     index: u32,
     id: Option<String>,
     function: Option<ApiFunctionFragment>,
+    extra_content: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,10 +316,11 @@ struct ApiCompletedChoice {
 struct ApiToolCall {
     id: String,
     function: ApiFunctionFragment,
+    extra_content: Option<Value>,
 }
 
 impl ApiCompletion {
-    fn finish(self, model: &str) -> Result<Completion, LlmError> {
+    fn finish(self, model: &str, gemini: bool) -> Result<Completion, LlmError> {
         if let Some(error) = self.error {
             return Err(response_error(model, format_api_error(&error)));
         }
@@ -330,6 +343,9 @@ impl ApiCompletion {
                         id: call.id,
                         name: call.function.name.unwrap_or_default(),
                         arguments: call.function.arguments.unwrap_or_default(),
+                        thought_signature: gemini
+                            .then(|| thought_signature(call.extra_content))
+                            .flatten(),
                     },
                 ))
             })
@@ -342,6 +358,10 @@ impl ApiCompletion {
                 .unwrap_or_default(),
             refusal: message.refusal.unwrap_or_default(),
             reasoning_details: message.reasoning_details.unwrap_or_default(),
+            gemini,
+            thought_signature: gemini
+                .then(|| thought_signature(message.extra_content))
+                .flatten(),
             tool_calls,
             usage: self.usage,
             finish_reason: choice.finish_reason,
@@ -375,10 +395,12 @@ struct ApiError {
 
 #[derive(Debug, Default)]
 struct CompletionState {
+    gemini: bool,
     content: String,
     reasoning: String,
     refusal: String,
     reasoning_details: Vec<Value>,
+    thought_signature: Option<String>,
     tool_calls: BTreeMap<u32, ToolCallState>,
     usage: Option<ApiUsage>,
     finish_reason: Option<String>,
@@ -389,6 +411,7 @@ struct ToolCallState {
     id: String,
     name: String,
     arguments: String,
+    thought_signature: Option<String>,
 }
 
 impl CompletionState {
@@ -403,6 +426,9 @@ impl CompletionState {
         };
         self.finish_reason = choice.finish_reason.or(self.finish_reason.take());
         let delta = choice.delta;
+        if self.gemini {
+            merge_thought_signature(&mut self.thought_signature, delta.extra_content)?;
+        }
         let reasoning = delta.reasoning_content.or(delta.reasoning);
         if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
             self.reasoning.push_str(&reasoning);
@@ -434,6 +460,9 @@ impl CompletionState {
         }
         for fragment in delta.tool_calls.unwrap_or_default() {
             let state = self.tool_calls.entry(fragment.index).or_default();
+            if self.gemini {
+                merge_thought_signature(&mut state.thought_signature, fragment.extra_content)?;
+            }
             if let Some(id) = fragment.id {
                 state.id.push_str(&id);
             }
@@ -481,16 +510,18 @@ impl CompletionState {
         let tool_calls = self
             .tool_calls
             .into_values()
-            .map(|call| ToolCall {
-                id: call.id,
-                r#type: "function".to_string(),
-                function: Some(FunctionCall {
-                    name: call.name,
-                    arguments: call.arguments,
-                }),
-                provider_fields: None,
+            .map(|call| {
+                Ok(ToolCall {
+                    id: call.id,
+                    r#type: "function".to_string(),
+                    function: Some(FunctionCall {
+                        name: call.name,
+                        arguments: call.arguments,
+                    }),
+                    provider_fields: signature_fields(call.thought_signature)?,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, LlmError>>()?;
         if tool_calls.iter().any(|call| {
             call.id.is_empty()
                 || call
@@ -514,7 +545,7 @@ impl CompletionState {
                 reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 reasoning_details,
                 refusal: (!self.refusal.is_empty()).then_some(self.refusal),
-                provider_fields: None,
+                provider_fields: signature_fields(self.thought_signature)?,
             },
             usage: self.usage.map(api_usage),
             truncated,
@@ -532,6 +563,52 @@ impl CompletionState {
             let index = *index;
             self.tool_calls.remove(&index);
         }
+    }
+}
+
+fn thought_signature(extra: Option<Value>) -> Option<String> {
+    extra?
+        .get("google")?
+        .get("thought_signature")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn merge_thought_signature(
+    prior: &mut Option<String>,
+    extra: Option<Value>,
+) -> Result<(), LlmError> {
+    let Some(signature) = thought_signature(extra) else {
+        return Ok(());
+    };
+    if prior
+        .as_ref()
+        .is_some_and(|previous| *previous != signature)
+    {
+        // Signatures are opaque complete values, not text deltas.
+        return Err(LlmError::Request(
+            "conflicting streamed thought signatures".into(),
+        ));
+    }
+    *prior = Some(signature);
+    Ok(())
+}
+
+fn signature_fields(signature: Option<String>) -> Result<Option<prost_types::Struct>, LlmError> {
+    signature
+        .map(|signature| json_to_struct(json!({"google_thought_signature": signature})))
+        .transpose()
+}
+
+fn replay_thought_signature(value: &mut Map<String, Value>, fields: Option<&prost_types::Struct>) {
+    if let Some(signature) = fields
+        .map(struct_to_json)
+        .and_then(|mut fields| fields.as_object_mut()?.remove("google_thought_signature"))
+    {
+        value.insert(
+            "extra_content".into(),
+            json!({"google": {"thought_signature": signature}}),
+        );
     }
 }
 
@@ -561,7 +638,7 @@ fn merge_reasoning_detail(prior: &mut Value, detail: Value) {
     }
 }
 
-fn serialize_message(message: &chat_record::Message) -> Result<Value, LlmError> {
+fn serialize_message(message: &chat_record::Message, gemini: bool) -> Result<Value, LlmError> {
     match message {
         chat_record::Message::System(message) => {
             Ok(json!({"role": "system", "content": message.content}))
@@ -574,33 +651,38 @@ fn serialize_message(message: &chat_record::Message) -> Result<Value, LlmError> 
             "tool_call_id": message.tool_call_id,
             "content": message.content,
         })),
-        chat_record::Message::Assistant(message) => serialize_assistant(message),
+        chat_record::Message::Assistant(message) => serialize_assistant(message, gemini),
     }
 }
 
-fn serialize_assistant(message: &AssistantMessage) -> Result<Value, LlmError> {
+fn serialize_assistant(message: &AssistantMessage, gemini: bool) -> Result<Value, LlmError> {
     let mut value = Map::from_iter([("role".to_string(), json!("assistant"))]);
+    if gemini {
+        replay_thought_signature(&mut value, message.provider_fields.as_ref());
+    }
     if let Some(content) = &message.content {
         value.insert("content".to_string(), json!(content));
     }
-    // The Reflection API requires nonempty reasoning even when the model emitted none.
-    let reasoning_content = message
-        .reasoning_content
-        .as_deref()
-        .filter(|reasoning| !reasoning.is_empty())
-        .unwrap_or(" ");
-    value.insert("reasoning_content".to_string(), json!(reasoning_content));
-    if !message.reasoning_details.is_empty() {
-        value.insert(
-            "reasoning_details".to_string(),
-            Value::Array(
-                message
-                    .reasoning_details
-                    .iter()
-                    .map(struct_to_json)
-                    .collect(),
-            ),
-        );
+    if !gemini {
+        // The Reflection API requires nonempty reasoning even when the model emitted none.
+        let reasoning_content = message
+            .reasoning_content
+            .as_deref()
+            .filter(|reasoning| !reasoning.is_empty())
+            .unwrap_or(" ");
+        value.insert("reasoning_content".to_string(), json!(reasoning_content));
+        if !message.reasoning_details.is_empty() {
+            value.insert(
+                "reasoning_details".to_string(),
+                Value::Array(
+                    message
+                        .reasoning_details
+                        .iter()
+                        .map(struct_to_json)
+                        .collect(),
+                ),
+            );
+        }
     }
     if let Some(refusal) = &message.refusal {
         value.insert("refusal".to_string(), json!(refusal));
@@ -613,14 +695,21 @@ fn serialize_assistant(message: &AssistantMessage) -> Result<Value, LlmError> {
                 let function = call.function.as_ref().ok_or_else(|| {
                     LlmError::Request(format!("tool call {:?} has no function", call.id))
                 })?;
-                Ok(json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": function.name,
-                        "arguments": function.arguments,
-                    },
-                }))
+                let mut value = Map::from_iter([
+                    ("id".into(), json!(call.id)),
+                    ("type".into(), json!("function")),
+                    (
+                        "function".into(),
+                        json!({
+                            "name": function.name,
+                            "arguments": function.arguments,
+                        }),
+                    ),
+                ]);
+                if gemini {
+                    replay_thought_signature(&mut value, call.provider_fields.as_ref());
+                }
+                Ok(Value::Object(value))
             })
             .collect::<Result<Vec<_>, _>>()?;
         value.insert("tool_calls".to_string(), Value::Array(calls));
@@ -649,6 +738,14 @@ fn format_api_error(error: &ApiError) -> String {
     }
 }
 
+fn redact_key(detail: String, key: &str) -> String {
+    if key.is_empty() {
+        detail
+    } else {
+        detail.replace(key, "[REDACTED]")
+    }
+}
+
 fn request_error(model: &str, error: impl std::fmt::Display) -> LlmError {
     LlmError::Request(format!("{error} [model={model}]"))
 }
@@ -666,12 +763,15 @@ fn response_error(model: &str, detail: String) -> LlmError {
 
 #[cfg(test)]
 mod tests {
+    use crate::local::SQLiteStore;
     use crate::tools::ToolDefinition;
+    use crate::Store;
     use assert_matches::assert_matches;
     use mirror_protocol::InferenceConfig;
     use mirror_protocol::SystemMessage;
     use mirror_protocol::ToolMessage;
     use mirror_protocol::UserMessage;
+    use mirror_protocol::{agent_message, AgentMessage, ChatRecord};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -1022,7 +1122,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("test server");
         let address = listener.local_addr().expect("server address");
         let server = tokio::spawn(async move {
-            for detail in ["Invalid request", "Still invalid"] {
+            for detail in ["Invalid request", "Still invalid test-key"] {
                 let (mut socket, _) = listener.accept().await.expect("accept request");
                 let mut request = [0; 16384];
                 assert!(socket.read(&mut request).await.expect("read request") > 0);
@@ -1053,6 +1153,7 @@ mod tests {
         let result = stream.next().await.expect("request result");
         assert_matches!(result, Err(error) => {
             assert!(error.to_string().contains("Still invalid"));
+            assert!(!error.to_string().contains("test-key"));
         });
         assert!(stream.next().await.is_none());
         server.await.expect("server completed");
@@ -1071,9 +1172,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stream_state_assembles_text_tools_and_usage() {
+    #[tokio::test]
+    async fn streamed_tool_turn_preserves_cacheable_prefix_through_history_reload() {
         let first: ApiChunk = serde_json::from_value(json!({
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 3}},
             "choices": [{
                 "delta": {
                     "reasoning": "plan",
@@ -1091,26 +1194,40 @@ mod tests {
             "choices": [{
                 "delta": {
                     "content": "lo",
+                    "extra_content": {"google": {"thought_signature": "opaque-message-signature"}},
                     "tool_calls": [{
                         "index": 0,
                         "id": "1",
                         "function": {"name": "sh", "arguments": "\"ls\"}"},
+                        "extra_content": {"google": {"thought_signature": "opaque-tool-signature"}},
                     }],
                 },
                 "finish_reason": "tool_calls",
             }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }))
         .expect("second chunk is valid");
-        let mut state = CompletionState::default();
+        let footer: ApiChunk = serde_json::from_value(json!({
+            "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 7}},
+        }))
+        .expect("usage footer");
+        let mut state = CompletionState {
+            gemini: true,
+            ..Default::default()
+        };
 
         let first_events = state.apply(first).expect("first chunk applies");
         let second_events = state.apply(second).expect("second chunk applies");
+        assert_eq!(
+            state.apply(footer).expect("usage footer"),
+            vec![StreamEvent::OutputTokens(5)]
+        );
         let completion = state.finish().expect("stream completes");
 
         assert_eq!(
             first_events,
             vec![
+                StreamEvent::OutputTokens(2),
                 StreamEvent::Reasoning(StreamReasoning {
                     reasoning: "plan".to_string(),
                 }),
@@ -1127,7 +1244,6 @@ mod tests {
         assert_eq!(
             second_events,
             vec![
-                StreamEvent::OutputTokens(5),
                 StreamEvent::Content(StreamContent {
                     content: "lo".to_string(),
                 }),
@@ -1138,23 +1254,134 @@ mod tests {
                 }),
             ]
         );
-        assert_eq!(completion.message.content.as_deref(), Some("Hello"));
         assert_eq!(
-            completion.message.reasoning_content.as_deref(),
-            Some("plan")
+            completion.usage,
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cached_tokens: 7,
+                cache_write_tokens: 0,
+            })
         );
-        assert_eq!(completion.message.tool_calls[0].id, "call_1");
-        assert_eq!(
-            completion.message.tool_calls[0]
-                .function
-                .as_ref()
-                .expect("tool call has a function")
-                .name,
-            "bash"
+        let google = provider_with_base_url(super::super::model_provider::GEMINI_BASE_URL);
+        let mut request = effort_request("medium", None);
+        request.messages.insert(
+            0,
+            chat_record::Message::System(SystemMessage {
+                content: "stable instructions".into(),
+            }),
         );
+        request.messages.extend([
+            chat_record::Message::Assistant(completion.message.clone()),
+            chat_record::Message::Tool(ToolMessage {
+                tool_call_id: "call_1".into(),
+                content: "README.md".into(),
+                name: Some("bash".into()),
+            }),
+        ]);
+        request.tools.push(ToolDefinition {
+            name: "bash".into(),
+            description: "Run a command".into(),
+            parameters: serde_json::from_value(
+                json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+            )
+            .expect("schema"),
+        });
+        let before = google
+            .request_body(request.clone())
+            .expect("tool continuation");
         assert_eq!(
-            completion.usage.expect("usage is present").prompt_tokens,
-            10
+            before["messages"][2],
+            json!({
+                "role": "assistant", "content": "Hello",
+                "extra_content": {"google": {"thought_signature": "opaque-message-signature"}},
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"},
+                    "extra_content": {"google": {"thought_signature": "opaque-tool-signature"}}}],
+            })
+        );
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("history.db");
+        let mut store = SQLiteStore::open(&database, "session", directory.path(), true, false)
+            .expect("create history");
+        store
+            .append(
+                "session",
+                0,
+                &mut [AgentMessage {
+                    payload: Some(agent_message::Payload::Chat(ChatRecord {
+                        message: Some(chat_record::Message::Assistant(completion.message)),
+                        success: true,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("save assistant");
+        drop(store);
+        let mut store = SQLiteStore::open(&database, "session", directory.path(), false, false)
+            .expect("reopen history");
+        let restored = store.load("session", true).await.expect("load history");
+        request.messages[2] = restored[0].chat_message().expect("assistant").clone();
+        request
+            .messages
+            .push(chat_record::Message::User(UserMessage {
+                content: "What next?".into(),
+                checkpoint: None,
+            }));
+        let after = google
+            .request_body(request.clone())
+            .expect("resumed request");
+        assert_eq!(
+            &after["messages"].as_array().expect("messages")[..4],
+            before["messages"].as_array().expect("messages")
+        );
+        assert_eq!(after["tools"], before["tools"]);
+        assert_eq!(after["reasoning_effort"], before["reasoning_effort"]);
+        assert_eq!(after.get("cache_control"), None);
+        for endpoint in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            crate::providers::reflection::REFLECTION_BASE_URL,
+        ] {
+            let body = provider_with_base_url(endpoint)
+                .request_body(request.clone())
+                .expect("switch endpoint");
+            assert_eq!(
+                body["messages"][2],
+                json!({
+                    "role": "assistant", "content": "Hello", "reasoning_content": "plan",
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}],
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn stream_state_validates_signatures_only_for_google() {
+        let mut google = CompletionState {
+            gemini: true,
+            ..Default::default()
+        };
+        let mut other = CompletionState::default();
+        let chunk = || {
+            serde_json::from_value::<ApiChunk>(json!({
+            "choices": [{"delta": {"extra_content": {"google": {"thought_signature": "signature"}}}}],
+        })).expect("chunk")
+        };
+        google.apply(chunk()).expect("first signature");
+        google.apply(chunk()).expect("repeated complete signature");
+        other.apply(chunk()).expect("foreign metadata");
+        let conflict = || {
+            serde_json::from_value::<ApiChunk>(json!({
+            "choices": [{"delta": {"extra_content": {"google": {"thought_signature": "different"}}}, "finish_reason": "stop"}],
+        })).expect("chunk")
+        };
+        assert_matches!(google.apply(conflict()), Err(LlmError::Request(_)));
+        other.apply(conflict()).expect("ignored foreign signature");
+        assert_eq!(
+            other.finish().expect("completion").message.provider_fields,
+            None
         );
     }
 
@@ -1238,7 +1465,9 @@ mod tests {
                 "prompt_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2}},
         }))
         .expect("complete response");
-        let completion = response.finish("test-model").expect("refusal completion");
+        let completion = response
+            .finish("test-model", false)
+            .expect("refusal completion");
         assert_eq!(completion.message.refusal.as_deref(), Some("Cannot help"));
         assert_eq!(
             completion.message.reasoning_content.as_deref(),
@@ -1269,7 +1498,9 @@ mod tests {
             }],
         }))
         .expect("truncated response");
-        let completion = response.finish("test-model").expect("truncated completion");
+        let completion = response
+            .finish("test-model", false)
+            .expect("truncated completion");
         assert!(completion.truncated);
         assert_eq!(completion.message.tool_calls.len(), 1);
         assert_eq!(completion.message.tool_calls[0].id, "first");
@@ -1283,7 +1514,7 @@ mod tests {
         }))
         .expect("error response");
         assert_matches!(
-            response.finish("test-model"),
+            response.finish("test-model", false),
             Err(LlmError::ContextOverflow(_))
         );
     }
@@ -1292,7 +1523,7 @@ mod tests {
     fn non_streaming_completion_rejects_empty_choices() {
         let response: ApiCompletion =
             serde_json::from_value(json!({"choices": []})).expect("empty response");
-        assert_matches!(response.finish("test-model"), Err(LlmError::Request(message))
+        assert_matches!(response.finish("test-model", false), Err(LlmError::Request(message))
             if message.contains("no choices"));
     }
 
@@ -1302,7 +1533,7 @@ mod tests {
             "choices": [{"message": {"content": "unfinished"}}],
         }))
         .expect("unfinished response");
-        assert_matches!(response.finish("test-model"), Err(LlmError::Request(message))
+        assert_matches!(response.finish("test-model", false), Err(LlmError::Request(message))
             if message.contains("without a finish reason"));
     }
 

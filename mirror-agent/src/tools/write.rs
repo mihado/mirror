@@ -121,7 +121,7 @@ impl Tool for WriteTool {
     }
 }
 
-pub(super) fn format_result(before: &str, args: &WriteArgs) -> ToolOutput {
+pub(crate) fn format_result(before: &str, args: &WriteArgs) -> ToolOutput {
     let diff = super::diff::unified_diff(before, &args.content, &args.file_path);
     let written = args.content.lines().count();
     let mut result = ToolOutput::success(format!("Wrote {written} line(s) to {}.", args.file_path));

@@ -25,6 +25,8 @@ message CallToolRequest {
   string session_id = 1;
   string name = 2;
   string arguments = 3;
+  // Per-call local selection; omission uses the active session setting.
+  optional string web_provider = 4;
 }
 
 message CallToolResponse {
@@ -52,7 +54,14 @@ message ClientMessage {
     AgentMessage message = 11;
     // Compact an idle conversation without adding a user message or model turn.
     google.protobuf.Empty compact = 12;
+    // Local retrieval selection, independent of model inference settings.
+    SetWebProvider set_web_provider = 13;
   }
+}
+
+message SetWebProvider {
+  // One of you, tavily, or firecrawl. Never contains credentials.
+  string provider = 1;
 }
 
 message InferenceConfig {
@@ -72,6 +81,8 @@ message InferenceConfig {
   optional string extra_body = 8;
 }
 
+// Stops the running turn. Inputs queued behind it are kept, and queued user
+// messages immediately start the next turn.
 message Interrupt {}
 
 message CancelTask {
@@ -148,6 +159,7 @@ message InputNack {
 
 message HITLRequest {
   ToolCall call = 1;
+  bool always_ask = 2;
 }
 
 message HITLResolved {
@@ -156,6 +168,9 @@ message HITLResolved {
 }
 
 message RuntimeDelta {
+  // Present on turn_started from workers that support turn identity.
+  optional string turn_id = 15;
+
   oneof payload {
     StreamContent stream_content = 1;
     StreamReasoning stream_reasoning = 2;
@@ -237,6 +252,8 @@ message TaskUpdate {
   google.protobuf.Timestamp started_at = 5;
   google.protobuf.Timestamp ended_at = 6;
   bool detached = 7;
+  // Display-only child events; never part of the parent's conversation history.
+  repeated SessionMessage messages = 8;
 }
 
 message TurnError {
@@ -270,6 +287,7 @@ message AgentMessage {
     ExtensionRecord extension = 10;
     ContextWindowRecord context_window = 11;
     ToolApprovalRecord tool_approval = 13;
+    ForkRecord fork = 15;
   }
 
   // Facts the harness records about the entry beside its content; never shown
@@ -278,6 +296,17 @@ message AgentMessage {
 
   // The inference settings used by the model call that produced this record.
   optional InferenceConfig inference = 8;
+
+  optional string turn_id = 14;
+}
+
+// Child-local workspace fork provenance; context only, never starts a model turn.
+message ForkRecord {
+  string parent_session_id = 1;
+  // Inclusive inherited boundary; zero for an empty parent trace.
+  uint64 inherited_sequence = 2;
+  string source_workspace = 3;
+  string destination_workspace = 4;
 }
 
 // Approval of a model-issued action; arguments and provider payloads are never copied here.
@@ -309,7 +338,8 @@ enum ApprovalSource {
 }
 
 message ChatRecord {
-  reserved 8, 12;
+  reserved 8, 9, 12;
+  reserved "rewind_to";
 
   oneof message {
     SystemMessage system = 1;
@@ -321,7 +351,6 @@ message ChatRecord {
   optional Usage usage = 5;
   optional string display = 6;
   bool success = 7;
-  optional string rewind_to = 9;
   // Whether the model stopped because it reached its completion limit.
   bool truncated = 10;
   optional SamplingInfo sampling = 11;
@@ -393,13 +422,15 @@ message ToolMessage {
   optional string name = 3;
 }
 
-// Facts a tool reported about what it did, kept beside its result.
+// Tool and execution facts kept beside the result.
 message MetadataRecord {
   // Paths the tool reported touching, relative to its workspace root, with
   // their kind. Empty when the tool has no filesystem footprint of its own.
   repeated TouchedPath touched = 1;
   // Exit code of the command the tool ran, when it ran one to completion.
   optional int32 exit_code = 2;
+  // Elapsed tool invocation time, ending when its result is returned.
+  optional double tool_duration_seconds = 3;
 }
 
 // A path a tool touched, reported by the tool itself.

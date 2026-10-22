@@ -15,6 +15,15 @@ from mirror.cli.components import component
 class Queued(component.Component):
   """Local submissions not yet observed in authoritative history."""
 
+  @override
+  def cache_key(self, state: state.State) -> object:
+    return (
+      state.turn.pending_instructions,
+      self._skip_first(),
+      state.layout.columns,
+      themes.current(state.extensions, state.extension_themes),
+    )
+
   def __init__(self, *, skip_first: Callable[[], bool] = lambda: False) -> None:
     self._skip_first = skip_first
 

@@ -22,6 +22,7 @@ from rich import cells, color, console, styled, text
 
 from mirror.cli import (
   actions,
+  code_layout,
   hyperlinks,
   rendering,
   screen_selection,
@@ -55,11 +56,15 @@ class Position:
   part: int = 0
 
 
+type RowPosition = tuple[str, tuple[int, int], int, int]
+
 type _Row = tuple[formatted_text.OneStyleAndTextTuple, ...]
 type _Rows = tuple[_Row, ...]
 type _LayoutKey = tuple[
   str, tuple[int, int], int, int, str | themes.Theme, int, bool
 ]
+type _LayoutIdentity = tuple[str, int, int, str | themes.Theme, int, bool]
+type _Layout = tuple[tuple[int, int], _Rows, int]
 
 
 def _presentation(blocks: Sequence[transcript.Block]) -> int | None:
@@ -171,6 +176,7 @@ class TranscriptView(screen_selection.HoverControl):
     if max_cache_bytes < 0:
       raise ValueError('max_cache_bytes must be nonnegative')
     self._max_cache_bytes = max_cache_bytes
+    self._code_layout = code_layout.CodeLayout()
     self._source = source
     self._pending = pending
     self._navigate = navigate or self.navigate
@@ -178,6 +184,8 @@ class TranscriptView(screen_selection.HoverControl):
     self._theme_name = theme_name
     self._anchor: Position | None = None
     self._anchor_index = 0
+    self._pending_scroll: collections.deque[int] = collections.deque()
+    self._scroll_heights: dict[_LayoutKey, int] = {}
     self._width = 0
     self._height = 0
     self._blocks: Sequence[transcript.Block] = ()
@@ -187,7 +195,7 @@ class TranscriptView(screen_selection.HoverControl):
     self._live_snapshot: tuple[transcript.Block, ...] = ()
     self._live_revision = 0
     self._settling_line: tuple[str, int, int, bool] | None = None
-    self._cache: collections.OrderedDict[_LayoutKey, tuple[_Rows, int]] = (
+    self._cache: collections.OrderedDict[_LayoutIdentity, _Layout] = (
       collections.OrderedDict()
     )
     self._expanded: set[str] = set()
@@ -198,22 +206,28 @@ class TranscriptView(screen_selection.HoverControl):
     self._copy_label = 'Copied'
     self._copy_until = 0.0
     self._visible: _Rows = ()
+    self._prepared_positions: tuple[RowPosition, ...] = ()
+    self._visible_positions: tuple[RowPosition, ...] = ()
     self._cache_bytes = 0
     self._render_task: asyncio.Task[None] | None = None
     self._render_needed: tuple[transcript.Block, _LayoutKey] | None = None
     self._layout_ready = True
     self._generation = 0
-    # The cache budget excludes transient rendering and the visible row slice.
-    # Keep both sides of a boundary, not every layout crossed by a large jump.
-    self._oversized: collections.deque[tuple[_LayoutKey, _Rows]] = (
-      collections.deque(maxlen=2)
-    )
+    # Paint-local layouts survive eviction from the byte-bounded history cache.
+    self._layouts: dict[_LayoutIdentity, _Layout] = {}
+    self._used_layouts: set[_LayoutIdentity] = set()
     self._header_height = 0
     self._user_position: tuple[int, int, int | None] | None = None
     self._summary: tuple[str, int, str] | None = None
 
   def _remember_line(
-    self, index: int, part: int, row: int, first: int | None = None
+    self,
+    index: int,
+    part: int,
+    row: int,
+    first: int | None = None,
+    *,
+    from_end: bool = False,
   ) -> None:
     """Locate reading content across rewrapping and preview settlement."""
     rows = self._rows(index, part)
@@ -239,6 +253,9 @@ class TranscriptView(screen_selection.HoverControl):
       if pattern
       else 0
     )
+    if from_end:
+      following = '\n'.join(map(_plain, rows[target_row + 1 :]))
+      occurrence = -1 - sum(1 for _ in re.finditer(pattern, following))
     self._settling_line = (
       pattern,
       occurrence,
@@ -296,11 +313,15 @@ class TranscriptView(screen_selection.HoverControl):
 
   def follow(self) -> None:
     """Resume following the latest conversation output."""
+    self._pending_scroll.clear()
+    self._scroll_heights.clear()
     self._anchor = None
     self._settling_line = None
 
   def first(self) -> None:
     """Reach the oldest entry without formatting the intervening history."""
+    self._pending_scroll.clear()
+    self._scroll_heights.clear()
     if self._blocks:
       self._anchor_index = 0
       self._settling_line = None
@@ -316,52 +337,86 @@ class TranscriptView(screen_selection.HoverControl):
     self.clear_hover()
     self._copied_style = None
     self._visible = ()
+    self._prepared_positions = self._visible_positions = ()
     self._anchor = None
     self._anchor_index = 0
+    self._pending_scroll.clear()
+    self._scroll_heights.clear()
     self._settling_line = None
     self._expanded.clear()
     self._cache.clear()
     self._cache_bytes = 0
     self._summary = None
     self._generation += 1
-    self._oversized.clear()
+    self._layouts.clear()
+    self._used_layouts.clear()
     self._blocks = self._settled_snapshot = self._pending_snapshot = ()
     self._live_snapshot = ()
     self._live_source = ()
     self._user_position = None
 
+  async def close(self) -> None:
+    """Release pending layouts when the conversation is closed."""
+    self.clear()
+    if self._render_task is not None:
+      self._render_task.cancel()
+      await asyncio.gather(self._render_task, return_exceptions=True)
+
   @contextlib.contextmanager
   def _layout_pass(self) -> Generator[None]:
-    """Reuse oversized boundary layouts until the pending layout is painted."""
+    """Retain only layouts still needed by the current paint or its retries."""
     self._layout_ready = True
+    self._used_layouts.clear()
     try:
       yield
     finally:
-      if self._layout_ready:
-        self._oversized.clear()
+      self._layouts = {
+        identity: layout
+        for identity, layout in self._layouts.items()
+        if identity in self._used_layouts
+      }
+      self._used_layouts.clear()
 
-  def _rows(self, index: int, part: int) -> _Rows:
+  def _layout_key(self, index: int, part: int) -> _LayoutKey:
     block = self._blocks[index]
-    renderable = block.parts[part]
-    # Match inline scrollback: one empty row between blocks or Markdown parts.
-    padding = 1
-    theme_name = self._theme_name()
-    key = (
+    return (
       block.key,
       block.revision,
       part,
       self._width,
-      theme_name,
-      padding,
+      self._theme_name(),
+      1,  # Match inline scrollback's empty row between blocks or Markdown parts.
       block.key in self._expanded,
     )
-    cached = self._cache.get(key)
+
+  def _row_count(self, index: int, part: int) -> int:
+    """Keep navigation heights across misses without pinning evictable rows."""
+    if not self._pending_scroll:
+      return len(self._rows(index, part))
+    key = self._layout_key(index, part)
+    height = self._scroll_heights.get(key)
+    if height is None:
+      height = len(self._rows(index, part))
+      # Missing layouts and stale-paint fallbacks are not authoritative heights.
+      if self._layout_ready and self._render_needed is None:
+        self._scroll_heights[key] = height
+        self._layouts.pop((key[0], *key[2:]), None)
+    return height
+
+  def _rows(self, index: int, part: int) -> _Rows:
+    block = self._blocks[index]
+    renderable = block.parts[part]
+    key = self._layout_key(index, part)
+    padding = key[5]
+    identity = (key[0], *key[2:])
+    self._used_layouts.add(identity)
+    cached = self._layouts.get(identity) or self._cache.get(identity)
     if cached is not None:
-      self._cache.move_to_end(key)
-      return cached[0]
-    for oversized_key, oversized_rows in self._oversized:
-      if oversized_key == key:
-        return oversized_rows
+      self._layouts[identity] = cached
+      if identity in self._cache:
+        self._cache.move_to_end(identity)
+      if cached[0] == block.revision:
+        return cached[1]
     app = current.get_app_or_none()
     # Input geometry and plain status decorations must be available immediately.
     if (
@@ -371,18 +426,29 @@ class TranscriptView(screen_selection.HoverControl):
     ):
       self._render_needed = self._render_needed or (block, key)
       # Keep the last painted revision while formatting the newest snapshot.
-      for previous, (rows, _) in reversed(self._cache.items()):
-        if previous[0] == key[0] and previous[2:] == key[2:]:
-          return rows
-      for previous, rows in reversed(self._oversized):
-        if previous[0] == key[0] and previous[2:] == key[2:]:
-          return rows
+      if cached is not None:
+        return cached[1]
       self._render_needed = (block, key)
       self._layout_ready = False
       return ((),) * padding
     rows, size = self._render_block(block, key, next(self._copy_ids))
     self._remember_rows(key, rows, size)
     return rows
+
+  def refresh(self) -> bool:
+    """Format changed visible content before requesting its next paint."""
+    app = current.get_app_or_none()
+    if app is None or not app.is_running or not self._width or not self._height:
+      return False
+    with self._layout_pass():
+      visible, header_height = self._prepare_content(self._width, self._height)
+    if self._render_needed is not None:
+      self._schedule_render()
+    elif self._layout_ready and (
+      visible != self._visible or header_height != self._header_height
+    ):
+      workspace_application.invalidate_transcript()
+    return True
 
   def _schedule_render(self) -> None:
     # One render at a time; prioritize unseen parts over refreshing live text.
@@ -396,31 +462,48 @@ class TranscriptView(screen_selection.HoverControl):
     self, block: transcript.Block, key: _LayoutKey, generation: int
   ) -> None:
     try:
-      # Rich layout and ANSI decoding must not hold up input or RPC cancellation.
-      rows, size = await asyncio.to_thread(
-        self._render_block, block, key, next(self._copy_ids)
-      )
-      if generation == self._generation:
+      # Rich layout must not hold up input or RPC cancellation.
+      for _ in range(max(1, self._height)):
+        rows, size = await asyncio.to_thread(
+          self._render_block, block, key, next(self._copy_ids)
+        )
+        if generation != self._generation:
+          break
         self._remember_rows(key, rows, size)
+        # Discover the next miss without waiting for a repaint of unchanged rows.
+        with self._layout_pass():
+          visible, header_height = self._prepare_content(
+            self._width, self._height
+          )
+        if self._layout_ready and (
+          visible != self._visible or header_height != self._header_height
+        ):
+          workspace_application.invalidate_transcript()
+        if self._render_needed is None:
+          break
+        block, key = self._render_needed
     finally:
       self._render_task = None
-      current.get_app().invalidate()
+      workspace_application.invalidate_transcript()
 
   def _remember_rows(self, key: _LayoutKey, rows: _Rows, size: int) -> None:
+    identity = (key[0], *key[2:])
+    self._layouts[identity] = layout = (key[1], rows, size)
     if size > self._max_cache_bytes:
-      self._oversized.append((key, rows))
       return
-    self._cache[key] = (rows, size)
+    # Retain only the latest revision per shape, including its stale-paint fallback.
+    previous = self._cache.pop(identity, None)
+    if previous is not None:
+      self._cache_bytes -= previous[2]
+    self._cache[identity] = layout
     self._cache_bytes += size
     while self._cache and (
-      len(self._cache) > max(64, 2 * self._height)
-      or self._cache_bytes + sys.getsizeof(self._cache) > self._max_cache_bytes
+      self._cache_bytes + sys.getsizeof(self._cache) > self._max_cache_bytes
     ):
-      _, (_, removed_size) = self._cache.popitem(last=False)
+      _, (_, _, removed_size) = self._cache.popitem(last=False)
       self._cache_bytes -= removed_size
     if not self._cache:
       self._cache.clear()
-      self._oversized.append((key, rows))
 
   def _render_block(
     self, block: transcript.Block, key: _LayoutKey, copy_id: int
@@ -438,6 +521,12 @@ class TranscriptView(screen_selection.HoverControl):
       theme_name=theme,
       interactive=not block.key.startswith('live:'),
     )
+    if block.key.startswith('live:') and isinstance(content, rendering.Answer):
+      retained = self._code_layout.render(
+        content, painter, width, padding, theme == 'mono'
+      )
+      if retained is not None:
+        return retained
     fragments: formatted_text.StyleAndTextTuples = []
     marker = ''
     handlers: dict[bool, Callable[[mouse_events.MouseEvent], None]] = {}
@@ -458,13 +547,13 @@ class TranscriptView(screen_selection.HoverControl):
       if rich_style:
         if theme == 'mono':
           rich_style = rich_style.without_color
-        value = rich_style.render(
-          value,
-          color_system=color.ColorSystem.STANDARD
-          if theme == 'terminal'
-          else color.ColorSystem.TRUECOLOR,
-        )
-      decoded = formatted_text.to_formatted_text(hyperlinks.ANSI(value))
+      decoded = hyperlinks.from_rich(
+        value,
+        rich_style,
+        color.ColorSystem.STANDARD
+        if theme == 'terminal'
+        else color.ColorSystem.TRUECOLOR,
+      )
       if marker and any(
         key in metadata
         for key in ('copy_code', 'code_block', 'code_action', 'code_hint')
@@ -502,13 +591,16 @@ class TranscriptView(screen_selection.HoverControl):
         self._expanded.remove(key)
       else:
         self._expanded.add(key)
+        # At the bottom edge, opening would otherwise show only the preview.
+        if event.position.y >= self._height - 3:
+          self._anchor = Position(key, 0)
 
   @override
   def clear_hover(self) -> None:
     if self._hovered_style is not None:
       self._hovered_style = None
       self._hovered_action = False
-      current.get_app().invalidate()
+      workspace_application.invalidate_transcript()
 
   def _code_event(
     self, text: str, style: str, action: bool, event: mouse_events.MouseEvent
@@ -542,6 +634,8 @@ class TranscriptView(screen_selection.HoverControl):
   def _move(
     self, index: int, part: int, row: int, amount: int
   ) -> tuple[int, int, int]:
+    if not self._layout_ready:
+      return index, part, row
     row += amount
     while row < 0 and (index > 0 or part > 0):
       if part > 0:
@@ -549,24 +643,26 @@ class TranscriptView(screen_selection.HoverControl):
       else:
         index -= 1
         part = len(self._blocks[index].parts) - 1
-      row += len(self._rows(index, part))
-    while row >= len(self._rows(index, part)):
+      row += self._row_count(index, part)
+      if not self._layout_ready:
+        return index, part, 0
+    while row >= self._row_count(index, part) and self._layout_ready:
       if part + 1 < len(self._blocks[index].parts):
-        row -= len(self._rows(index, part))
+        row -= self._row_count(index, part)
         part += 1
       elif index + 1 < len(self._blocks):
-        row -= len(self._rows(index, part))
+        row -= self._row_count(index, part)
         index, part = index + 1, 0
       else:
         break
-    return index, part, max(0, min(row, len(self._rows(index, part)) - 1))
+    return index, part, max(0, min(row, self._row_count(index, part) - 1))
 
   def _start(self) -> tuple[int, int, int]:
     if self._anchor is None:
       index = len(self._blocks) - 1
       part = len(self._blocks[index].parts) - 1
       return self._move(
-        index, part, len(self._rows(index, part)) - 1, -self._height + 1
+        index, part, self._row_count(index, part) - 1, -self._height + 1
       )
     index = self._anchor_index
     if (
@@ -591,11 +687,10 @@ class TranscriptView(screen_selection.HoverControl):
         return index, part, 0
       self._settling_line = None
       text = '\n'.join(map(_plain, itertools.chain.from_iterable(rows)))
+      matches = list(re.finditer(pattern, text)) if pattern else []
       match = (
-        next(
-          itertools.islice(re.finditer(pattern, text), occurrence, None), None
-        )
-        if pattern
+        matches[occurrence]
+        if -len(matches) <= occurrence < len(matches)
         else None
       )
       if match is not None:
@@ -606,7 +701,7 @@ class TranscriptView(screen_selection.HoverControl):
             self._anchor = Position(self._blocks[index].key, row, part)
             break
           row -= len(chunk)
-    return index, part, min(self._anchor.row, len(self._rows(index, part)) - 1)
+    return index, part, min(self._anchor.row, self._row_count(index, part) - 1)
 
   def _owner(
     self, index: int, part: int, row: int
@@ -658,21 +753,41 @@ class TranscriptView(screen_selection.HoverControl):
     return (
       end_index == len(self._blocks) - 1
       and end_part == len(self._blocks[end_index].parts) - 1
-      and end_row == len(self._rows(end_index, end_part)) - 1
+      and end_row == self._row_count(end_index, end_part) - 1
     )
 
   def scroll(self, rows: int) -> None:
     """Move by terminal rows, resuming following when the final row is visible."""
     self.clear_hover()
-    if not self._blocks or (rows > 0 and self._anchor is None):
+    if not self._blocks or (
+      rows > 0 and self._anchor is None and not self._pending_scroll
+    ):
       return
+    self._pending_scroll.append(rows)
     with self._layout_pass():
-      index, part, row = self._move(*self._content_start(), rows)
-      if self._shows_last_row(index, part, row):
-        self.follow()
+      self._apply_scroll()
+
+  def _apply_scroll(self) -> None:
+    """Retry navigation in order, never treating a missing layout as one row."""
+    if not self._blocks:
+      self._pending_scroll.clear()
+    while self._pending_scroll:
+      index, part, row = self._move(
+        *self._content_start(), self._pending_scroll[0]
+      )
+      if not self._layout_ready:
         return
-      self._anchor_index = index
-      self._anchor = Position(self._blocks[index].key, row, part)
+      follows = self._shows_last_row(index, part, row)
+      if not self._layout_ready:
+        return
+      self._pending_scroll.popleft()
+      if follows:
+        self._anchor = None
+        self._settling_line = None
+      else:
+        self._anchor_index = index
+        self._anchor = Position(self._blocks[index].key, row, part)
+    self._scroll_heights.clear()
 
   def page(self, direction: int) -> None:
     """Scroll one viewport, retaining a row of context."""
@@ -690,9 +805,9 @@ class TranscriptView(screen_selection.HoverControl):
       case 'latest':
         self.follow()
       case 'up':
-        self.scroll(-3)
+        self.scroll(-action.rows)
       case 'down':
-        self.scroll(3)
+        self.scroll(action.rows)
 
   def _refresh_blocks(self) -> None:
     settled = self._source()
@@ -736,6 +851,22 @@ class TranscriptView(screen_selection.HoverControl):
       first, last, user = self._user_position
       last = min(last, len(settled) + len(pending) - 1)
       self._user_position = (first, last, user) if first <= last else None
+    if self._anchor is not None and self._settling_line is None:
+      for previous, replacement in zip(self._live_snapshot, live_blocks):
+        before, after = previous.renderable, replacement.renderable
+        if (
+          previous.key == self._anchor.block
+          and isinstance(before, rendering.Answer)
+          and before.truncated
+          and isinstance(after, rendering.Answer)
+          and not after.truncated
+        ):
+          index = next(
+            i for i, block in enumerate(self._blocks) if block is previous
+          )
+          self._remember_line(
+            index, self._anchor.part, self._anchor.row, from_end=True
+          )
     self._live_snapshot = tuple(live_blocks)
     self._settled_snapshot = settled
     self._pending_snapshot = pending
@@ -763,45 +894,74 @@ class TranscriptView(screen_selection.HoverControl):
     self._user_position = (user or 0, index, user)
     return user
 
+  def _prepare_content(self, width: int, height: int) -> tuple[_Rows, int]:
+    """Discover missing layouts without publishing unpainted rows to the mouse."""
+    if (
+      width != self._width
+      and self._anchor is not None
+      and self._blocks
+      and self._settling_line is None
+    ):
+      self._remember_line(*self._start())
+    if (width, height) != (self._width, self._height):
+      self.clear_hover()
+    self._render_needed = None
+    self._layout_ready = True
+    self._width, self._height = max(1, width), max(1, height)
+    self._refresh_blocks()
+    self._apply_scroll()
+    scroll_needed = self._render_needed
+    # Paint the resolved anchor while further navigation awaits its geometry.
+    self._render_needed = None
+    self._layout_ready = True
+    visible: list[_Row] = []
+    positions: list[RowPosition] = []
+    header_height = 0
+    if self._blocks:
+      index, part, row = self._start()
+      owner = self._owner(index, part, row)
+      header = () if owner is None else self._header(owner)
+      header_height = len(header)
+      if self._anchor is None:
+        index, part, row = self._move(index, part, row, len(header))
+      visible.extend(header)
+      while len(visible) < height and index < len(self._blocks):
+        rows = self._rows(index, part)
+        while row < len(rows) and len(visible) < height:
+          visible.append(rows[row])
+          block = self._blocks[index]
+          positions.append((block.key, block.revision, part, row))
+          row += 1
+        if part + 1 < len(self._blocks[index].parts):
+          part, row = part + 1, 0
+        else:
+          index, part, row = index + 1, 0, 0
+    # Live revisions must not starve the geometry needed by queued navigation.
+    self._render_needed = scroll_needed or self._render_needed
+    self._prepared_positions = tuple(positions)
+    return tuple(visible), header_height
+
+  def scrolling_positions(self) -> tuple[RowPosition, ...]:
+    """Identify painted body rows without comparing their terminal cells."""
+    return self._visible_positions
+
+  def scrolling_range(self) -> range:
+    """Return movable painted rows, even while their replacement is prepared."""
+    return range(self._header_height, len(self._visible))
+
   @override
   def create_content(self, width: int, height: int) -> controls.UIContent:
     with self._layout_pass():
-      if (
-        width != self._width
-        and self._anchor is not None
-        and self._blocks
-        and self._settling_line is None
-      ):
-        self._remember_line(*self._start())
-      if (width, height) != (self._width, self._height):
-        self.clear_hover()
-      self._render_needed = None
-      self._layout_ready = True
-      self._width, self._height = max(1, width), max(1, height)
-      self._refresh_blocks()
-      visible: list[_Row] = []
-      self._header_height = 0
-      if self._blocks:
-        index, part, row = self._start()
-        owner = self._owner(index, part, row)
-        header = () if owner is None else self._header(owner)
-        self._header_height = len(header)
-        if self._anchor is None:
-          index, part, row = self._move(index, part, row, len(header))
-        visible.extend(header)
-        while len(visible) < height and index < len(self._blocks):
-          rows = self._rows(index, part)
-          while row < len(rows) and len(visible) < height:
-            visible.append(rows[row])
-            row += 1
-          if part + 1 < len(self._blocks[index].parts):
-            part, row = part + 1, 0
-          else:
-            index, part, row = index + 1, 0, 0
-      snapshot = tuple(visible) if self._layout_ready else self._visible
+      visible, header_height = self._prepare_content(width, height)
+      if self._layout_ready:
+        self._header_height = header_height
+        self._visible_positions = self._prepared_positions
+      snapshot = visible if self._layout_ready else self._visible
       if snapshot != self._visible:
         self.clear_hover()
       self._visible = snapshot
+      if self._layout_ready and self._render_needed is None:
+        self._layouts.clear()
       self._schedule_render()
       return controls.UIContent(
         get_line=lambda index: self._display_row(snapshot[index]),
@@ -850,9 +1010,9 @@ class TranscriptView(screen_selection.HoverControl):
     if mouse_event.event_type == mouse_events.MouseEventType.MOUSE_MOVE:
       self.clear_hover()
     if mouse_event.event_type == mouse_events.MouseEventType.SCROLL_UP:
-      self._navigate(actions.NavigateHistory('up'))
+      self._navigate(actions.NavigateHistory('up', rows=1))
     elif mouse_event.event_type == mouse_events.MouseEventType.SCROLL_DOWN:
-      self._navigate(actions.NavigateHistory('down'))
+      self._navigate(actions.NavigateHistory('down', rows=1))
     elif 0 <= mouse_event.position.y < len(self._visible):
       column = 0
       for fragment in self._visible[mouse_event.position.y]:
@@ -863,4 +1023,4 @@ class TranscriptView(screen_selection.HoverControl):
           fragment[2](mouse_event)
           break
         column = end
-    current.get_app().invalidate()
+    workspace_application.invalidate_transcript()

@@ -1,10 +1,12 @@
 //! Streaming OpenAI Responses API model provider.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
 use futures_core::Stream;
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use mirror_protocol::chat_record;
 use mirror_protocol::AssistantMessage;
@@ -18,6 +20,7 @@ use mirror_protocol::Usage;
 use prost_types::value::Kind;
 use prost_types::Struct;
 use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -29,7 +32,10 @@ use super::Llm;
 use super::LlmError;
 use super::ModelApi;
 use super::ModelRequestGuard;
+use super::ResponsesWebSocket;
 use super::StreamEvent;
+use super::WebSocketEvent;
+use super::WebSocketTarget;
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
 
@@ -51,6 +57,8 @@ pub struct ResponsesConfig {
     pub api_key: String,
     pub base_url: String,
     pub prompt_cache_key: Option<String>,
+    /// The session's WebSocket connection, for endpoints that serve it.
+    pub websocket: Option<ResponsesWebSocket>,
 }
 
 impl ResponsesClient {
@@ -150,40 +158,19 @@ impl ResponsesClient {
         bearer_token: String,
         guard: Option<&'a dyn ModelRequestGuard>,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + 'a {
-        let client = self.client.clone();
-        let endpoint = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let request = self.http_request(headers, bearer_token);
+        let websocket = self.config.websocket.clone();
         let model = self.config.model.clone();
         try_stream! {
             let body = body?;
             if let Some(guard) = guard {
                 guard.verify().await?;
             }
-            let response = client
-                .post(endpoint)
-                .headers(headers)
-                .header(reqwest::header::ACCEPT, "text/event-stream")
-                .bearer_auth(bearer_token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| request_error(&model, error))?;
-            let response = if response.status().is_success() {
-                response
-            } else {
-                let status = response.status();
-                let detail = response.text().await.unwrap_or_default();
-                Err(response_error(&model, format!("{status}: {detail}")))?
-            };
+            let (mut payloads, transport) = event_payloads(websocket.as_ref(), request, body).await?;
 
             let mut completed_items = Vec::new();
-            let mut events = response.bytes_stream().eventsource();
-            while let Some(event) = events.next().await {
-                let payload = event
-                    .map_err(|error| request_error(&model, error))?
-                    .data;
-                if payload == "[DONE]" {
-                    continue;
-                }
+            while let Some(payload) = payloads.next().await {
+                let payload = payload?;
                 let event: ApiEvent = serde_json::from_str(&payload)
                     .map_err(|error| request_error(&model, error))?;
                 if event.kind == "error" || event.kind == "response.failed" {
@@ -205,7 +192,11 @@ impl ResponsesClient {
                     if final_response.output.is_empty() {
                         final_response.output = completed_items;
                     }
-                    yield StreamEvent::Final(build_completion(final_response)?);
+                    let mut completion = build_completion(final_response)?;
+                    if let Some(transport) = transport {
+                        record_transport(&mut completion.message, transport);
+                    }
+                    yield StreamEvent::Final(completion);
                     return;
                 }
                 if let Some(partial) = stream_partial(event)? {
@@ -218,6 +209,155 @@ impl ResponsesClient {
             ))?;
         }
     }
+}
+
+impl ResponsesClient {
+    /// Load `request` into the session's WebSocket without generating.
+    pub(super) async fn prewarm(
+        &self,
+        request: CompletionRequest,
+        guard: Option<&dyn ModelRequestGuard>,
+    ) -> Result<(), LlmError> {
+        let body = self.request_body(request)?;
+        self.prewarm_body(body, HeaderMap::new(), self.config.api_key.clone(), guard)
+            .await
+    }
+
+    pub(super) async fn prewarm_body(
+        &self,
+        body: Value,
+        headers: HeaderMap,
+        bearer_token: String,
+        guard: Option<&dyn ModelRequestGuard>,
+    ) -> Result<(), LlmError> {
+        let (Some(websocket), Value::Object(fields)) = (&self.config.websocket, body) else {
+            return Ok(());
+        };
+        if let Some(guard) = guard {
+            guard.verify().await?;
+        }
+        websocket.prewarm(
+            websocket_target(&self.http_request(headers, bearer_token))?,
+            fields,
+        );
+        Ok(())
+    }
+
+    fn http_request(&self, headers: HeaderMap, bearer_token: String) -> HttpRequest {
+        HttpRequest {
+            client: self.client.clone(),
+            endpoint: format!("{}/responses", self.config.base_url.trim_end_matches('/')),
+            headers,
+            bearer_token,
+            model: self.config.model.clone(),
+        }
+    }
+}
+
+struct HttpRequest {
+    client: Client,
+    endpoint: String,
+    headers: HeaderMap,
+    bearer_token: String,
+    model: String,
+}
+
+fn http_payloads(
+    request: HttpRequest,
+    body: Value,
+) -> impl Stream<Item = Result<String, LlmError>> + Send + 'static {
+    try_stream! {
+        let HttpRequest { client, endpoint, headers, bearer_token, model } = request;
+        let response = client
+            .post(endpoint)
+            .headers(headers)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .bearer_auth(bearer_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| request_error(&model, error))?;
+        let response = if response.status().is_success() {
+            response
+        } else {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            Err(response_error(&model, format!("{status}: {detail}")))?
+        };
+        let mut events = response.bytes_stream().eventsource();
+        while let Some(event) = events.next().await {
+            let payload = event.map_err(|error| request_error(&model, error))?.data;
+            if payload != "[DONE]" {
+                yield payload;
+            }
+        }
+    }
+}
+
+async fn event_payloads(
+    websocket: Option<&ResponsesWebSocket>,
+    request: HttpRequest,
+    body: Value,
+) -> Result<(BoxStream<'static, Result<String, LlmError>>, Option<Value>), LlmError> {
+    let (Some(websocket), Value::Object(fields)) = (websocket, &body) else {
+        return Ok((http_payloads(request, body).boxed(), None));
+    };
+    let mut events = websocket
+        .stream(websocket_target(&request)?, fields.clone())
+        .boxed();
+    let mut delivery = None;
+    let first = loop {
+        match events.next().await {
+            Some(Ok(WebSocketEvent::Sent(sent))) => delivery = Some(sent),
+            Some(Ok(WebSocketEvent::Payload(payload))) => break payload,
+            Some(Ok(WebSocketEvent::Unavailable(reason))) => {
+                let transport = json!({"kind": "http", "reason": reason});
+                return Ok((http_payloads(request, body).boxed(), Some(transport)));
+            }
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(request_error(
+                    &request.model,
+                    "Responses WebSocket ended without a response",
+                ))
+            }
+        }
+    };
+    let transport = delivery.map(|delivery| {
+        json!({
+            "kind": "websocket",
+            "incremental": delivery.incremental,
+            "reason": delivery.reason,
+        })
+    });
+    let rest = events.filter_map(|event| {
+        std::future::ready(match event {
+            Ok(WebSocketEvent::Payload(payload)) => Some(Ok(payload)),
+            Ok(WebSocketEvent::Sent(_) | WebSocketEvent::Unavailable(_)) => None,
+            Err(error) => Some(Err(error)),
+        })
+    });
+    let payloads = futures_util::stream::once(std::future::ready(Ok(first))).chain(rest);
+    Ok((payloads.boxed(), transport))
+}
+
+fn websocket_target(request: &HttpRequest) -> Result<WebSocketTarget, LlmError> {
+    let mut headers = request.headers.clone();
+    let authorization = HeaderValue::from_str(&format!("Bearer {}", request.bearer_token))
+        .map_err(|error| LlmError::Request(format!("invalid authorization header: {error}")))?;
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    Ok(WebSocketTarget {
+        url: request.endpoint.clone(),
+        headers,
+    })
+}
+
+fn record_transport(message: &mut AssistantMessage, transport: Value) {
+    message
+        .provider_fields
+        .get_or_insert_with(Struct::default)
+        .fields
+        .insert(TRANSPORT_FIELD.to_string(), json_to_prost(transport));
 }
 
 fn request_error(model: &str, error: impl std::fmt::Display) -> LlmError {
@@ -437,12 +577,20 @@ fn build_assistant_message(output: Vec<Value>) -> Result<AssistantMessage, LlmEr
     let mut reasoning_details = Vec::new();
     let mut tool_calls = Vec::new();
     let mut message_item_id = None;
+    let mut order = Vec::new();
+    let mut seen_message = false;
     for raw in output {
         let item: ApiItem = serde_json::from_value(raw.clone())
             .map_err(|error| LlmError::Request(error.to_string()))?;
+        if matches!(item.kind.as_str(), "reasoning" | "function_call")
+            || (item.kind == "message" && !seen_message)
+        {
+            order.push(string_value(item.kind.clone()));
+        }
         match item.kind.as_str() {
             "reasoning" => reasoning_details.push(json_to_struct(raw)?),
             "message" => {
+                seen_message = true;
                 message_item_id = message_item_id.or(item.id);
                 for part in item.content.unwrap_or_default() {
                     match part.kind.as_str() {
@@ -472,8 +620,15 @@ fn build_assistant_message(output: Vec<Value>) -> Result<AssistantMessage, LlmEr
             _ => {}
         }
     }
-    let provider_fields = message_item_id.map(|id| Struct {
-        fields: BTreeMap::from([("message_item_id".to_string(), string_value(id))]),
+    let mut provider_fields = BTreeMap::new();
+    if let Some(id) = message_item_id {
+        provider_fields.insert("message_item_id".to_string(), string_value(id));
+    }
+    if !order.is_empty() {
+        provider_fields.insert(OUTPUT_ORDER_FIELD.to_string(), order.into());
+    }
+    let provider_fields = (!provider_fields.is_empty()).then_some(Struct {
+        fields: provider_fields,
     });
     Ok(AssistantMessage {
         content: (!content.is_empty()).then_some(content),
@@ -529,60 +684,107 @@ fn text_input(role: &str, content: &str) -> Value {
 }
 
 fn serialize_assistant(message: &AssistantMessage, index: usize) -> Result<Vec<Value>, LlmError> {
+    let mut reasoning = message
+        .reasoning_details
+        .iter()
+        .map(struct_to_json)
+        .filter(|value| value.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .collect::<VecDeque<_>>();
+    let mut text = assistant_text_item(message, index)
+        .into_iter()
+        .collect::<VecDeque<_>>();
+    let mut calls = message
+        .tool_calls
+        .iter()
+        .map(function_call_item)
+        .collect::<Result<VecDeque<_>, _>>()?;
     let mut items = Vec::new();
-    for detail in &message.reasoning_details {
-        let value = struct_to_json(detail);
-        if value.get("type").and_then(Value::as_str) == Some("reasoning") {
-            items.push(value);
-        }
-    }
-    if message.content.is_some() || message.refusal.is_some() {
-        let mut content = Vec::new();
-        if let Some(text) = &message.content {
-            content.push(json!({"type": "output_text", "text": text, "annotations": []}));
-        }
-        if let Some(refusal) = &message.refusal {
-            content.push(json!({"type": "refusal", "refusal": refusal}));
-        }
-        let id = message
-            .provider_fields
-            .as_ref()
-            .and_then(|fields| fields.fields.get("message_item_id"))
-            .and_then(prost_string)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("msg_mirror_{index}"));
-        items.push(json!({
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "id": id,
-            "content": content,
-        }));
-    }
-    for call in &message.tool_calls {
-        let Some(function) = &call.function else {
-            return Err(LlmError::Request(format!(
-                "tool call {:?} has no function",
-                call.id
-            )));
+    // A reasoning item must stay in front of the item it led to.
+    for kind in output_order(message) {
+        let next = match kind {
+            "reasoning" => reasoning.pop_front(),
+            "message" => text.pop_front(),
+            "function_call" => calls.pop_front(),
+            _ => None,
         };
-        let mut item = json!({
-            "type": "function_call",
-            "call_id": call.id,
-            "name": function.name,
-            "arguments": function.arguments,
-        });
-        if let Some(id) = call
-            .provider_fields
-            .as_ref()
-            .and_then(|fields| fields.fields.get("item_id"))
-            .and_then(prost_string)
-        {
-            item["id"] = Value::String(id.to_string());
-        }
-        items.push(item);
+        items.extend(next);
     }
+    items.extend(reasoning);
+    items.extend(text);
+    items.extend(calls);
     Ok(items)
+}
+
+const TRANSPORT_FIELD: &str = "transport";
+
+const OUTPUT_ORDER_FIELD: &str = "output_order";
+
+fn output_order(message: &AssistantMessage) -> Vec<&str> {
+    let Some(Kind::ListValue(order)) = message
+        .provider_fields
+        .as_ref()
+        .and_then(|fields| fields.fields.get(OUTPUT_ORDER_FIELD))
+        .and_then(|order| order.kind.as_ref())
+    else {
+        return Vec::new();
+    };
+    order.values.iter().filter_map(prost_string).collect()
+}
+
+fn assistant_text_item(message: &AssistantMessage, index: usize) -> Option<Value> {
+    if message.content.is_none() && message.refusal.is_none() {
+        return None;
+    }
+    let mut content = Vec::new();
+    if let Some(text) = &message.content {
+        content.push(json!({"type": "output_text", "text": text, "annotations": []}));
+    }
+    if let Some(refusal) = &message.refusal {
+        content.push(json!({"type": "refusal", "refusal": refusal}));
+    }
+    let id = message
+        .provider_fields
+        .as_ref()
+        .and_then(|fields| fields.fields.get("message_item_id"))
+        .and_then(prost_string)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("msg_mirror_{index}"));
+    Some(json!({
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "id": id,
+        "content": content,
+    }))
+}
+
+fn function_call_item(call: &ToolCall) -> Result<Value, LlmError> {
+    let Some(function) = &call.function else {
+        return Err(LlmError::Request(format!(
+            "tool call {:?} has no function",
+            call.id
+        )));
+    };
+    let mut item = json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": function.name,
+        "arguments": function.arguments,
+    });
+    if let Some(id) = call
+        .provider_fields
+        .as_ref()
+        .and_then(|fields| fields.fields.get("item_id"))
+        .and_then(prost_string)
+    {
+        item["id"] = Value::String(id.to_string());
+    }
+    Ok(item)
+}
+
+/// A response's output in the form a later request replays it.
+pub(super) fn replayed_output(output: Vec<Value>) -> Result<Vec<Value>, LlmError> {
+    serialize_assistant(&build_assistant_message(output)?, 0)
 }
 
 pub(super) fn json_to_struct(value: Value) -> Result<Struct, LlmError> {

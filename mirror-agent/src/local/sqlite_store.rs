@@ -312,12 +312,7 @@ impl SQLiteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
         let parent = session_row(&transaction, source)?;
-        let lineage = crate::Lineage::parse(
-            source.to_string(),
-            serde_json::from_str(&parent.lineage).map_err(persistence)?,
-            serde_json::from_str(&parent.fork_points).map_err(persistence)?,
-        )
-        .map_err(persistence)?;
+        let lineage = session_lineage(source, &parent)?;
         let target: Option<(i64, Vec<u8>)> = transaction
             .query_row(
                 &format!("SELECT e.sequence, e.payload {VIEW} AND e.entry_id = ?"),
@@ -337,24 +332,108 @@ impl SQLiteStore {
             crate::ForkPoint::parse(&target).ok_or_else(|| StoreError::InvalidForkTarget {
                 entry_id: at_entry_id.to_string(),
             })?;
-        let (lineage, fork_points) = lineage
-            .fork(new_session.to_string(), point)
-            .map_err(persistence)?
-            .into_columns();
+        insert_fork(&transaction, lineage, point, new_session, &parent.workspace)?;
+        transaction.commit().map_err(persistence)
+    }
+
+    /// Bind a runtime-pinned prefix to its newly materialized workspace.
+    pub fn fork_at_head(
+        database: &Path,
+        source: &str,
+        head: u64,
+        new_session: &str,
+        workspace: &Path,
+    ) -> Result<(), StoreError> {
+        validate_session_id(source)?;
+        validate_session_id(new_session)?;
+        let workspace = std::fs::canonicalize(workspace).map_err(persistence)?;
+        let point =
+            crate::ForkPoint::after(head).ok_or_else(|| persistence("fork head overflow"))?;
+        let mut connection = connect(database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(persistence)?;
+        let parent = session_row(&transaction, source)?;
+        let lineage = session_lineage(source, &parent)?;
+        let current: i64 = transaction
+            .query_row(
+                &format!("SELECT COALESCE(MAX(e.sequence), 0) {VIEW}"),
+                [source],
+                |row| row.get(0),
+            )
+            .map_err(persistence)?;
+        if head > u64::try_from(current).map_err(persistence)? {
+            return Err(StoreError::Stale);
+        }
+        insert_fork(
+            &transaction,
+            lineage,
+            point,
+            new_session,
+            &workspace.to_string_lossy(),
+        )?;
+        let entry = AgentMessage {
+            sequence: Some(head + 1),
+            id: Uuid::new_v4().simple().to_string(),
+            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            payload: Some(agent_message::Payload::Fork(mirror_protocol::ForkRecord {
+                parent_session_id: source.to_string(),
+                inherited_sequence: head,
+                source_workspace: parent.workspace,
+                destination_workspace: workspace.to_string_lossy().into_owned(),
+            })),
+            ..Default::default()
+        };
         transaction
             .execute(
-                "INSERT INTO react_session(id, workspace, lineage, fork_points) \
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO react_entry(session_id, sequence, entry_id, payload) VALUES (?, ?, ?, ?)",
                 params![
                     new_session,
-                    parent.workspace,
-                    serde_json::to_string(&lineage).map_err(persistence)?,
-                    serde_json::to_string(&fork_points).map_err(persistence)?,
+                    i64::try_from(head + 1).map_err(persistence)?,
+                    entry.id,
+                    entry.encode_to_vec()
                 ],
             )
             .map_err(persistence)?;
         transaction.commit().map_err(persistence)
     }
+}
+
+fn session_lineage(
+    source: &str,
+    parent: &SessionRow,
+) -> Result<crate::Lineage<String>, StoreError> {
+    crate::Lineage::parse(
+        source.to_string(),
+        serde_json::from_str(&parent.lineage).map_err(persistence)?,
+        serde_json::from_str(&parent.fork_points).map_err(persistence)?,
+    )
+    .map_err(persistence)
+}
+
+fn insert_fork(
+    transaction: &rusqlite::Transaction<'_>,
+    lineage: crate::Lineage<String>,
+    point: crate::ForkPoint,
+    new_session: &str,
+    workspace: &str,
+) -> Result<(), StoreError> {
+    let (lineage, fork_points) = lineage
+        .fork(new_session.to_string(), point)
+        .map_err(persistence)?
+        .into_columns();
+    transaction
+        .execute(
+            "INSERT INTO react_session(id, workspace, lineage, fork_points) VALUES (?, ?, ?, ?)",
+            params![
+                new_session,
+                workspace,
+                serde_json::to_string(&lineage).map_err(persistence)?,
+                serde_json::to_string(&fork_points).map_err(persistence)?
+            ],
+        )
+        .map_err(persistence)?;
+    Ok(())
 }
 
 impl Store for SQLiteStore {

@@ -1,5 +1,7 @@
 //! Storage-independent durable conversation contract.
 
+use std::sync::Arc;
+
 use futures_util::future::BoxFuture;
 use mirror_protocol::chat_record;
 use mirror_protocol::AgentMessage;
@@ -45,6 +47,10 @@ pub trait Store: Send {
         head: u64,
         entries: &'a mut [AgentMessage],
     ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    fn inbox(&self) -> Option<Arc<dyn crate::Inbox>> {
+        None
+    }
 }
 
 #[must_use]

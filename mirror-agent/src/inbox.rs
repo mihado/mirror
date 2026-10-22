@@ -1,0 +1,45 @@
+use futures_util::future::BoxFuture;
+use mirror_protocol::{agent_message, chat_record, AgentMessage, ChatRecord, UserMessage};
+
+use crate::StoreError;
+
+pub trait Inbox: Send + Sync {
+    fn admit<'a>(
+        &'a self,
+        session_id: &'a str,
+        input: &'a AgentMessage,
+    ) -> BoxFuture<'a, Result<InboxAdmission, StoreError>>;
+
+    fn take<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentMessage>, StoreError>>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboxAdmission {
+    Admitted,
+    Pending(AgentMessage),
+    Appended(AgentMessage),
+}
+
+pub fn input_payload(entry: &AgentMessage) -> Option<agent_message::Payload> {
+    match entry.payload.as_ref()? {
+        agent_message::Payload::Chat(chat) => {
+            let Some(chat_record::Message::User(user)) = &chat.message else {
+                return None;
+            };
+            Some(agent_message::Payload::Chat(ChatRecord {
+                message: Some(chat_record::Message::User(UserMessage {
+                    content: user.content.clone(),
+                    checkpoint: None,
+                })),
+                ..chat.clone()
+            }))
+        }
+        agent_message::Payload::Extension(extension) => {
+            Some(agent_message::Payload::Extension(extension.clone()))
+        }
+        _ => None,
+    }
+}

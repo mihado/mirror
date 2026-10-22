@@ -71,6 +71,10 @@ impl Tool for FindTool {
         true
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn run_remote(
         &self,
         args: FindArgs,

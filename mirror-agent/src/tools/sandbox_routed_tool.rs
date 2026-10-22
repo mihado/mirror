@@ -35,6 +35,10 @@ impl AnyTool for SandboxRoutedTool {
         self.tool.needs_approval()
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        self.tool.is_concurrency_safe()
+    }
+
     fn definition(&self) -> ToolDefinition {
         self.tool.definition()
     }

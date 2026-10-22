@@ -6,13 +6,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import http.client
 import json
 import pathlib
 import re
+import sys
 import tempfile
+import time
 import tomllib
-from typing import cast
+from collections.abc import Callable
+from typing import BinaryIO, Protocol, cast
 from urllib import request
 
 _CONVENTIONAL = re.compile(
@@ -38,11 +43,12 @@ _PACKAGE_ID = re.compile(
 _FIRST_PARTY = {
   'mirror-agent': 'mirror-agent/Cargo.toml',
   'mirror-protocol': 'protocols/mirror_agent/Cargo.toml',
-  'mirror-agent-python': 'mirror-agent-py/Cargo.toml',
   'mirror-sandbox': 'mirror-sandbox/Cargo.toml',
   'mirror-sandbox-microsandbox': 'mirror-sandbox/providers/microsandbox/Cargo.toml',
   'mirror-sandboxd': 'mirror-sandboxd/Cargo.toml',
 }
+# Seconds to wait before each retry of a supplemental download.
+_DOWNLOAD_RETRY_DELAYS_S = (2.0, 5.0, 10.0)
 # A binary Zig cross-links embeds Zig's compiler runtime and glibc's start files.
 _ZIG_RUNTIME_FILES = (
   ('Zig and its compiler runtime', pathlib.Path('LICENSE')),
@@ -138,13 +144,62 @@ def _section(label: str, content: bytes) -> bytes:
   return f'{label}\nSHA256: {digest}\n\n'.encode() + content + b'\n\n'
 
 
+class _Opener(Protocol):
+  """Open a URL the way `urllib.request.urlopen` does."""
+
+  def __call__(
+    self, url: str, *, timeout: float
+  ) -> contextlib.AbstractContextManager[BinaryIO]: ...
+
+
+def download(
+  url: str,
+  *,
+  opener: _Opener = request.urlopen,
+  sleep: Callable[[float], None] = time.sleep,
+) -> bytes:
+  """Fetch `url`, retrying after each of `_DOWNLOAD_RETRY_DELAYS_S` in turn.
+
+  A slow or dropped connection must not fail a whole build, so the first
+  attempt is followed by one retry per delay; only the last failure escapes.
+  """
+  for delay_s in _DOWNLOAD_RETRY_DELAYS_S:
+    try:
+      return _read_url(url, opener)
+    except (OSError, http.client.HTTPException) as error:
+      print(f'{url}: {error}; retrying in {delay_s:g} s', file=sys.stderr)
+      sleep(delay_s)
+  return _read_url(url, opener)
+
+
+def _read_url(url: str, opener: _Opener) -> bytes:
+  with opener(url, timeout=30) as response:
+    return response.read()
+
+
+def _vendored(sources_dir: pathlib.Path, relative: str) -> bytes:
+  """Read a text kept beside the sources file, refusing escaped paths."""
+  path = sources_dir / relative
+  if (
+    not path.resolve(strict=True).is_relative_to(
+      sources_dir.resolve(strict=True)
+    )
+    or not path.is_file()
+  ):
+    raise ValueError(
+      f'Supplemental path is not a file beside the sources: {path}'
+    )
+  return path.read_bytes()
+
+
 def _supplement(
   source: dict[str, object],
+  sources_dir: pathlib.Path,
   root: pathlib.Path,
   version: str,
   expression: str,
 ) -> bytes:
-  """Fetch only a version/license/VCS-matched, checksum-pinned source text."""
+  """Read or fetch only a version/license/VCS-matched, checksum-pinned text."""
   if (
     _string(source, 'version') != version
     or _string(source, 'license') != expression
@@ -165,8 +220,11 @@ def _supplement(
   label = f'Supplemental source: {url}\nSource VCS git SHA1: {commit}\nReason: {_string(source, "reason")}'
   if 'selected_license' in source:
     label += f'\nSelected license for this distribution: {_string(source, "selected_license")}'
-  with request.urlopen(url, timeout=30) as response:
-    content: bytes = response.read()
+  content = (
+    _vendored(sources_dir, _string(source, 'path'))
+    if 'path' in source
+    else download(url)
+  )
   if hashlib.sha256(content).hexdigest() != checksum:
     raise ValueError(f'{url}: supplemental SHA256 mismatch')
   if not content.strip() or b'\0' in content:
@@ -178,6 +236,7 @@ def _notices(
   package_id: str,
   manifest: pathlib.Path,
   sources: dict[str, object],
+  sources_dir: pathlib.Path,
   workspace: pathlib.Path,
 ) -> bytes:
   """Render actual source files or an explicitly guarded supplemental text."""
@@ -219,7 +278,9 @@ def _notices(
         f'{package_id}: source now ships license text; review supplemental entry'
       )
     sections.append(
-      _supplement(_object(sources[name]), root, version, expression)
+      _supplement(
+        _object(sources[name]), sources_dir, root, version, expression
+      )
     )
   elif not any(paths.values()):
     raise ValueError(
@@ -302,7 +363,11 @@ def main() -> None:
     packages: dict[str, bytes] = {}
     for package_id, manifest in sorted(artifacts):
       rendered = _notices(
-        package_id, manifest, sources, args.workspace_root.resolve()
+        package_id,
+        manifest,
+        sources,
+        args.sources.resolve().parent,
+        args.workspace_root.resolve(),
       )
       if package_id in packages and packages[package_id] != rendered:
         raise ValueError(
@@ -320,7 +385,7 @@ def main() -> None:
       staged = pathlib.Path(temporary) / 'notices'
       staged.write_bytes(content)
       staged.replace(args.output)
-  except (OSError, ValueError) as error:
+  except (OSError, http.client.HTTPException, ValueError) as error:
     parser.error(str(error))
 
 

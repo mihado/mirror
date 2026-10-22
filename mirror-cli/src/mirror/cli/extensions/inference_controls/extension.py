@@ -65,6 +65,7 @@ _PROTOCOL_KEY_ENV = {
   'openai-responses': 'OPENAI_API_KEY',
   'openai-chat-completions': 'OPENROUTER_API_KEY',
   'anthropic-messages': 'ANTHROPIC_API_KEY',
+  'gemini': 'GEMINI_API_KEY',
 }
 
 
@@ -80,7 +81,7 @@ def _credential_hint(api: str) -> str:
   env = _PROTOCOL_KEY_ENV.get(api)
   if env is None:
     return ''
-  return 'key set' if os.environ.get(env) else f'set ${env}'
+  return api_keys.environment_key_hint(env)
 
 
 def _protocol_choices() -> tuple[selection.Choice, ...]:
@@ -244,6 +245,10 @@ def _codex_model_selected(model_id: str) -> actions.Action:
   return _model_selected(model_id, 'openai-codex-responses')
 
 
+def _gemini_model_selected(model_id: str) -> actions.Action:
+  return _model_selected(model_id, 'gemini')
+
+
 def _default_model(api: str) -> actions.Action:
   """Switch to a protocol's default model without a secondary picker."""
   return actions.ModelResolved(
@@ -316,6 +321,20 @@ def _select_inference(value: str) -> actions.Action:
       empty='No models available.',
       choices=_codex_choices(),
     )
+  if value == 'gemini':
+    return _model_picker(
+      'gemini-models',
+      'Google Gemini Developer API',
+      _gemini_model_selected,
+      empty='No supported models.',
+      choices=(
+        selection.Choice(
+          models.GEMINI_MODEL,
+          'Gemini 4 Argon',
+          'gemini-4-argon · 1,048,576 shared ctx · 65,536 max output · paid API',
+        ),
+      ),
+    )
   if value in _PROTOCOL_IDS:
     return _default_model(value)
   return actions.SetModel(value)
@@ -375,6 +394,11 @@ def _set_reasoning(
   context: commands.CommandContext, arguments: str
 ) -> actions.Action:
   effort = arguments.lower()
+  efforts = (
+    models.GEMINI_REASONING_EFFORTS
+    if context.model == models.GEMINI_MODEL
+    else _REASONING_EFFORTS
+  )
   if not effort:
     return actions.OpenSelector(
       selection.Selector(
@@ -385,7 +409,7 @@ def _set_reasoning(
             value,
             'provider default' if value == 'none' else value,
           )
-          for value in _REASONING_EFFORTS
+          for value in efforts
         ),
         actions.SetReasoning,
         current=context.reasoning_effort,
@@ -393,10 +417,9 @@ def _set_reasoning(
         selected=context.reasoning_effort,
       )
     )
-  if effort not in _REASONING_EFFORTS:
+  if effort not in efforts:
     return actions.ShowText(
-      f'Unknown reasoning effort: {arguments}. Choices: '
-      f'{", ".join(_REASONING_EFFORTS)}',
+      f'Unknown reasoning effort: {arguments}. Choices: {", ".join(efforts)}',
       style='ui.warning',
     )
   return actions.SetReasoning(effort)

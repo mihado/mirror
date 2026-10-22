@@ -17,7 +17,7 @@ async fn worker_describes_its_workspace_when_the_client_asks() {
     let prompt = initial_context(
         workspace.path(),
         serde_json::json!({"include_environment": true}),
-        None,
+        &[],
     )
     .await
     .system_prompt;
@@ -34,7 +34,7 @@ async fn worker_describes_its_workspace_when_the_client_asks() {
 async fn worker_adds_no_environment_section_unless_asked() {
     let workspace = tempfile::tempdir().expect("workspace");
 
-    let prompt = initial_context(workspace.path(), serde_json::json!({}), None)
+    let prompt = initial_context(workspace.path(), serde_json::json!({}), &[])
         .await
         .system_prompt;
 
@@ -44,7 +44,7 @@ async fn worker_adds_no_environment_section_unless_asked() {
 #[tokio::test]
 async fn worker_omits_unconfigured_web_tools_by_default() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let context = initial_context(workspace.path(), serde_json::json!({}), None).await;
+    let context = initial_context(workspace.path(), serde_json::json!({}), &[]).await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
     assert!(tools.iter().any(|tool| tool.source == "bash"));
     assert!(!tools
@@ -57,8 +57,8 @@ async fn worker_skips_unconfigured_web_tools_in_an_allowlist() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"]}),
-        None,
+        serde_json::json!({"tools": ["bash", "web_search", "web_browse"], "web_provider": "tavily"}),
+        &[("YOU_API_KEY", "synthetic-you-key")],
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -76,8 +76,8 @@ async fn worker_omits_web_tools_with_a_blank_key() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"]}),
-        Some(" \t "),
+        serde_json::json!({"tools": ["bash", "web_search", "web_browse"], "web_provider": "you"}),
+        &[("YOU_API_KEY", " \t ")],
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -91,12 +91,12 @@ async fn worker_omits_web_tools_with_a_blank_key() {
 }
 
 #[tokio::test]
-async fn worker_offers_web_tools_with_a_configured_key() {
+async fn worker_offers_web_tools_with_a_you_key() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"]}),
-        Some("synthetic-firecrawl-key"),
+        serde_json::json!({"tools": ["bash", "web_search", "web_browse"], "web_provider": "you"}),
+        &[("YOU_API_KEY", "synthetic-you-key")],
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -109,10 +109,48 @@ async fn worker_offers_web_tools_with_a_configured_key() {
     );
 }
 
+#[tokio::test]
+async fn worker_allowlist_selects_search_without_browse() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let context = initial_context(
+        workspace.path(),
+        serde_json::json!({"tools": ["bash", "web_search"]}),
+        &[("YOU_API_KEY", "synthetic-you-key")],
+    )
+    .await;
+    let tools = context.system_prompt_report.expect("prompt report").tools;
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.source.as_str())
+            .collect::<Vec<_>>(),
+        ["bash", "web_search"]
+    );
+}
+
+#[tokio::test]
+async fn worker_omits_web_tools_when_only_another_provider_has_a_key() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let context = initial_context(
+        workspace.path(),
+        serde_json::json!({"tools": ["bash", "web_search", "web_browse"]}),
+        &[("FIRECRAWL_API_KEY", "synthetic-firecrawl-key")],
+    )
+    .await;
+    let tools = context.system_prompt_report.expect("prompt report").tools;
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.source.as_str())
+            .collect::<Vec<_>>(),
+        ["bash"]
+    );
+}
+
 async fn initial_context(
     workspace: &Path,
     overrides: serde_json::Value,
-    firecrawl_key: Option<&str>,
+    provider_keys: &[(&str, &str)],
 ) -> mirror_agent::ContextWindowRecord {
     let auth = workspace.join("auth.json");
     std::fs::write(
@@ -132,10 +170,12 @@ async fn initial_context(
         .expect("config object")
         .extend(overrides.as_object().expect("override object").clone());
     let mut command = Command::new(worker_binary());
-    command.env_remove("FIRECRAWL_API_KEY");
-    if let Some(key) = firecrawl_key {
-        command.env("FIRECRAWL_API_KEY", key);
-    }
+    command
+        .env_remove("FIRECRAWL_API_KEY")
+        .env_remove("YOU_API_KEY")
+        .env_remove("TAVILY_API_KEY")
+        .env_remove("MIRROR_WEB_PROVIDER")
+        .envs(provider_keys.iter().copied());
     let mut child = command
         .arg(config.to_string())
         .env("MIRROR_WORKSPACE", workspace)

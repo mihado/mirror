@@ -10,6 +10,7 @@ use mirror_protocol::mirror::ListSessionsResponse;
 use mirror_protocol::mirror::SessionScope;
 use mirror_protocol::mirror::StartSessionRequest;
 use mirror_protocol::mirror::StartSessionResponse;
+use mirror_protocol::mirror::{ForkWorkspaceRequest, ForkWorkspaceResponse};
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -23,12 +24,21 @@ use crate::ReactAgentServiceHandle;
 pub struct LocalMirrorRpc {
     service: ReactAgentServiceHandle,
     database: PathBuf,
+    workspace: Option<PathBuf>,
 }
 
 impl LocalMirrorRpc {
     #[must_use]
-    pub fn new(service: ReactAgentServiceHandle, database: PathBuf) -> Self {
-        Self { service, database }
+    pub fn new(
+        service: ReactAgentServiceHandle,
+        database: PathBuf,
+        workspace: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            service,
+            database,
+            workspace,
+        }
     }
 }
 
@@ -53,6 +63,53 @@ impl mirror_rpc_server::MirrorRpc for LocalMirrorRpc {
         _request: Request<DeleteSessionRequest>,
     ) -> Result<Response<DeleteSessionResponse>, Status> {
         Err(single_session())
+    }
+
+    async fn fork_workspace(
+        &self,
+        request: Request<ForkWorkspaceRequest>,
+    ) -> Result<Response<ForkWorkspaceResponse>, Status> {
+        let request = request.into_inner();
+        if request.source_session_id != self.service.session_id() {
+            return Err(Status::not_found(
+                "source session is not served by this worker",
+            ));
+        }
+        Uuid::parse_str(&request.session_id)
+            .map_err(|_| Status::invalid_argument("child session ID must be a UUID"))?;
+        let workspace = self.workspace.clone().ok_or_else(|| {
+            Status::failed_precondition("workspace forking is unavailable in a sandbox")
+        })?;
+        let service = self.service.clone();
+        let database = self.database.clone();
+        // RPC cancellation must not strand a checkout between capture and lineage insertion.
+        tokio::spawn(async move {
+            let (head, workspace) = service
+                .fork_workspace(
+                    crate::Checkpoints::new(workspace),
+                    PathBuf::from(request.directory),
+                    request.name,
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            tokio::task::spawn_blocking(move || {
+                SQLiteStore::fork_at_head(
+                    &database,
+                    &request.source_session_id,
+                    head,
+                    &request.session_id,
+                    &workspace,
+                )
+                .map_err(fork_status)?;
+                Ok::<_, Status>(Response::new(ForkWorkspaceResponse {
+                    workspace: workspace.to_string_lossy().into_owned(),
+                }))
+            })
+            .await
+            .map_err(|error| Status::internal(format!("local fork task failed: {error}")))?
+        })
+        .await
+        .map_err(|error| Status::internal(format!("local fork task failed: {error}")))?
     }
 
     async fn fork_session(

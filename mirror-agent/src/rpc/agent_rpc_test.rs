@@ -89,7 +89,7 @@ impl Llm for StableModel {
 }
 
 struct PendingModel {
-    started: mpsc::UnboundedSender<()>,
+    started: mpsc::UnboundedSender<Vec<ToolDefinition>>,
 }
 
 impl Llm for PendingModel {
@@ -99,10 +99,126 @@ impl Llm for PendingModel {
 
     fn stream(
         &self,
-        _request: CompletionRequest,
+        request: CompletionRequest,
     ) -> impl futures_core::Stream<Item = Result<StreamEvent, LlmError>> {
-        let _ = self.started.send(());
+        let _ = self.started.send(request.tools);
         futures_util::stream::pending()
+    }
+}
+
+#[tokio::test]
+async fn web_provider_controls_apply_while_idle_and_running() {
+    let (started, mut started_receiver) = mpsc::unbounded_channel();
+    let tools = DirectToolExecutor::new(vec![Arc::new(crate::tools::WebSearchTool::new(
+        Box::new(|selection| {
+            Ok(Box::new(
+                crate::tools::web_test_provider::MemoryWebProvider(selection),
+            ))
+        }),
+    ))])
+    .with_tool_visibility(|_, context| {
+        context.web_provider() == Some(crate::web::WebProviderConfig::Tavily)
+    });
+    let agent = ReactAgent::new(
+        PendingModel { started },
+        test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
+        None,
+        &tools,
+        system_prompt(),
+        ReactAgentConfig::default(),
+    )
+    .expect("agent");
+    let (service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tools),
+        Box::new(InMemoryStore::default()),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+    )
+    .await
+    .expect("service");
+    let runtime = tokio::spawn(runtime);
+    assert_matches!(
+        &service.messages().await.expect("history")[0].payload,
+        Some(agent_message::Payload::ContextWindow(window))
+            if window.system_prompt_report.as_ref().expect("report").tools.is_empty()
+    );
+    let rpc = AgentRpc::new(service.clone());
+    let (requests, receiver) = mpsc::channel(4);
+    let mut responses = rpc
+        .open_session(ReceiverStream::new(receiver))
+        .await
+        .expect("session");
+    requests
+        .send(Ok(web_provider_request("first", "tavily")))
+        .await
+        .expect("send");
+    await_ack(&mut responses, "first").await;
+    let first = service
+        .call_tool("web_search".to_string(), r#"{"query":"test"}"#.to_string())
+        .await
+        .expect("idle tool");
+    assert_eq!(first.display.as_deref(), Some("Tavily: 1 result(s)"));
+
+    service
+        .execute(user_input_message("user".to_string(), "wait".to_string()))
+        .expect("execute");
+    let visible = started_receiver.recv().await.expect("running");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "web_search");
+    requests
+        .send(Ok(web_provider_request("next", "firecrawl")))
+        .await
+        .expect("send");
+    await_ack(&mut responses, "next").await;
+    let request = CallToolRequest {
+        session_id: "session".to_string(),
+        name: "web_search".to_string(),
+        arguments: r#"{"query":"test"}"#.to_string(),
+        web_provider: Some("you".to_string()),
+    };
+    let direct = rpc
+        .call_tool(Request::new(request))
+        .await
+        .expect("direct call")
+        .into_inner();
+    assert_eq!(direct.display.as_deref(), Some("You.com: 1 result(s)"));
+    let active = service
+        .call_tool("web_search".to_string(), r#"{"query":"test"}"#.to_string())
+        .await
+        .expect("active tool");
+    assert_eq!(active.display.as_deref(), Some("Firecrawl: 1 result(s)"));
+    service
+        .interrupt()
+        .expect("interrupt")
+        .await
+        .expect("interrupted");
+    service
+        .execute(user_input_message("next".to_string(), "wait".to_string()))
+        .expect("execute again");
+    assert!(started_receiver
+        .recv()
+        .await
+        .expect("next request")
+        .is_empty());
+    service.close().await.expect("close");
+    runtime.await.expect("runtime");
+}
+
+fn web_provider_request(message_id: &str, provider: &str) -> ClientMessage {
+    ClientMessage {
+        session_id: "session".to_string(),
+        message_id: message_id.to_string(),
+        payload: Some(client_message::Payload::SetWebProvider(
+            mirror_protocol::SetWebProvider {
+                provider: provider.to_string(),
+            },
+        )),
     }
 }
 
@@ -143,6 +259,7 @@ async fn call_tool_runs_bash_in_the_session_workspace_without_a_turn() {
             session_id: "another-session".to_string(),
             name: "bash".to_string(),
             arguments: "{}".to_string(),
+            ..Default::default()
         }))
         .await
         .expect_err("reject wrong session");
@@ -152,6 +269,7 @@ async fn call_tool_runs_bash_in_the_session_workspace_without_a_turn() {
             session_id: "session".to_string(),
             name: "bash".to_string(),
             arguments: r#"{"command":"pwd"}"#.to_string(),
+            ..Default::default()
         }))
         .await
         .expect("tool result")
@@ -296,29 +414,6 @@ async fn invalid_message_returns_validation_nack_without_recording_acceptance() 
     .expect("service");
     let runtime = tokio::spawn(runtime);
     let mut inputs = HashMap::new();
-    let request = SessionRequest {
-        session_id: "session".to_string(),
-        message_id: "invalid-1".to_string(),
-        input: SessionInput::Message(Box::new(AgentMessage {
-            payload: Some(agent_message::Payload::Chat(ChatRecord {
-                message: Some(chat_record::Message::User(UserMessage {
-                    checkpoint: None,
-                    content: "retry".to_string(),
-                })),
-                rewind_to: Some("previous".to_string()),
-                ..ChatRecord::default()
-            })),
-            ..AgentMessage::default()
-        })),
-    };
-    assert_eq!(
-        handled(&service, &mut inputs, request).await,
-        vec![nack_output(
-            "invalid-1".to_string(),
-            SessionNackReason::InvalidRequest,
-            "rewind_to is not supported; fork the session with MirrorRPC.ForkSession".to_string(),
-        )]
-    );
     assert_eq!(
         handled(
             &service,
@@ -1152,6 +1247,7 @@ async fn await_turn_completed(responses: &mut ReceiverStream<Result<SessionMessa
             next_message(responses).await.payload,
             Some(session_message::Payload::RuntimeDelta(RuntimeDelta {
                 payload: Some(runtime_delta::Payload::TurnCompleted(())),
+                ..
             }))
         ) {
             return;
@@ -1439,6 +1535,7 @@ async fn stream_replays_an_input_its_closing_actor_rejected() {
             }
             Some(session_message::Payload::RuntimeDelta(RuntimeDelta {
                 payload: Some(runtime_delta::Payload::TurnCompleted(())),
+                ..
             })) if replayed => break,
             _ => {}
         }
@@ -1683,6 +1780,7 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
             }
             Some(session_message::Payload::RuntimeDelta(RuntimeDelta {
                 payload: Some(runtime_delta::Payload::TurnCompleted(())),
+                ..
             })) => panic!("the gated tool ran without approval"),
             _ => {}
         }

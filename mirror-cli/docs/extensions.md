@@ -35,6 +35,13 @@ Startup downloads missing sources; installed sources work offline. No automatic
 updates, hooks, submodules, or dependency installs. Private repos use Git credential
 helpers—never put tokens in URLs or settings.
 
+## Local folders
+
+`/extensions-add ~/src/clock` registers a live directory containing `extension.py`.
+Paths are on the CLI host, relative to its launch directory.
+Enable with `/extensions`; disable/re-enable after edits.
+`/extensions-remove` unregisters it without deleting files or settings.
+
 ## Author an extension
 
 Enable `user_extensions` in `/extensions` for authoring tools and

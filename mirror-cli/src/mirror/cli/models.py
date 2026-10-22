@@ -33,7 +33,12 @@ WIRE_PROTOCOLS: tuple[tuple[str, str], ...] = (
   ('openai-responses', 'OpenAI Responses API'),
   ('openai-chat-completions', 'OpenRouter'),
   ('anthropic-messages', 'Anthropic Messages API'),
+  ('gemini', 'Google Gemini Developer API'),
 )
+
+GEMINI_MODEL = 'gemini-4-argon'
+GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai'
+GEMINI_REASONING_EFFORTS = ('none', 'low', 'medium', 'high')
 
 
 # A Reflection API alias of the default Beam model. The API serves it under this
@@ -45,11 +50,20 @@ def default_model(api: str) -> str:
   """The model id a wire protocol starts from when none is named."""
   if api == 'reflection':
     return 'Beam-1.0-501B-A23B'
+  if api == 'gemini':
+    return GEMINI_MODEL
   if api == 'anthropic-messages':
     return 'claude-opus-4-8'
   if api in ('openai-responses', 'openai-codex-responses'):
     return 'gpt-6-astra'
   return 'openai/gpt-6-astra'
+
+
+def inherited_reasoning_effort(api: str, effort: str) -> str:
+  """Keep inherited effort when supported, otherwise use the provider default."""
+  if api == 'gemini' and effort not in GEMINI_REASONING_EFFORTS:
+    return 'none'
+  return effort
 
 
 def key_env(api: str) -> str:
@@ -58,6 +72,8 @@ def key_env(api: str) -> str:
     return 'REFLECTION_API_KEY'
   if api == 'openai-responses':
     return 'OPENAI_API_KEY'
+  if api == 'gemini':
+    return 'GEMINI_API_KEY'
   if api == 'anthropic-messages':
     return 'ANTHROPIC_API_KEY'
   return 'OPENROUTER_API_KEY'
@@ -65,7 +81,7 @@ def key_env(api: str) -> str:
 
 def base_env(api: str) -> str | None:
   """The environment variable holding the base URL for a wire protocol."""
-  if api == 'reflection':
+  if api in ('reflection', 'gemini'):
     return None
   if api == 'openai-responses':
     return 'OPENAI_BASE_URL'
@@ -83,6 +99,18 @@ def validate_connection(api: str, base_url: str) -> None:
         '--api openai-chat-completions for custom endpoints'
       )
     return
+  if api == 'gemini':
+    if base_url and base_url.rstrip('/') != GEMINI_BASE_URL:
+      raise ValueError(
+        'gemini uses the Gemini Developer API, not Vertex AI or custom '
+        'endpoints. Use openai-chat-completions for a custom endpoint.'
+      )
+    if not os.environ.get('GEMINI_API_KEY', '').strip():
+      raise ValueError(
+        'Set GEMINI_API_KEY from Google AI Studio and restart Mirror. '
+        'Gemini 4 Argon requires paid API access; a Google AI plan is not an API key.'
+      )
+    return
   if api in ('', 'openai-codex-responses', 'anthropic-messages'):
     return
   endpoint_env = base_env(api)
@@ -93,6 +121,29 @@ def validate_connection(api: str, base_url: str) -> None:
       f'No API key found. Export {key_env(api)} or use --base-url '
       'for a keyless self-hosted endpoint.'
     )
+
+
+def validate_selection(
+  option: ModelOption, reasoning_effort: str, *, max_tokens: int | None = None
+) -> None:
+  """Check the supported Gemini configuration before committing a selection."""
+  if option.api != 'gemini':
+    return
+  if option.model_id != GEMINI_MODEL:
+    raise ValueError(
+      'gemini supports gemini-4-argon only. Select /model gemini.'
+    )
+  if reasoning_effort not in GEMINI_REASONING_EFFORTS:
+    raise ValueError(
+      'Gemini 4 Argon supports provider default, low, medium, or high reasoning. '
+      'Restart with --reasoning-effort medium, or use /effort medium before switching models.'
+    )
+  if max_tokens is not None and not 0 < max_tokens <= 65_536:
+    raise ValueError(
+      'Gemini requires --max-tokens between 1 and 65536. '
+      'Long decode is unavailable on the OpenAI-compatible API.'
+    )
+  validate_connection(option.api, option.base_url)
 
 
 def _config_path() -> pathlib.Path:
@@ -176,7 +227,10 @@ def load_models() -> tuple[ModelOption, ...]:
   path = _config_path()
   if not path.exists():
     return ()
-  raw: Any = json.loads(path.read_text())
+  try:
+    raw: Any = json.loads(path.read_text())
+  except json.JSONDecodeError as error:
+    raise ValueError(f'{path}: invalid JSON: {error}') from error
   if not isinstance(raw, list):
     raise ValueError(f'{path}: expected a JSON list, got {type(raw).__name__}')
   entries = cast(list[Any], raw)
@@ -210,6 +264,8 @@ def find_model(model_id: str) -> ModelOption:
   for option in load_models():
     if option.model_id == model_id:
       return option
+  if model_id == GEMINI_MODEL:
+    return ModelOption(model_id, 'Gemini 4 Argon', api='gemini')
   if is_reflection_default(model_id):
     return ModelOption(model_id, 'Reflection', api='reflection')
   return ModelOption(model_id, model_id)

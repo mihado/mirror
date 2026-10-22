@@ -298,6 +298,12 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
             style='ui.warning',
           )
         )
+      for reason in mcp.invalid_servers():
+        context.dispatch(
+          actions.ShowText(
+            f'Ignored MCP server configuration: {reason}', style='ui.warning'
+          )
+        )
       self._failed_servers.update(self._pending_auth)
       self._pending_auth.clear()
     for server in sorted(self._pending_auth):

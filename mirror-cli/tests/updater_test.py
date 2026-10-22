@@ -288,6 +288,7 @@ def _installer(
 def test_real_side_by_side_install_and_selected_offline_start(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+  original_version = distribution.installed().version
   wheel = _wheel(tmp_path, _NEW)
   _installer(tmp_path, monkeypatch, wheel)
   root = tmp_path / 'releases'
@@ -309,7 +310,7 @@ def test_real_side_by_side_install_and_selected_offline_start(
   assert json.loads(result.stdout)['version'] == _NEW
   assert json.loads(result.stdout)['argv'] == ['--continue']
   assert python != pathlib.Path(sys.executable)
-  assert distribution.installed().version == '0.1.0'
+  assert distribution.installed().version == original_version
   assert old_config.read_text() == '{"keep": true}'
   assert old_session.read_bytes() == b'old-session'
   _enable(tmp_path, monkeypatch)

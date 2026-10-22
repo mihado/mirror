@@ -138,6 +138,7 @@ enum Cancellation {
 #[derive(Debug)]
 pub(crate) enum TaskEvent {
     Updated(TaskInfo),
+    Agent(TaskInfo, Box<crate::AgentEvent>),
     Finished(TaskInfo, ToolOutput),
 }
 
@@ -311,6 +312,14 @@ impl TaskContext {
             .map_err(|_| TaskError::Closed)
     }
 
+    /// Forward child display events on the existing task update stream.
+    pub(crate) fn agent_event(&self, event: crate::AgentEvent) {
+        let _ = self.commands.send(Command::AgentEvent {
+            task_id: self.task_id.clone(),
+            event: Box::new(event),
+        });
+    }
+
     /// Replace the task's current terminal summary.
     pub fn update(&self, display: Option<String>) {
         let _ = self.commands.send(Command::Display {
@@ -348,6 +357,10 @@ pub enum TaskError {
 }
 
 enum Command {
+    AgentEvent {
+        task_id: String,
+        event: Box<crate::AgentEvent>,
+    },
     Spawn {
         tool_name: String,
         display: Option<String>,
@@ -540,6 +553,11 @@ impl TaskManager {
             Command::DetachForeground { response } => {
                 let detached = self.detach_foreground();
                 let _ = response.send(detached);
+            }
+            Command::AgentEvent { task_id, event } => {
+                if let Some(task) = Self::task_mut(&mut self.tasks, &task_id) {
+                    let _ = self.events.send(TaskEvent::Agent(task.info(), event));
+                }
             }
             Command::Display { task_id, display } => self.display(&task_id, display),
             Command::Log {

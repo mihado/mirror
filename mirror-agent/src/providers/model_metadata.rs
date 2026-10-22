@@ -36,6 +36,10 @@ async fn discover_context_window(
     if let Some(window) = config.context_window {
         return Ok(window);
     }
+    // Google's window is shared by input, thinking, and output; no catalog probe is needed.
+    if config.api == ModelApi::Gemini && config.model == "gemini-4-argon" {
+        return Ok(1_048_576);
+    }
     // The plan-billed Codex backend has no model catalog.
     if config.api == ModelApi::CodexResponses {
         return Ok(272_000);

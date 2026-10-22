@@ -79,6 +79,10 @@ impl Tool for ReadTool {
         true
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn run_remote(
         &self,
         args: ReadArgs,
@@ -112,7 +116,7 @@ impl Tool for ReadTool {
     }
 }
 
-pub(super) fn format_content(
+pub(crate) fn format_content(
     content: Vec<u8>,
     exceeded_byte_cap: bool,
     args: &ReadArgs,

@@ -18,6 +18,7 @@ from mirror.cli import (
   noninteractive,
   onboarding,
   showcase,
+  themes,
   worktrees,
 )
 from mirror.cli import logging as _logging
@@ -38,6 +39,8 @@ def _startup_model(
   option = next((o for o in configured if o.model_id == model_id), None)
   if option is not None:
     return option
+  if model_id == _models.GEMINI_MODEL:
+    return _models.ModelOption(model_id, 'Gemini 4 Argon', api='gemini')
   if model_id is not None and _models.is_reflection_default(model_id):
     return _models.ModelOption(model_id, 'Reflection', api='reflection')
   return configured[0] if configured and requested is None else None
@@ -162,6 +165,7 @@ def _parse_args() -> argparse.Namespace:
       'openai-chat-completions',
       'openai-chat-completions-non-streaming',
       'openrouter',
+      'gemini',
       'anthropic-messages',
     ],
     default=None,
@@ -433,6 +437,10 @@ def _parse_args() -> argparse.Namespace:
     )
   if args.model is None:
     args.model = _models.default_model(args.api)
+  if not args.reasoning_effort_override:
+    args.reasoning_effort = _models.inherited_reasoning_effort(
+      args.model_api or args.api, args.reasoning_effort
+    )
   return args
 
 
@@ -472,6 +480,8 @@ def _worker_config(
   config.pop('remote_endpoint')
   config.pop('remote_insecure')
   config['database'] = str(_agent_database_path(args.database))
+  # Invalid settings must not silently route web requests to the default service.
+  settings = _config.Config(_config.default_path()).read()
   return (
     config
     | {
@@ -479,8 +489,9 @@ def _worker_config(
       'create_session': create_session,
       'allow_workspace_mismatch': allow_workspace_mismatch,
       'api_key': None,
+      'web_provider': _config.web_provider(settings),
     }
-    | _memory.worker_config(_settings())
+    | _memory.worker_config(settings)
   )
 
 
@@ -502,6 +513,18 @@ def _resolve_conversation(
     if args.conversation_id:
       conversation_id = args.conversation_id
     elif args.continue_recent:
+      current = worktrees.current_worktree(pathlib.Path(cwd))
+      repository_key = workspace.git_workspace_key(str(current.path)) or str(
+        current.path
+      )
+      overlay = store.worktree_overlays(repository_key).get(current.id)
+      if (
+        overlay is not None
+        and overlay.conversation_id
+        and overlay.conversation_cwd == str(pathlib.Path(cwd).resolve())
+      ):
+        # The worker validates existence, directory ownership and its execution lease.
+        return overlay.conversation_id, False, False
       info = store.latest(cwd=cwd)
       if info is None:
         return uuid.uuid4().hex, True, False
@@ -541,6 +564,8 @@ def main(logs: _logging.Logs | None = None) -> None:
   """Parse flags and run the TUI over the agent worker subprocess."""
   args = _parse_args()
   if args.showcase:
+    if themes.preference(_settings()) == themes.AUTO:
+      themes.detect_background()
     showcase.run(
       scrollback_limit=args.scrollback_limit,
       flush_scrollback=args.flush_scrollback,
@@ -552,6 +577,16 @@ def main(logs: _logging.Logs | None = None) -> None:
   # Interactive validation belongs inside the UI so /model can repair it.
   if args.command in ('exec', 'acp'):
     try:
+      _models.validate_selection(
+        _models.ModelOption(
+          args.model,
+          args.model,
+          api=api,
+          base_url=args.base_url or args.model_base_url or '',
+        ),
+        args.reasoning_effort,
+        max_tokens=args.max_tokens,
+      )
       _models.validate_connection(
         api, args.base_url or args.model_base_url or ''
       )
@@ -575,9 +610,12 @@ def main(logs: _logging.Logs | None = None) -> None:
       )
     )
   if args.command == 'exec':
-    onboarding.ensure_consent(
-      pathlib.Path.cwd(), confirm=noninteractive.require_interactive_consent
-    )
+    try:
+      onboarding.ensure_consent(
+        pathlib.Path.cwd(), confirm=noninteractive.require_interactive_consent
+      )
+    except ValueError as error:
+      raise SystemExit(f'mirror: {error}') from None
     _database_paths(args.database)
     raise SystemExit(
       noninteractive.run(
@@ -592,7 +630,10 @@ def main(logs: _logging.Logs | None = None) -> None:
         reasoning_effort=args.reasoning_effort,
       )
     )
-  onboarding.ensure_consent(pathlib.Path.cwd())
+  try:
+    onboarding.ensure_consent(pathlib.Path.cwd())
+  except ValueError as error:
+    raise SystemExit(f'mirror: {error}') from None
   onboarding.ensure_install_id()
   if args.api_key:
     os.environ[_models.key_env(api)] = args.api_key
@@ -603,6 +644,8 @@ def main(logs: _logging.Logs | None = None) -> None:
     )
   if logs is not None:
     logs.set_conversation(conversation_id)
+  if themes.preference(_settings()) == themes.AUTO:
+    themes.detect_background()
   try:
     asyncio.run(
       cli.run_tui(

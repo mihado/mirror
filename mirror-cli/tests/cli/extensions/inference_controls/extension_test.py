@@ -118,6 +118,7 @@ def _clear_credentials(
     'OPENROUTER_API_KEY',
     'ANTHROPIC_API_KEY',
     'REFLECTION_API_KEY',
+    'GEMINI_API_KEY',
   ):
     monkeypatch.delenv(env, raising=False)
 
@@ -163,6 +164,11 @@ def test_extension_commands_open_selectors(
           'anthropic-messages',
           'Anthropic Messages API',
           'anthropic-messages · select to sign in',
+        ),
+        selection.Choice(
+          'gemini',
+          'Google Gemini Developer API',
+          'gemini · set $GEMINI_API_KEY',
         ),
         selection.Choice('next', 'Next', 'next'),
       ),
@@ -214,6 +220,7 @@ def test_model_command_offers_protocols_without_a_config(
     'openai-responses',
     'openai-chat-completions',
     'anthropic-messages',
+    'gemini',
   )
 
 
@@ -267,6 +274,33 @@ def test_keyed_protocols_open_a_live_fetched_picker(
   assert isinstance(openai, actions.OpenSelector)
   assert openai.selector.id == 'openai-models'
   assert openai.selector.load is inference_controls._fetch_openai_models  # pyright: ignore[reportPrivateUsage]
+
+
+def test_gemini_picker_and_effort_offer_only_verified_choices() -> None:
+  available = _commands(_state())
+  action = commands.dispatch('/model gemini', _command_context(), available)
+  assert isinstance(action, actions.OpenSelector)
+  assert action.selector.load is None
+  assert tuple(choice.value for choice in action.selector.choices) == (
+    'gemini-4-argon',
+  )
+  assert action.selector.on_select('gemini-4-argon') == actions.ModelResolved(
+    models.ModelOption('gemini-4-argon', 'gemini-4-argon', api='gemini')
+  )
+  context = commands.CommandContext(
+    'gemini-4-argon', 'medium', 'conversation', False, '/workspace'
+  )
+  effort = commands.dispatch('/effort', context, available)
+  assert isinstance(effort, actions.OpenSelector)
+  assert tuple(choice.value for choice in effort.selector.choices) == (
+    'none',
+    'low',
+    'medium',
+    'high',
+  )
+  assert isinstance(
+    commands.dispatch('/effort max', context, available), actions.ShowText
+  )
 
 
 def test_codex_offers_a_curated_static_list() -> None:

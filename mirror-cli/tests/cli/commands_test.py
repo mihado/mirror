@@ -15,6 +15,19 @@ def _context(*, busy: bool = False) -> commands.CommandContext:
   )
 
 
+def test_fork_command_requires_an_idle_conversation() -> None:
+  assert commands.dispatch(
+    '/fork experiment', _context()
+  ) == actions.ForkWorkspace('experiment')
+  assert commands.dispatch('/fork', _context()) == actions.ForkWorkspace()
+  assert commands.dispatch(
+    '/fork experiment', _context(busy=True)
+  ) == actions.ShowText(
+    '/fork is unavailable while a turn is in progress.',
+    style='ui.warning',
+  )
+
+
 def test_path_guard() -> None:
   """`/Users/…` is not a command; bare `/name` is."""
   assert commands.looks_like_slash_command('/help')

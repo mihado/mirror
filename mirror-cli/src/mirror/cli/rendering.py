@@ -16,11 +16,13 @@ from collections.abc import Collection, Mapping, Sequence
 from typing import Any, ClassVar, cast, override
 
 import pydantic
+from markdown_it import token as _markdown_token
 from mirror.protocol import agent_pb2
 from rich import box as _box
 from rich import cells as _cells
 from rich import console as _console
 from rich import markdown as _markdown
+from rich import measure as _measure
 from rich import padding as _padding
 from rich import segment as _segment
 from rich import style as _style
@@ -29,7 +31,7 @@ from rich import table as _table
 from rich import text as _text
 
 from mirror import distribution
-from mirror.cli import themes
+from mirror.cli import code_rendering, prose_preview, themes
 from mirror.cli.composer import skill_completion as _skill_completion
 
 # The glyph the input line uses, reused as the user-message prefix.
@@ -45,6 +47,13 @@ _PARTIAL_ARGUMENTS = pydantic.TypeAdapter(dict[str, Any])
 # Reserve two icon cells (including Crossfire) and one separator cell.
 GUTTER_WIDTH = 3
 _HUNK_RE = re.compile(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@')
+# Rich's repr highlighter also scans for non-string tokens and mishandles
+# closing quotes after escaped backslashes. Limit label highlighting to quotes;
+# skip escaped characters, and don't treat apostrophes inside words as quotes.
+_TOOL_STRINGS_RE = re.compile(
+  r"""\\.|(?P<accent>"(?:\\.|[^"\\])*"|\$'(?:\\.|[^'\\])*'|(?<!\w)'[^']*')""",
+  re.DOTALL,
+)
 
 # Full ECMA-48 escape coverage. Conversation history can contain terminal
 # output captured by tools; replaying it must never execute those controls in
@@ -262,25 +271,39 @@ def approval_body(
       and _readable_argument(command)
     ):
       arguments.pop('command')
-      code = _syntax.Syntax(
-        command, 'bash', background_color='default', word_wrap=True
-      )
-      if command.isprintable():
-        header = _tool_title(f'{name} ')
-        header.append_text(code.highlight(command)[: len(command)])
-        return tool_block(
-          header,
-          _approval_arguments(arguments) if arguments else None,
-          wrap=True,
-        )
-      body = (
-        _console.Group(code, _approval_arguments(arguments))
-        if arguments
-        else code
-      )
-      return tool_block(name, body, wrap=True)
+      return _CommandApproval(name, command, arguments)
     body = _approval_arguments(arguments)
   return tool_block(name, body, wrap=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class _CommandApproval:
+  """A proposed shell command, highlighted for the palette it renders in."""
+
+  name: str
+  command: str
+  arguments: Mapping[str, object]
+
+  def __rich_console__(
+    self, console: _console.Console, options: _console.ConsoleOptions
+  ) -> _console.RenderResult:
+    del options  # Unused.
+    code = _syntax.Syntax(
+      self.command,
+      'bash',
+      theme=themes.syntax_theme(console, 'code'),
+      background_color='default',
+      word_wrap=True,
+    )
+    arguments = _approval_arguments(self.arguments) if self.arguments else None
+    if self.command.isprintable():
+      header = _tool_title(self.name)
+      header.append(' ')
+      header.append_text(code.highlight(self.command)[: len(self.command)])
+      yield tool_block(header, arguments, wrap=True)
+      return
+    body = _console.Group(code, arguments) if arguments else code
+    yield tool_block(self.name, body, wrap=True)
 
 
 def _approval_arguments(arguments: Mapping[str, object]) -> _text.Text:
@@ -533,15 +556,26 @@ class _CodePanel:
     if options.max_width < 2:
       yield self.body
       return
-    lines = console.render_lines(
-      _padding.Padding(
-        self.body,
-        (2 if self.copy_text else 1, 0, 1, 0),
-        style='ui.code',
-        expand=True,
-      ),
-      options.update(width=options.max_width - 1),
-    )
+    if isinstance(self.body, code_rendering.Syntax) and self.body.retained:
+      background = console.get_style('ui.code')
+      blank = [_segment.Segment(' ' * (options.max_width - 1), background)]
+      lines = itertools.chain(
+        itertools.repeat(blank, 2 if self.copy_text else 1),
+        _segment.Segment.split_lines(
+          console.render(self.body, options.update(width=options.max_width - 1))
+        ),
+        (blank,),
+      )
+    else:
+      lines = console.render_lines(
+        _padding.Padding(
+          self.body,
+          (2 if self.copy_text else 1, 0, 1, 0),
+          style='ui.code',
+          expand=True,
+        ),
+        options.update(width=options.max_width - 1),
+      )
     rail = console.get_style('ui.code-rail')
     interactive = (
       isinstance(console, _InteractiveConsole)
@@ -576,16 +610,28 @@ class _CodePanel:
 class _TranscriptCodeBlock(_markdown.CodeBlock):
   """Set code on the shared panel without changing its syntax foregrounds."""
 
+  rows: code_rendering.RowCache | None = None
+
+  @classmethod
+  @override
+  def create(
+    cls, markdown: _markdown.Markdown, token: _markdown_token.Token
+  ) -> _TranscriptCodeBlock:
+    block = cls(token.info.partition(' ')[0] or 'text', markdown.code_theme)
+    if isinstance(markdown, _TranscriptMarkdown):
+      block.rows = markdown.code_rows
+    return block
+
   @override
   def __rich_console__(
     self, console: _console.Console, options: _console.ConsoleOptions
   ) -> _console.RenderResult:
     background = console.get_style('ui.code').bgcolor
-    code = _syntax.Syntax(
+    code = code_rendering.Syntax(
       str(self.text).rstrip(),
       self.lexer_name,
-      theme=self.theme,
-      word_wrap=True,
+      rows=self.rows,
+      theme=themes.syntax_theme(console, 'code'),
       background_color=background.name if background else 'default',
       padding=(0, 1) if options.max_width >= 6 else 0,
     )
@@ -662,6 +708,8 @@ class _StartTrimmed:
 class _TranscriptMarkdown(_markdown.Markdown):
   """Shared Markdown presentation for streaming and settled transcript text."""
 
+  code_rows: code_rendering.RowCache | None = None
+
   elements: ClassVar[dict[str, type[_markdown.MarkdownElement]]] = {
     **_markdown.Markdown.elements,
     'table_open': _TranscriptTable,
@@ -718,27 +766,83 @@ class StreamingAnswer:
   ) -> None:
     self._skill_names = frozenset(skill_names)
     self._hyperlinks = hyperlinks
+    self._code_rows = code_rendering.RowCache()
+    self._preview = prose_preview.ProsePreview()
     self._source = ''
     self._source_offset = 0
+    self._truncated = False
     self._stable_source_len = 0
     self._stable: list[_console.RenderableType] = []
     self._parts: tuple[_console.RenderableType, ...] = ()
 
+  def _append_fence(self, source: str) -> bool:
+    if not self._parts or not isinstance(self._parts[-1], Answer):
+      return False
+    previous = self._parts[-1]
+    markdown = previous.markdown
+    if markdown is None or len(markdown.parsed) != 1:
+      return False
+    token = markdown.parsed[0]
+    if (
+      token.type != 'fence'
+      or not token.info
+      or not source.startswith(self._source)
+    ):
+      return False
+    tail = source[self._stable_source_len :]
+    opening, newline, code = previous.source.partition('\n')
+    # Match only canonical, unindented, still-open fences. Closing markers,
+    # normalization and edits go back through the Markdown parser.
+    if (
+      not newline
+      or not opening.startswith(token.markup)
+      or token.content != code
+    ):
+      return False
+    added = tail[len(previous.source) :]
+    last_line = previous.source.rfind('\n') + 1
+    if (
+      '\r' in added
+      or '\0' in added
+      or re.search(r'(?m)^ {0,3}' + re.escape(token.markup), tail[last_line:])
+    ):
+      return False
+    updated = copy.copy(markdown)
+    updated.markup = tail
+    updated_token = copy.copy(token)
+    updated_token.content = tail.partition('\n')[2]
+    updated.parsed = [updated_token]
+    answer = dataclasses.replace(previous, source=tail, markdown=updated)
+    self._source = source
+    self._parts = (*self._stable, answer)
+    return True
+
   def update(
-    self, source: str, *, source_offset: int = 0
+    self, source: str, *, source_offset: int = 0, preview: bool = False
   ) -> tuple[_console.RenderableType, ...]:
-    """Retain stable parts, with offsets relative to the normalized full answer."""
+    """Render live text, optionally bounding prose while following the stream."""
+    content, omitted = self._preview.update(source) if preview else (source, 0)
+    if not source:
+      self._preview.update('')
+    return self._update(
+      content, source_offset=source_offset + omitted, truncated=bool(omitted)
+    )
+
+  def _update(
+    self, source: str, *, source_offset: int, truncated: bool
+  ) -> tuple[_console.RenderableType, ...]:
     source = strip_ansi(source)
     if source_offset:
       source_offset += len(source) - len(source.lstrip())
     source = source.strip()
-    if source_offset != self._source_offset:
+    if source_offset != self._source_offset or truncated != self._truncated:
       self._source_offset = source_offset
+      self._truncated = truncated
       self._source = ''
       self._stable_source_len = 0
       self._stable.clear()
       self._parts = ()
-    if source == self._source:
+    if source == self._source or self._append_fence(source):
       return self._parts
     previous_source = self._source[self._stable_source_len :]
     previous_tail = self._parts[-1] if self._parts else None
@@ -758,6 +862,7 @@ class StreamingAnswer:
       previous_tail = None
     suffix = source[self._stable_source_len :]
     markdown = _TranscriptMarkdown(suffix, hyperlinks=self._hyperlinks)
+    markdown.code_rows = self._code_rows
     boundaries = [
       (index, token.map[0])
       for index, token in enumerate(markdown.parsed)
@@ -794,15 +899,16 @@ class StreamingAnswer:
       block = copy.copy(markdown)
       block.markup = block_source
       block.parsed = markdown.parsed[token_index:next_index]
+      answer = assistant_render(
+        block_source,
+        hyperlinks=self._hyperlinks,
+        skill_names=self._skill_names,
+        continuation=bool(self._stable),
+        markdown=block,
+        source_offset=source_offset + self._stable_source_len + offsets[line],
+      )
       self._stable.append(
-        assistant_render(
-          block_source,
-          hyperlinks=self._hyperlinks,
-          skill_names=self._skill_names,
-          continuation=bool(self._stable),
-          markdown=block,
-          source_offset=source_offset + self._stable_source_len + offsets[line],
-        )
+        dataclasses.replace(answer, truncated=True) if truncated else answer
       )
     self._stable_source_len += offsets[last_line]
     markdown.parsed = markdown.parsed[last_index:]
@@ -815,6 +921,8 @@ class StreamingAnswer:
       markdown=markdown,
       source_offset=source_offset + self._stable_source_len,
     )
+    if truncated:
+      tail = dataclasses.replace(tail, truncated=True)
     self._parts = (*self._stable, tail)
     return self._parts
 
@@ -829,6 +937,7 @@ class Answer:
   continuation: bool = False
   markdown: _TranscriptMarkdown | None = None
   source_offset: int = 0
+  truncated: bool = False
 
   @functools.cached_property
   def parts(self) -> tuple[_console.RenderableType, ...]:
@@ -846,20 +955,52 @@ class Answer:
     grid.add_column(width=GUTTER_WIDTH - 1)
     # Rich's code-block wrapping inherits the column's overflow policy.
     grid.add_column(overflow='fold')
+    content: _console.RenderableType = self.markdown or _LazyMarkdown(
+      self.source, hyperlinks=self.hyperlinks
+    )
+    if self.truncated:
+      content = _console.Group(_text.Text('…', style='ui.muted'), content)
     grid.add_row(
       _text.Text(
         '' if self.continuation else ASSISTANT_ICON,
         style='' if self.continuation else 'ui.accent',
       ),
-      _StartTrimmed(
-        self.markdown or _LazyMarkdown(self.source, hyperlinks=self.hyperlinks)
-      ),
+      _StartTrimmed(content),
     )
     return _skill_completion.highlight_renderable(grid, self.skill_names)
 
   def __rich_console__(
     self, console: _console.Console, options: _console.ConsoleOptions
   ) -> _console.RenderResult:
+    markdown = self.markdown
+    # A top-level fence has fixed gutters. Avoid measuring it through a table
+    # and rendering its entire contents a second time just to add that gutter.
+    if (
+      markdown is not None
+      and markdown.code_rows is not None
+      and len(markdown.parsed) == 1
+      and markdown.parsed[0].type == 'fence'
+      and options.max_width >= GUTTER_WIDTH + 8
+      and not self.skill_names
+    ):
+      block = _TranscriptCodeBlock.create(markdown, markdown.parsed[0])
+      block.text = _text.Text(markdown.parsed[0].content)
+      rows = _segment.Segment.split_lines(
+        console.render(
+          block, options.update(width=options.max_width - GUTTER_WIDTH)
+        )
+      )
+      for index, row in enumerate(rows):
+        if index == 0 and not self.continuation:
+          yield _segment.Segment(
+            ASSISTANT_ICON + ' ', console.get_style('ui.accent')
+          )
+          yield _segment.Segment(' ', console.get_style('none'))
+        else:
+          yield _segment.Segment(' ' * GUTTER_WIDTH, console.get_style('none'))
+        yield from row
+        yield _segment.Segment.line()
+      return
     yield from console.render(self.body, options)
 
 
@@ -952,7 +1093,16 @@ def skill_status_text(display: str, status: str) -> _text.Text:
 
 
 def skill_loaded_text(display: str) -> _text.Text:
-  return skill_status_text(display, 'loaded')
+  return skill_status_text(display, 'Loaded')
+
+
+def context_display_text(display: str) -> _text.Text:
+  """Render context summaries verbatim; bare skill mentions need a status."""
+  if display.startswith('$'):
+    return skill_loaded_text(display)
+  text = _text.Text(icon_prefix('◆'), style='ui.muted')
+  text.append(strip_ansi(display), style='ui.info')
+  return text
 
 
 def skill_display_for_tool(name: str, args: str) -> str | None:
@@ -1009,16 +1159,16 @@ def looks_like_diff(text: str) -> bool:
 
 
 def _diff_highlighter(
-  diff_lines: list[str], background: str = 'default'
+  diff_lines: list[str],
+  background: str = 'default',
+  theme: str = 'ansi_dark',
 ) -> _syntax.Syntax:
   """A syntax highlighter keyed off the diff's target file path."""
   path = next(
     (ln[4:].strip() for ln in diff_lines if ln.startswith('+++ ')), 'file.txt'
   )
   lexer = _syntax.Syntax.guess_lexer(path)
-  return _syntax.Syntax(
-    '', lexer, theme='ansi_dark', background_color=background
-  )
+  return _syntax.Syntax('', lexer, theme=theme, background_color=background)
 
 
 def _diff_line(
@@ -1113,6 +1263,7 @@ class _DiffPanel:
       kind: _diff_highlighter(
         lines,
         value.bgcolor.name if value.bgcolor else themes.DEFAULT_BACKGROUND,
+        themes.syntax_theme(console, 'diff'),
       )
       for kind, value in styles.items()
     }
@@ -1163,7 +1314,7 @@ def running_tool_renderable(
   name: str, args: str, activity_kind: str, body: str
 ) -> _console.RenderableType:
   if (display := skill_display_for_tool(name, args)) is not None:
-    return skill_status_text(display, 'loading')
+    return skill_status_text(display, 'Loading')
   return tool_text(
     name, args, result_summary(body), activity_kind=activity_kind
   )
@@ -1187,9 +1338,11 @@ def tool_text(
       call.append(' · ', style='ui.muted')
       call.append(args, style='ui.muted')
   else:
-    call = _text.Text(f'{name}(', style='ui.warning')
-    call.append(args, style='ui.muted')
-    call.append(')', style='ui.warning')
+    call = _text.Text(style='ui.text')
+    call.append(name, style='ui.error.bold' if error else 'ui.info.bold')
+    call.append('(', style='ui.muted')
+    call.append_text(_tool_arguments(args))
+    call.append(')', style='ui.muted')
   return tool_block(call, result, error=error, wrap=name == 'bash')
 
 
@@ -1201,35 +1354,92 @@ def tool_block(
   wrap: bool = False,
 ) -> _console.RenderableType:
   """A tool activity with the transcript's shared icon gutter."""
-  title = _tool_title(header) if isinstance(header, str) else header.copy()
+  title = (
+    _tool_title(header, error=error)
+    if isinstance(header, str)
+    else header.copy()
+  )
   title.no_wrap = not wrap
   title.overflow = 'fold' if wrap else 'ellipsis'
-  parts: list[_console.RenderableType] = [title]
-  if body is not None:
-    result = _table.Table.grid(padding=(0, 1), expand=True)
-    result.add_column(width=1)
-    result.add_column(ratio=1, overflow='fold')
-    result.add_row(_text.Text('└', style='dim'), body)
-    parts.append(result)
-  grid = _table.Table.grid(padding=(0, 1), expand=True)
-  grid.add_column(width=GUTTER_WIDTH - 1)
-  grid.add_column(ratio=1, overflow='fold')
-  grid.add_row(
-    _text.Text('✗', style='ui.error')
-    if error
-    else _text.Text('·', style='dim'),
-    _console.Group(*parts),
-  )
-  return grid
+  return _ToolBlock(title, body, error)
 
 
-def _tool_title(header: str) -> _text.Text:
-  """Keep activity secondary to answers, emphasizing only the leading verb."""
-  verb, space, rest = strip_ansi(header).partition(' ')
-  title = _text.Text(style='ui.tool-heading')
-  title.append(verb, style='bold')
-  title.append(space + rest)
-  return title
+@dataclasses.dataclass(frozen=True)
+class _ToolBlock:
+  """Keep offscreen history free of Rich's per-cell layout object graph."""
+
+  title: _text.Text
+  body: _console.RenderableType | None
+  error: bool
+
+  def _grid(self) -> _table.Table:
+    parts: list[_console.RenderableType] = [self.title]
+    if self.body is not None:
+      result = _table.Table.grid(padding=(0, 1), expand=True)
+      result.add_column(width=1)
+      result.add_column(ratio=1, overflow='fold')
+      result.add_row(_text.Text('└', style='dim'), self.body)
+      parts.append(result)
+    grid = _table.Table.grid(padding=(0, 1), expand=True)
+    grid.add_column(width=GUTTER_WIDTH - 1)
+    grid.add_column(ratio=1, overflow='fold')
+    grid.add_row(
+      _text.Text('✗', style='ui.error')
+      if self.error
+      else _text.Text('·', style='dim'),
+      _console.Group(*parts),
+    )
+    return grid
+
+  def __rich_measure__(
+    self, console: _console.Console, options: _console.ConsoleOptions
+  ) -> _measure.Measurement:
+    return self._grid().__rich_measure__(console, options)
+
+  def __rich_console__(
+    self, console: _console.Console, options: _console.ConsoleOptions
+  ) -> _console.RenderResult:
+    del console, options
+    yield self._grid()
+
+
+def _tool_arguments(arguments: str) -> _text.Text:
+  """Emphasize quoted strings without recoloring paths, numbers, or booleans."""
+  rendered = _text.Text(strip_ansi(arguments))
+  rendered.highlight_regex(_TOOL_STRINGS_RE, style_prefix='ui.')
+  return rendered
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolLabel:
+  """A palette-independent tool action, arguments, and status label."""
+
+  action: str
+  arguments: str = ''
+  detail: str = ''
+  error: bool = False
+
+  def render(self) -> _text.Text:
+    """Accent the action without dimming paths, queries, or command text."""
+    label = _text.Text(style='ui.text')
+    label.append(
+      strip_ansi(self.action),
+      style='ui.error.bold' if self.error else 'ui.info.bold',
+    )
+    if self.arguments:
+      label.append(' ')
+      label.append_text(_tool_arguments(self.arguments))
+    if self.detail:
+      label.append(
+        strip_ansi(self.detail),
+        style='ui.error' if self.error else 'ui.muted',
+      )
+    return label
+
+
+def _tool_title(header: str, *, error: bool = False) -> _text.Text:
+  verb, _, rest = strip_ansi(header).partition(' ')
+  return ToolLabel(verb, rest, error=error).render()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1240,18 +1450,22 @@ class Stopwatch:
 
   def render(self) -> str:
     """The elapsed time as seconds or the two largest adjacent units."""
-    elapsed = time.monotonic() - self.started
-    seconds = round(elapsed)
-    if elapsed > 86_400:
-      days, hours = divmod(seconds // 3_600, 24)
-      return f'{days}d {hours}h'
-    if elapsed > 3_600:
-      hours, minutes = divmod(seconds // 60, 60)
-      return f'{hours}h {minutes}m'
-    if elapsed > 60:
-      minutes, seconds = divmod(seconds, 60)
-      return f'{minutes}m {seconds}s'
-    return f'{seconds}s'
+    return format_duration(time.monotonic() - self.started)
+
+
+def format_duration(elapsed: float) -> str:
+  """Format seconds using the two largest adjacent time units."""
+  seconds = round(elapsed)
+  if elapsed > 86_400:
+    days, hours = divmod(seconds // 3_600, 24)
+    return f'{days}d {hours}h'
+  if elapsed > 3_600:
+    hours, minutes = divmod(seconds // 60, 60)
+    return f'{hours}h {minutes}m'
+  if elapsed > 60:
+    minutes, seconds = divmod(seconds, 60)
+    return f'{minutes}m {seconds}s'
+  return f'{seconds}s'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1266,6 +1480,30 @@ class Expandable:
   ) -> _console.RenderResult:
     del console, options
     yield self.collapsed
+
+
+@dataclasses.dataclass(frozen=True)
+class _BashResult:
+  """Highlight command previews only when their transcript rows are rendered."""
+
+  command: str
+  suffix: str
+  body: _console.RenderableType | None
+  error: bool
+  wrap: bool
+
+  def __rich_console__(
+    self, console: _console.Console, options: _console.ConsoleOptions
+  ) -> _console.RenderResult:
+    del console, options
+    code = _syntax.Syntax(
+      self.command, 'bash', background_color='default', word_wrap=True
+    )
+    header = _tool_title('Ran', error=self.error)
+    header.append(' ')
+    header.append_text(code.highlight(self.command)[: len(self.command)])
+    header.append(self.suffix, style='ui.error' if self.error else 'ui.muted')
+    yield tool_block(header, self.body, error=self.error, wrap=self.wrap)
 
 
 def bash_result(
@@ -1300,14 +1538,15 @@ def bash_result(
     detail = ' · timed out' if status.group(1) else f' · exit {code}'
     output = output[status.end() :].removeprefix('stdout:\n')
   suffix = (detail or ' · failed') if error else ''
-  header = _tool_title(f'Ran {command_preview(command)}{suffix}')
+  command = command_preview(command)
   lines = output.strip().splitlines()
   style = 'ui.error' if error else 'dim'
   preview = lines[0] if lines else ''
   if len(lines) > 1:
     preview += f' … (+{len(lines) - 1} lines)'
-  collapsed = tool_block(
-    header,
+  collapsed = _BashResult(
+    command,
+    suffix,
     _text.Text(preview, style=style, overflow='ellipsis', no_wrap=True)
     if lines
     else None,
@@ -1316,8 +1555,9 @@ def bash_result(
   )
   if not expandable:
     return collapsed
-  expanded = tool_block(
-    header,
+  expanded = _BashResult(
+    command,
+    suffix,
     _text.Text('\n'.join(lines), style=style) if lines else None,
     error=error,
     wrap=True,

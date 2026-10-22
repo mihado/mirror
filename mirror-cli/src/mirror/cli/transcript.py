@@ -107,6 +107,10 @@ def _render_entry(
   kind = entry.WhichOneof('payload')
   if kind == 'log':
     return _rendering.log_text(entry.log.level, entry.log.text)
+  if kind == 'fork':
+    return _rendering.context_display_text(
+      f'Forked from {entry.fork.parent_session_id}'
+    )
   if kind == 'context_window':
     return _rendering.compaction_text(
       entry.context_window.compaction,
@@ -138,7 +142,7 @@ def _render_entry(
   role = message.WhichOneof('message')
   if role == 'user':
     if message.HasField('display') and message.display:
-      return _rendering.skill_loaded_text(message.display)
+      return _rendering.context_display_text(message.display)
     return _rendering.user_text(message.user.content, skill_names)
   if role == 'assistant':
     assistant = message.assistant
@@ -405,7 +409,7 @@ class Transcript:
   def _visible_entry(self, entry: agent_pb2.AgentMessage) -> bool:
     """Classify record visibility before either lazy or immediate projection."""
     match entry.WhichOneof('payload'):
-      case 'log':
+      case 'log' | 'fork':
         return True
       case 'context_window':
         return entry.context_window.HasField('compaction')

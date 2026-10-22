@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from typing import override
@@ -9,6 +10,8 @@ from typing import override
 from prompt_toolkit import formatted_text, utils
 from prompt_toolkit.formatted_text import ansi
 from prompt_toolkit.output import base, vt100
+from rich import color
+from rich import style as rich_style
 
 from mirror.cli import rendering
 
@@ -16,6 +19,28 @@ _OSC_LINK = re.compile(
   r'\x1b\]8;[^\x00-\x1f\x7f-\x9f;]*;([^\x00-\x1f\x7f-\x9f]*)(?:\x07|\x1b\\)'
 )
 _CLOSE = '\x1b]8;;\x1b\\'
+
+
+@functools.lru_cache(maxsize=1024)
+def _rich_style(sample: str) -> str:
+  """Translate each visual style once, without retaining action metadata."""
+  return formatted_text.to_formatted_text(ANSI(sample))[0][0]
+
+
+def from_rich(
+  value: str, appearance: rich_style.Style | None, system: color.ColorSystem
+) -> formatted_text.StyleAndTextTuples:
+  """Keep Rich spans intact instead of ANSI-decoding every character.
+
+  Links still need cell-local escapes, and embedded ANSI still needs parsing.
+  Use the existing decoder for both so terminal sanitization stays identical.
+  """
+  if (appearance and appearance.link) or '\x1b' in value or '\x9b' in value:
+    if appearance:
+      value = appearance.render(value, color_system=system)
+    return formatted_text.to_formatted_text(ANSI(value))
+  sample = appearance.render('x', color_system=system) if appearance else 'x'
+  return [(_rich_style(sample), rendering.strip_ansi(value))]
 
 
 class Output(vt100.Vt100_Output):

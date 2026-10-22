@@ -1,4 +1,4 @@
-//! Fetch, cache, preview, and search webpages through Firecrawl.
+//! Fetch, cache, preview, and search webpages with provider-isolated caches.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -12,17 +12,17 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use super::object_schema;
-use super::FirecrawlClient;
-use super::FirecrawlError;
 use super::Tool;
 use super::ToolError;
 use crate::tools::ToolOutput;
+use crate::web::{WebError, WebProviderConfig, WebProviderFactory};
 use crate::ExecutionContext;
 
 /// Fetch and inspect public webpages through a conversation-local cache.
 #[derive(Debug, Clone)]
 pub struct WebBrowseTool {
     requests: mpsc::UnboundedSender<BrowseRequest>,
+    name: &'static str,
 }
 
 /// Arguments accepted by webpage browsing and search.
@@ -63,44 +63,99 @@ struct Page {
     line_count: usize,
 }
 
+// Struct serialization preserves field order and omits absent optional fields.
+#[derive(Serialize)]
+struct BrowseResponse<'a> {
+    url: &'a str,
+    final_url: &'a str,
+    cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_preview: Option<&'a str>,
+    estimated_text_tokens: usize,
+    line_count: usize,
+    truncated: bool,
+    hint: &'a str,
+}
+
+#[derive(Serialize)]
+struct GrepResponse<'a> {
+    url: &'a str,
+    final_url: &'a str,
+    cached: bool,
+    pattern: &'a Option<String>,
+    output_mode: BrowseOutputMode,
+    output: &'a str,
+    truncated: bool,
+    timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
 struct BrowseRequest {
     url: String,
-    response: oneshot::Sender<Result<(Page, bool), FirecrawlError>>,
+    provider: Option<WebProviderConfig>,
+    response: oneshot::Sender<Result<(Page, bool), WebError>>,
 }
 
 struct BrowseCache {
-    client: FirecrawlClient,
+    make_provider: Box<WebProviderFactory>,
     requests: mpsc::UnboundedReceiver<BrowseRequest>,
-    pages: HashMap<String, Page>,
+    pages: HashMap<(&'static str, String), Page>,
 }
 
 const MAX_TOKENS_PER_PAGE: usize = 8_000;
 const MAX_GREP_LINES: usize = 1_000;
-const MAX_GREP_COLUMN_WIDTH: usize = 2_000;
 const MAX_TITLE_CHARS: usize = 500;
 const MAX_URL_CHARS: usize = 2_048;
-static TOKEN_CHUNKS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\w+|[^\w\s]").expect("token estimate regex"));
+// Python's Unicode \w excludes combining marks and connector punctuation except _.
+static TOKEN_CHUNKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[\p{L}\p{N}_]+|[^\p{L}\p{N}_\s\x1c-\x1f]")
+        .expect("the token estimate pattern is a valid constant")
+});
+static LINE_BREAKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x{85}\x{2028}\x{2029}]")
+        .expect("the splitlines pattern is a valid constant")
+});
 
 impl WebBrowseTool {
-    /// Create a web browser with one MPSC-owned page cache.
-    pub fn new(client: FirecrawlClient) -> Self {
+    /// Resolve adapters per request; clones share the provider-isolated cache.
+    pub fn new(make_provider: Box<WebProviderFactory>) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
         tokio::spawn(
             BrowseCache {
-                client,
+                make_provider,
                 requests: receiver,
                 pages: HashMap::new(),
             }
             .run(),
         );
-        Self { requests }
+        Self {
+            requests,
+            name: "web_browse",
+        }
     }
 
-    async fn get_page(&self, url: String) -> Result<(Page, bool), ToolError> {
+    /// Override the model-facing tool name.
+    #[must_use]
+    pub fn with_name(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+
+    async fn get_page(
+        &self,
+        url: String,
+        provider: Option<WebProviderConfig>,
+    ) -> Result<(Page, bool), ToolError> {
         let (response, receiver) = oneshot::channel();
         self.requests
-            .send(BrowseRequest { url, response })
+            .send(BrowseRequest {
+                url,
+                provider,
+                response,
+            })
             .map_err(|_| ToolError::Execution("webpage cache closed".to_string()))?;
         receiver
             .await
@@ -113,7 +168,7 @@ impl Tool for WebBrowseTool {
     type Args = WebBrowseArgs;
 
     fn name(&self) -> &str {
-        "web_browse"
+        self.name
     }
 
     fn description(&self) -> &str {
@@ -127,7 +182,7 @@ impl Tool for WebBrowseTool {
                     "url".to_string(),
                     serde_json::json!({
                         "type": "string",
-                        "description": "The HTTP(S) webpage URL, usually obtained from web_search. The page is cached by URL for later searches on this tool instance."
+                        "description": "The HTTP(S) webpage URL, usually obtained from a web search. The page is cached by URL for later searches on this tool instance."
                     }),
                 ),
                 (
@@ -197,16 +252,20 @@ impl Tool for WebBrowseTool {
         )
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn run(
         &self,
         args: WebBrowseArgs,
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         validate_args(&args)?;
         let Some(url) = validated_url(&args.url) else {
             return Ok(ToolOutput::error("web_browse requires an HTTP(S) URL."));
         };
-        let (page, cached) = match self.get_page(url).await {
+        let (page, cached) = match self.get_page(url, context.web_provider()).await {
             Ok(page) => page,
             Err(ToolError::Execution(message)) => {
                 return Ok(ToolOutput::error(message));
@@ -227,6 +286,7 @@ impl Tool for WebBrowseTool {
             success: !error,
             touched: Vec::new(),
             exit_code: None,
+            duration: None,
         })
     }
 }
@@ -252,22 +312,31 @@ fn validate_args(args: &WebBrowseArgs) -> Result<(), ToolError> {
 impl BrowseCache {
     async fn run(mut self) {
         while let Some(request) = self.requests.recv().await {
-            if let Some(page) = self.pages.get(&request.url) {
-                let _ = request.response.send(Ok((page.clone(), true)));
-                continue;
-            }
-            let BrowseRequest { url, mut response } = request;
+            let BrowseRequest {
+                url,
+                provider,
+                mut response,
+            } = request;
             let result = tokio::select! {
                 biased;
                 _ = response.closed() => continue,
-                result = self.fetch(&url) => result,
+                result = self.fetch(&url, provider) => result,
             };
             let _ = response.send(result);
         }
     }
 
-    async fn fetch(&mut self, requested_url: &str) -> Result<(Page, bool), FirecrawlError> {
-        let result = self.client.scrape(requested_url).await?;
+    async fn fetch(
+        &mut self,
+        requested_url: &str,
+        provider: Option<WebProviderConfig>,
+    ) -> Result<(Page, bool), WebError> {
+        let client = (self.make_provider)(provider)?;
+        let key = (client.name(), requested_url.to_string());
+        if let Some(page) = self.pages.get(&key) {
+            return Ok((page.clone(), true));
+        }
+        let result = client.contents(requested_url).await?;
         let text = normalize_text(&result.text);
         let final_url = validated_url(&result.url).unwrap_or_else(|| requested_url.to_string());
         let page = Page {
@@ -279,25 +348,25 @@ impl BrowseCache {
             line_count: text.lines().count(),
             text,
         };
-        self.pages.insert(requested_url.to_string(), page.clone());
-        self.pages.insert(final_url, page.clone());
+        self.pages.insert(key, page.clone());
+        self.pages.insert((client.name(), final_url), page.clone());
         Ok((page, false))
     }
 }
 
 fn preview_response(requested_url: &str, page: &Page, cached: bool) -> Result<String, ToolError> {
     let (preview, truncated) = truncate(&page.text, MAX_TOKENS_PER_PAGE);
-    model_json(serde_json::json!({
-        "url": requested_url,
-        "final_url": page.final_url,
-        "cached": cached,
-        "title": page.title,
-        "text_preview": (!preview.is_empty()).then_some(preview),
-        "estimated_text_tokens": page.estimated_tokens,
-        "line_count": page.line_count,
-        "truncated": truncated,
-        "hint": "Full page text is cached. Browse previews and search results are capped around 8000 tokens. Add a regex pattern and optional context_lines to inspect relevant parts of the page."
-    }))
+    model_json(&BrowseResponse {
+        url: requested_url,
+        final_url: &page.final_url,
+        cached,
+        title: page.title.as_deref(),
+        text_preview: (!preview.is_empty()).then_some(preview.as_str()),
+        estimated_text_tokens: page.estimated_tokens,
+        line_count: page.line_count,
+        truncated,
+        hint: "Full page text is cached. Browse previews and search results are capped around 8000 tokens. Add a regex pattern and optional context_lines to inspect relevant parts of the page.",
+    })
 }
 
 async fn grep_response(
@@ -322,10 +391,10 @@ async fn grep_response(
             .unwrap_or_default();
     }
     let error = if !matches!(result.return_code, 0 | 1) && !result.timed_out {
-        let detail = if result.stderr.trim().is_empty() {
-            output.trim()
+        let detail = if result.stderr.is_empty() {
+            output.as_str()
         } else {
-            result.stderr.trim()
+            result.stderr.as_str()
         };
         let (detail, _) = truncate(detail, MAX_TOKENS_PER_PAGE);
         Some(format!(
@@ -342,29 +411,23 @@ async fn grep_response(
         format_grep_result(args, &output, result.timed_out)
     };
     Ok((
-        model_json(serde_json::json!({
-            "url": args.url,
-            "final_url": page.final_url,
-            "cached": cached,
-            "pattern": args.pattern,
-            "output_mode": match args.output_mode {
-                BrowseOutputMode::Content => "content",
-                BrowseOutputMode::Count => "count",
-            },
-            "output": formatted,
-            "truncated": truncated,
-            "timed_out": result.timed_out,
-            "error": error,
-        }))?,
+        model_json(&GrepResponse {
+            url: &args.url,
+            final_url: &page.final_url,
+            cached,
+            pattern: &args.pattern,
+            output_mode: args.output_mode,
+            output: &formatted,
+            truncated,
+            timed_out: result.timed_out,
+            error: error.as_deref(),
+        })?,
         failed,
     ))
 }
 
 fn grep_arguments(args: &WebBrowseArgs) -> Vec<String> {
     let mut arguments = vec![
-        "--max-columns".to_string(),
-        MAX_GREP_COLUMN_WIDTH.to_string(),
-        "--max-columns-preview".to_string(),
         "--color".to_string(),
         "never".to_string(),
         "--no-heading".to_string(),
@@ -467,11 +530,8 @@ fn format_grep_output(
     format!("{header}\n{output}")
 }
 
-fn model_json(mut payload: Value) -> Result<String, ToolError> {
-    if let Value::Object(fields) = &mut payload {
-        fields.retain(|_, value| !value.is_null());
-    }
-    serde_json::to_string_pretty(&payload).map_err(|error| ToolError::Execution(error.to_string()))
+fn model_json(payload: &impl Serialize) -> Result<String, ToolError> {
+    serde_json::to_string_pretty(payload).map_err(|error| ToolError::Execution(error.to_string()))
 }
 
 fn validated_url(url: &str) -> Option<String> {
@@ -490,9 +550,22 @@ fn validated_url(url: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+fn python_whitespace(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '\u{1c}'..='\u{1f}')
+}
+
+fn split_lines(text: &str) -> impl Iterator<Item = &str> {
+    // Unlike str::lines, Python splitlines includes Unicode separators and bare CR.
+    let mut lines = LINE_BREAKS.split(text).peekable();
+    std::iter::from_fn(move || {
+        let line = lines.next()?;
+        (!line.is_empty() || lines.peek().is_some()).then_some(line)
+    })
+}
+
 fn normalize_text(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
+    split_lines(text)
+        .map(|line| line.trim_matches(python_whitespace))
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
@@ -509,8 +582,33 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 fn truncate(text: &str, max_tokens: usize) -> (String, bool) {
+    if max_tokens == 0 {
+        return (String::new(), !text.is_empty());
+    }
+    let mut selected = Vec::new();
+    let mut used = 0;
+    for line in split_lines(text) {
+        let separator = usize::from(!selected.is_empty());
+        let cost = estimate_tokens(line);
+        if used + separator + cost <= max_tokens {
+            selected.push(line.to_string());
+            used += separator + cost;
+            continue;
+        }
+        if let Some(remaining) = max_tokens.checked_sub(used + separator).filter(|n| *n > 0) {
+            let partial = truncate_line(line, remaining);
+            if !partial.is_empty() {
+                selected.push(partial);
+            }
+        }
+        return (selected.join("\n"), true);
+    }
+    (text.to_string(), false)
+}
+
+fn truncate_line(text: &str, max_tokens: usize) -> String {
     if estimate_tokens(text) <= max_tokens {
-        return (text.to_string(), false);
+        return text.to_string();
     }
     let mut boundaries = text
         .char_indices()
@@ -527,7 +625,9 @@ fn truncate(text: &str, max_tokens: usize) -> (String, bool) {
             upper = midpoint - 1;
         }
     }
-    (text[..boundaries[lower]].trim_end().to_string(), true)
+    text[..boundaries[lower]]
+        .trim_end_matches(python_whitespace)
+        .to_string()
 }
 
 #[cfg(test)]

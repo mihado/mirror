@@ -27,9 +27,9 @@ class ShowExtensions:
 
 @dataclasses.dataclass(frozen=True)
 class AddExtension:
-  """Declare and download a GitHub extension without granting execution consent."""
+  """Register a GitHub or host-local source without enabling execution."""
 
-  url: str
+  source: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,7 +41,7 @@ class UpdateExtensions:
 
 @dataclasses.dataclass(frozen=True)
 class RemoveExtension:
-  """Choose a GitHub source to remove, then confirm removal of its declaration."""
+  """Choose a source to remove, then confirm removal of its declaration."""
 
   key: str | None = None
   confirmed: bool = False
@@ -61,6 +61,13 @@ class ExtensionConsent:
   key: str
   enabled: bool | None
   revision: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtensionConsentBatch:
+  """Answer only the source revisions included in one extension review."""
+
+  requests: tuple[ExtensionConsent, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,6 +151,7 @@ class Task:
   id: str
   tool_name: str
   display: str | None
+  inspectable: bool = False
 
 
 class WorktreeAgentState(enum.Enum):
@@ -338,6 +346,13 @@ class CreateWorkspace:
 @dataclasses.dataclass(frozen=True)
 class CloseWorkspace:
   """Close the selected workspace without deleting its directory."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ForkWorkspace:
+  """Fork the idle conversation and working files into a new worktree tab."""
+
+  name: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -604,6 +619,7 @@ class NavigateHistory:
   """Navigate the owned conversation viewport without changing the editor."""
 
   direction: Literal['page_up', 'page_down', 'oldest', 'latest', 'up', 'down']
+  rows: int = 3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -853,6 +869,11 @@ class SetModel:
 
 
 @dataclasses.dataclass(frozen=True)
+class SetWebProvider:
+  provider: str
+
+
+@dataclasses.dataclass(frozen=True)
 class SetRemoteModel:
   """Choose the remote session's model; an empty `api` keeps its protocol."""
 
@@ -1025,6 +1046,16 @@ class ClearTaskSelection:
 
 
 @dataclasses.dataclass(frozen=True)
+class InspectSelectedTask:
+  """Open the selected child's read-only transcript."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CloseInspection:
+  """Return from a child transcript without changing either agent."""
+
+
+@dataclasses.dataclass(frozen=True)
 class CancelSelectedTask:
   pass
 
@@ -1087,7 +1118,7 @@ type Action = (
   | UpdateExtensions
   | RemoveExtension
   | ToggleExtension
-  | ExtensionConsent
+  | ExtensionConsentBatch
   | ExtensionConsentResolved
   | ClearScreen
   | QuitApp
@@ -1108,6 +1139,7 @@ type Action = (
   | CreateWorkspace
   | CloseWorkspace
   | CreateWorktree
+  | ForkWorkspace
   | CreateSandbox
   | Drop
   | SetStatus
@@ -1191,6 +1223,7 @@ type Action = (
   | CancelModelSelection
   | ForgetReflectionKey
   | SetModel
+  | SetWebProvider
   | SetRemoteModel
   | SetReasoning
   | ModelResolved
@@ -1222,4 +1255,6 @@ type Action = (
   | MoveTaskSelection
   | ClearTaskSelection
   | CancelSelectedTask
+  | InspectSelectedTask
+  | CloseInspection
 )

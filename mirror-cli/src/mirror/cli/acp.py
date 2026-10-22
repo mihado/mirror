@@ -620,6 +620,7 @@ class Server:
       conversation_id,
       on_message=on_message,
       on_error=on_error,
+      web_provider=configuration.web_provider,
       inference_config=configuration.inference_config(
         model, self._reasoning_effort, remote=False
       ),

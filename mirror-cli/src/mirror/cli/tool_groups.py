@@ -62,7 +62,7 @@ class ToolGroup:
   web_searches: int = 0
   web_browses: int = 0
   tool_counts: tuple[tuple[str, int], ...] = ()
-  latest: str = ''
+  latest: rendering.ToolLabel | None = None
 
   def merge(self, other: ToolGroup) -> ToolGroup:
     counts = dict(self.tool_counts)
@@ -105,7 +105,7 @@ class ToolGroup:
       style='ui.tool-heading', no_wrap=True, overflow='ellipsis'
     )
     summary.append(rendering.icon_prefix('·'), style='dim')
-    summary.append(label, style='bold')
+    summary.append(label, style='ui.info.bold')
     if parts:
       summary.append(' · ' + ', '.join(parts))
     return summary
@@ -140,5 +140,5 @@ def result(
     web_searches=int(name == 'web_search'),
     web_browses=int(name == 'web_browse'),
     tool_counts=((counted_name, 1),) if key != 'exploration' else (),
-    latest=f'{verb} {args}'.rstrip(),
+    latest=rendering.ToolLabel(verb, args, error=not success),
   )

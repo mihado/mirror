@@ -4,14 +4,14 @@ use super::*;
 use crate::tools::web_test_server::TestResponse;
 use crate::tools::web_test_server::TestServer;
 use crate::tools::AnyTool;
+use crate::web::YouClient;
 
 #[tokio::test]
 async fn returns_normalized_safe_unicode_results() {
     let mut server = TestServer::start(vec![TestResponse::json(
         200,
         serde_json::json!({
-            "success": true,
-            "data": {"web": [
+            "results": {"web": [
                 {
                     "title": " Python\n版本 ",
                     "url": "https://python.org/downloads/",
@@ -31,8 +31,8 @@ async fn returns_normalized_safe_unicode_results() {
         }),
     )])
     .await;
-    let client = FirecrawlClient::for_test(Some("secret"), &server.base_url, Vec::new());
-    let result = WebSearchTool::new(client)
+    let client = YouClient::for_test(Some("secret"), &server.base_url);
+    let result = WebSearchTool::new(Box::new(move |_| Ok(Box::new(client.clone()))))
         .run(
             WebSearchArgs {
                 query: "latest Python release".to_string(),
@@ -43,19 +43,21 @@ async fn returns_normalized_safe_unicode_results() {
         .expect("search");
 
     assert!(result.success);
-    assert_eq!(result.display.as_deref(), Some("firecrawl: 1 result(s)"));
+    assert_eq!(result.display.as_deref(), Some("you: 1 result(s)"));
     assert_eq!(
-        serde_json::from_str::<Value>(&result.content).expect("result JSON"),
-        serde_json::json!({
-            "results": [{
-                "title": "Python 版本",
-                "link": "https://python.org/downloads/",
-                "snippet": "Version details"
-            }]
-        })
+        result.content,
+        r#"{
+  "results": [
+    {
+      "title": " Python\n版本 ",
+      "link": "https://python.org/downloads/",
+      "snippet": "Version   details"
+    }
+  ]
+}"#
     );
     let request = server.request().await;
-    assert_eq!(request.path, "/search");
+    assert!(request.path.starts_with("/v1/search?"));
 }
 
 #[tokio::test]
@@ -64,17 +66,17 @@ async fn remote_workspace_search_uses_the_host_provider_not_the_shell_endpoint()
     use std::sync::Arc;
 
     let response = serde_json::json!({
-        "success": true,
-        "data": {"web": [{"url": "https://example.com", "title": "Result", "description": "Summary"}]},
+        "results": {"web": [{"url": "https://example.com", "title": "Result", "snippets": ["Summary"]}]},
     });
     let mut server = TestServer::start(vec![
         TestResponse::json(200, response.clone()),
         TestResponse::json(200, response),
     ])
     .await;
-    let client =
-        FirecrawlClient::for_test(Some("synthetic-provider-key"), &server.base_url, Vec::new());
-    let tool = Arc::new(WebSearchTool::new(client));
+    let client = YouClient::for_test(Some("synthetic-provider-key"), &server.base_url);
+    let tool = Arc::new(WebSearchTool::new(Box::new(move |_| {
+        Ok(Box::new(client.clone()))
+    })));
     let local = DirectToolExecutor::new(vec![tool.clone()]);
     let remote = RemoteToolExecutor::new(
         vec![tool],
@@ -95,14 +97,21 @@ async fn remote_workspace_search_uses_the_host_provider_not_the_shell_endpoint()
         .await
         .expect("remote-compatible search");
     assert!(remote.success);
-    assert_eq!(local, remote);
+    // Separate invocations have different timings but must return the same output.
+    assert_eq!(
+        ToolOutput {
+            duration: None,
+            ..local
+        },
+        ToolOutput {
+            duration: None,
+            ..remote
+        },
+    );
     for _ in 0..2 {
         let request = server.request().await;
-        assert_eq!(request.path, "/search");
-        assert_eq!(
-            request.authorization.as_deref(),
-            Some("Bearer synthetic-provider-key")
-        );
+        assert!(request.path.starts_with("/v1/search?"));
+        assert_eq!(request.api_key.as_deref(), Some("synthetic-provider-key"));
     }
 }
 
@@ -128,8 +137,8 @@ fn caps_result_fields_and_total_output() {
 
 #[tokio::test]
 async fn reports_provider_errors() {
-    let client = FirecrawlClient::for_test(None, "http://127.0.0.1:1", Vec::new());
-    let tool = WebSearchTool::new(client);
+    let client = YouClient::for_test(None, "http://127.0.0.1:1");
+    let tool = WebSearchTool::new(Box::new(move |_| Ok(Box::new(client.clone()))));
 
     let result = tool
         .run(
@@ -144,7 +153,7 @@ async fn reports_provider_errors() {
     assert!(!result.success);
     assert!(result
         .content
-        .starts_with("Tool error: FIRECRAWL_API_KEY is not set"));
+        .starts_with("Tool error: YOU_API_KEY is not set"));
     assert_eq!(
         AnyTool::definition(&tool).parameters["required"],
         serde_json::json!(["query"])

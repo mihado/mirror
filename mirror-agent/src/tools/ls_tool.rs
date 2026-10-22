@@ -64,6 +64,10 @@ impl Tool for LsTool {
         true
     }
 
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn run_remote(
         &self,
         args: LsArgs,
@@ -123,7 +127,7 @@ impl Tool for LsTool {
     }
 }
 
-pub(super) fn format_entries(mut entries: Vec<String>) -> ToolOutput {
+pub(crate) fn format_entries(mut entries: Vec<String>) -> ToolOutput {
     entries.sort();
     ToolOutput::success(if entries.is_empty() {
         "(empty directory)".to_string()

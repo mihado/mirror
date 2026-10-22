@@ -76,6 +76,9 @@ class WorktreeOverlay:
     default_factory=client_pb2.WorkspacePreferences
   )
 
+  conversation_id: str | None = None
+  conversation_cwd: str | None = None
+
   @property
   def tag_id(self) -> str | None:
     """Return the assigned tag, with absent proto fields treated as untagged."""
@@ -159,6 +162,8 @@ class Store:
       'created_at',
       'closed_at',
       'sandbox',
+      'conversation_id',
+      'conversation_cwd',
     } <= columns and preview is None:
       return
     # Recheck under the lock: another CLI may have added the columns meanwhile.
@@ -176,7 +181,15 @@ class Store:
       row['name']
       for row in self._db.execute('PRAGMA table_info(cli_worktree_overlays)')
     }
-    for column in ('path', 'name', 'created_at', 'closed_at', 'sandbox'):
+    for column in (
+      'path',
+      'name',
+      'created_at',
+      'closed_at',
+      'sandbox',
+      'conversation_id',
+      'conversation_cwd',
+    ):
       if column not in columns:
         self._db.execute(
           f'ALTER TABLE cli_worktree_overlays ADD COLUMN {column} TEXT'
@@ -261,10 +274,11 @@ class Store:
         'created_at',
         'closed_at',
       )
-      # A database this version extended also carries the sandbox column.
+      # Recognize only known additive columns left by a newer reader.
       if columns['cli_worktree_overlays'] in (
         extended_overlay,
         (*extended_overlay, 'sandbox'),
+        (*extended_overlay, 'sandbox', 'conversation_id', 'conversation_cwd'),
       ):
         expected['cli_worktree_overlays'] = columns['cli_worktree_overlays']
       if (
@@ -629,7 +643,8 @@ class Store:
     """Return optional metadata for worktrees in one repository."""
     rows = self._db.execute(
       """
-      SELECT id, alias, preferences FROM cli_worktree_overlays
+      SELECT id, alias, preferences, conversation_id, conversation_cwd
+      FROM cli_worktree_overlays
       WHERE repository_key = ?
       """,
       (repository_key,),
@@ -639,6 +654,12 @@ class Store:
       overlays[str(row['id'])] = WorktreeOverlay(
         alias=str(row['alias']) if row['alias'] is not None else None,
         preferences=self._preferences(row['preferences']),
+        conversation_id=str(row['conversation_id'])
+        if row['conversation_id'] is not None
+        else None,
+        conversation_cwd=str(row['conversation_cwd'])
+        if row['conversation_cwd'] is not None
+        else None,
       )
     return overlays
 
@@ -728,6 +749,28 @@ class Store:
           worktree_id,
           preferences.SerializeToString(deterministic=True),
         ),
+      )
+
+  def set_workspace_conversation(
+    self,
+    repository_key: str,
+    workspace_id: str,
+    conversation_id: str,
+    cwd: pathlib.Path,
+  ) -> None:
+    """Remember a tab's conversation without changing its launch preferences."""
+    self._validate_id(conversation_id)
+    with self._db:
+      self._db.execute(
+        """
+        INSERT INTO cli_worktree_overlays(
+          repository_key, id, preferences, conversation_id, conversation_cwd
+        ) VALUES (?, ?, X'', ?, ?)
+        ON CONFLICT(repository_key, id)
+        DO UPDATE SET conversation_id = excluded.conversation_id,
+                      conversation_cwd = excluded.conversation_cwd
+        """,
+        (repository_key, workspace_id, conversation_id, str(cwd.resolve())),
       )
 
   def delete_worktree_overlay(

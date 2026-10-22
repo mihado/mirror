@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
 from typing import override
 
+from prompt_toolkit import formatted_text
 from prompt_toolkit.application import current
 from prompt_toolkit.formatted_text import ansi
 from prompt_toolkit.layout import (
   containers,
   controls,
   dimension,
+)
+from prompt_toolkit.layout import (
   mouse_handlers as layout_mouse_handlers,
+)
+from prompt_toolkit.layout import (
   screen as layout_screen,
 )
 from rich import align, console, text
 
 from mirror.cli import rendering, state, themes
 from mirror.cli.components import component
-
 
 # Metacarbon's exact cell artwork; no bitmap generator is needed at runtime.
 _WORDMARK = (
@@ -172,7 +177,7 @@ class Banner(component.Component):
       containers.Window(height=1),
     ])
 
-  def _text(self, state: state.State) -> ansi.ANSI:
+  def _text(self, state: state.State) -> formatted_text.StyleAndTextTuples:
     output = current.get_app().output
     columns, rows = state.layout.columns, output.get_size().rows
     width = input_width(columns)
@@ -203,8 +208,13 @@ class Banner(component.Component):
       if logo
       else align.Align.center(details_text)
     )
-    return ansi.ANSI(
+    fragments = ansi.ANSI(
       rendering.renderable_to_ansi(
         welcome, columns, theme_name=theme_name
       ).rstrip()
-    )
+    ).__pt_formatted_text__()
+    # ANSI emits one fragment per character; layout needs only the style runs.
+    return [
+      (style, ''.join(fragment[1] for fragment in run))
+      for style, run in itertools.groupby(fragments, key=lambda part: part[0])
+    ]

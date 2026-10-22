@@ -9,6 +9,7 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use mirror_protocol::agent_message;
 use mirror_protocol::agent_rpc_server;
+use mirror_protocol::chat_record;
 use mirror_protocol::client_message;
 use mirror_protocol::runtime_delta;
 use mirror_protocol::session_message;
@@ -32,7 +33,6 @@ use mirror_protocol::RuntimeDelta;
 use mirror_protocol::SessionMessage;
 use mirror_protocol::TaskStatus as ProtocolTaskStatus;
 use mirror_protocol::TaskUpdate;
-use mirror_protocol::ToolCall;
 use mirror_protocol::TurnError;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -41,6 +41,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::web::WebProviderConfig;
 use crate::AgentApprovalMode;
 use crate::AgentEvent;
 use crate::ReactAgentServiceHandle;
@@ -76,6 +77,7 @@ enum SessionInput {
     DetachTools,
     SetApprovalMode(AgentApprovalMode),
     SetInferenceConfig(InferenceConfig),
+    SetWebProvider(WebProviderConfig),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,9 +156,15 @@ impl agent_rpc_server::AgentRpc for AgentRpc {
         if request.session_id != self.service.session_id() {
             return Err(Status::not_found("session not found"));
         }
+        let web_provider = request
+            .web_provider
+            .as_deref()
+            .map(str::parse::<WebProviderConfig>)
+            .transpose()
+            .map_err(Status::invalid_argument)?;
         let mut shutdown = self.shutdown.subscribe();
         let output = tokio::select! {
-            result = self.service.call_tool(request.name, request.arguments) => {
+            result = self.service.call_tool_with_web_provider(request.name, request.arguments, web_provider) => {
                 result.map_err(|error| Status::internal(error.to_string()))?
             }
             _ = shutdown.recv() => return Err(Status::unavailable("agent RPC shutting down")),
@@ -232,6 +240,7 @@ pub fn acquire_intent(message: &ClientMessage) -> AcquireIntent {
         Some(
             client_message::Payload::Message(_)
             | client_message::Payload::SetInferenceConfig(_)
+            | client_message::Payload::SetWebProvider(_)
             | client_message::Payload::SetApprovalMode(_)
             | client_message::Payload::Compact(_),
         ) => AcquireIntent::Execute,
@@ -273,13 +282,14 @@ struct SessionState {
     rejected: Vec<String>,
     approval_mode: Option<AgentApprovalMode>,
     inference: Option<InferenceConfig>,
+    web_provider: Option<WebProviderConfig>,
 }
 
 struct AttachedService {
     service: ReactAgentServiceHandle,
     events: broadcast::Receiver<ReactServiceEvent>,
     /// Requests made before this stream subscribed; the broadcast never sends them again.
-    unannounced: VecDeque<ToolCall>,
+    unannounced: VecDeque<HitlRequest>,
 }
 
 impl AttachedService {
@@ -317,6 +327,7 @@ impl SessionState {
             rejected: Vec::new(),
             approval_mode: None,
             inference: None,
+            web_provider: None,
         }
     }
 
@@ -324,8 +335,8 @@ impl SessionState {
         let Some(attached) = &mut self.attached else {
             return std::future::pending().await;
         };
-        if let Some(call) = attached.unannounced.pop_front() {
-            return Step::Event(ReactServiceEvent::HitlRequest(call));
+        if let Some(request) = attached.unannounced.pop_front() {
+            return Step::Event(ReactServiceEvent::HitlRequest(request));
         }
         match attached.events.recv().await {
             Ok(ReactServiceEvent::Closed) | Err(broadcast::error::RecvError::Closed) => {
@@ -369,6 +380,12 @@ impl SessionState {
                 .await
                 .map_err(service_status)?;
         }
+        if let Some(provider) = self.web_provider {
+            service
+                .set_web_provider(provider)
+                .await
+                .map_err(service_status)?;
+        }
         if let Some(inference) = &self.inference {
             service
                 .set_inference_config(inference.clone())
@@ -381,6 +398,7 @@ impl SessionState {
     fn remember_setting(&mut self, input: &SessionInput) {
         match input {
             SessionInput::SetApprovalMode(mode) => self.approval_mode = Some(*mode),
+            SessionInput::SetWebProvider(provider) => self.web_provider = Some(*provider),
             SessionInput::SetInferenceConfig(inference) => {
                 self.inference = Some(inference.clone());
             }
@@ -526,6 +544,7 @@ impl SessionInput {
             Self::Message(_)
             | Self::SetApprovalMode(_)
             | Self::SetInferenceConfig(_)
+            | Self::SetWebProvider(_)
             | Self::Compact => AcquireIntent::Execute,
             Self::Interrupt
             | Self::CancelTask { .. }
@@ -633,31 +652,36 @@ async fn handle_request(
     }
 
     let accepted = match request.input.clone() {
-        SessionInput::Message(message) => match service.accept(*message).await {
-            Ok(()) => true,
-            Err(ReactServiceError::Closed) => return Err(ServiceClosed),
-            Err(ReactServiceError::MessageIdConflict(id)) => {
-                return Ok(vec![nack_output(
-                    message_id,
-                    SessionNackReason::MessageIdConflict,
-                    format!("message_id {id:?} was reused for different input"),
-                )]);
+        SessionInput::Message(mut message) => {
+            if message.id.is_empty() {
+                message.id.clone_from(&message_id);
             }
-            Err(ReactServiceError::Agent(error)) => {
-                return Ok(vec![nack_output(
-                    message_id,
-                    SessionNackReason::InvalidRequest,
-                    error,
-                )]);
+            match service.accept(*message).await {
+                Ok(()) => true,
+                Err(ReactServiceError::Closed) => return Err(ServiceClosed),
+                Err(ReactServiceError::MessageIdConflict(id)) => {
+                    return Ok(vec![nack_output(
+                        message_id,
+                        SessionNackReason::MessageIdConflict,
+                        format!("message_id {id:?} was reused for different input"),
+                    )]);
+                }
+                Err(ReactServiceError::Agent(error)) => {
+                    return Ok(vec![nack_output(
+                        message_id,
+                        SessionNackReason::InvalidRequest,
+                        error,
+                    )]);
+                }
+                Err(error) => {
+                    return Ok(vec![nack_output(
+                        message_id,
+                        SessionNackReason::TargetNotFound,
+                        error.to_string(),
+                    )]);
+                }
             }
-            Err(error) => {
-                return Ok(vec![nack_output(
-                    message_id,
-                    SessionNackReason::TargetNotFound,
-                    error.to_string(),
-                )]);
-            }
-        },
+        }
         SessionInput::Compact => match service.compact().await {
             Ok(()) => true,
             Err(ReactServiceError::Closed) => return Err(ServiceClosed),
@@ -696,6 +720,9 @@ async fn handle_request(
         SessionInput::DetachTools => accepted(service.detach_tools().await.map(|_| true))?,
         SessionInput::SetApprovalMode(mode) => {
             accepted(service.set_approval_mode(mode).await.map(|()| true))?
+        }
+        SessionInput::SetWebProvider(provider) => {
+            accepted(service.set_web_provider(provider).await.map(|()| true))?
         }
         SessionInput::SetInferenceConfig(inference) => {
             if let Some(reasoning) = &inference.reasoning_effort {
@@ -779,7 +806,16 @@ fn session_request(request: ClientMessage) -> Result<SessionRequest, InvalidClie
     let session_id = request.session_id;
     let message_id = request.message_id;
     let input = match request.payload {
-        Some(client_message::Payload::Message(message)) => SessionInput::Message(message),
+        Some(client_message::Payload::Message(message)) => {
+            if !message.id.is_empty() && message.id != message_id {
+                let error = format!(
+                    "AgentMessage.id {:?} does not match message_id {message_id:?}",
+                    message.id
+                );
+                return Err(invalid_request(message_id, error));
+            }
+            SessionInput::Message(message)
+        }
         Some(client_message::Payload::Interrupt(_)) => SessionInput::Interrupt,
         Some(client_message::Payload::CancelTask(cancel)) => SessionInput::CancelTask {
             task_id: cancel.task_id,
@@ -838,6 +874,13 @@ fn session_request(request: ClientMessage) -> Result<SessionRequest, InvalidClie
                     ));
                 }
             }
+        }
+        Some(client_message::Payload::SetWebProvider(selection)) => {
+            let provider = selection
+                .provider
+                .parse()
+                .map_err(|error: &str| invalid_request(message_id.clone(), error.to_string()))?;
+            SessionInput::SetWebProvider(provider)
         }
         Some(client_message::Payload::SetInferenceConfig(inference)) => {
             SessionInput::SetInferenceConfig(inference)
@@ -929,10 +972,8 @@ fn nack_reason(reason: SessionNackReason) -> InputNackReason {
 fn service_responses(event: ReactServiceEvent) -> Vec<SessionMessage> {
     match event {
         ReactServiceEvent::Agent(event) => agent_event_responses(event),
-        ReactServiceEvent::HitlRequest(call) => vec![SessionMessage {
-            payload: Some(session_message::Payload::HitlRequest(HitlRequest {
-                call: Some(call),
-            })),
+        ReactServiceEvent::HitlRequest(request) => vec![SessionMessage {
+            payload: Some(session_message::Payload::HitlRequest(request)),
             ..SessionMessage::default()
         }],
         ReactServiceEvent::HitlResolved { call_id, approved } => vec![SessionMessage {
@@ -945,13 +986,27 @@ fn service_responses(event: ReactServiceEvent) -> Vec<SessionMessage> {
         ReactServiceEvent::TaskUpdated(info) => vec![runtime_response(
             runtime_delta::Payload::TaskUpdate(info.into()),
         )],
+        ReactServiceEvent::TaskAgentEvent(info, event) => {
+            let mut update = TaskUpdate::from(info);
+            update.messages = agent_event_responses(*event);
+            for message in &mut update.messages {
+                if let Some(session_message::Payload::AgentMessage(entry)) = &mut message.payload {
+                    redact_child_entry(entry);
+                }
+            }
+            vec![runtime_response(runtime_delta::Payload::TaskUpdate(update))]
+        }
         ReactServiceEvent::HostToolCall(call) => vec![SessionMessage {
             payload: Some(session_message::Payload::HostToolCall(call)),
             ..SessionMessage::default()
         }],
-        ReactServiceEvent::TurnStarted => {
-            vec![runtime_response(runtime_delta::Payload::TurnStarted(()))]
-        }
+        ReactServiceEvent::TurnStarted { turn_id } => vec![SessionMessage {
+            payload: Some(session_message::Payload::RuntimeDelta(RuntimeDelta {
+                payload: Some(runtime_delta::Payload::TurnStarted(())),
+                turn_id,
+            })),
+            ..SessionMessage::default()
+        }],
         ReactServiceEvent::TurnCompleted => {
             vec![runtime_response(runtime_delta::Payload::TurnCompleted(()))]
         }
@@ -971,6 +1026,49 @@ fn service_responses(event: ReactServiceEvent) -> Vec<SessionMessage> {
     }
 }
 
+// Child events are display-only, not a second writable agent session.
+fn redact_child_entry(entry: &mut AgentMessage) {
+    entry.inference = None;
+    entry.metadata = None;
+    match &mut entry.payload {
+        Some(agent_message::Payload::Chat(chat)) => {
+            chat.sampling = None;
+            match &mut chat.message {
+                Some(chat_record::Message::System(_)) => chat.message = None,
+                Some(chat_record::Message::User(user)) => {
+                    user.checkpoint = None;
+                    if chat
+                        .display
+                        .as_ref()
+                        .is_some_and(|display| !display.is_empty())
+                    {
+                        user.content.clear();
+                    }
+                }
+                Some(chat_record::Message::Assistant(assistant)) => {
+                    assistant.provider_fields = None;
+                    assistant.reasoning_details.clear();
+                    for call in &mut assistant.tool_calls {
+                        call.provider_fields = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(agent_message::Payload::ContextWindow(window)) => {
+            window.system_prompt.clear();
+            window.metadata = None;
+            window.system_prompt_report = None;
+            if let Some(compaction) = &mut window.compaction {
+                compaction.inference = None;
+                compaction.recent.clear();
+            }
+        }
+        Some(agent_message::Payload::Extension(_)) => entry.payload = None,
+        _ => {}
+    }
+}
+
 impl From<TaskInfo> for TaskUpdate {
     fn from(info: TaskInfo) -> Self {
         let status = match info.status {
@@ -987,6 +1085,7 @@ impl From<TaskInfo> for TaskUpdate {
             started_at: Some(info.started_at.into()),
             ended_at: info.ended_at.map(Into::into),
             detached: info.detached,
+            messages: Vec::new(),
         }
     }
 }
@@ -1060,6 +1159,7 @@ fn runtime_response(payload: runtime_delta::Payload) -> SessionMessage {
     SessionMessage {
         payload: Some(session_message::Payload::RuntimeDelta(RuntimeDelta {
             payload: Some(payload),
+            ..RuntimeDelta::default()
         })),
         ..SessionMessage::default()
     }

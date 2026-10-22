@@ -8,12 +8,15 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout import containers, controls, dimension
 
 from mirror.cli import state
-from mirror.cli.components import component
-from mirror.cli.components import menu
+from mirror.cli.components import component, menu
 
 
 class RewindPicker(component.Component):
   """Rewind choices and fork confirmation."""
+
+  @override
+  def cache_key(self, state: state.State) -> object:
+    return state.rewind
 
   @override
   def render(self, state: state.State) -> containers.AnyContainer:
@@ -28,6 +31,10 @@ class RewindPicker(component.Component):
 
 class RewindBanner(component.Component):
   """Standing reminder that the composer targets an earlier turn."""
+
+  @override
+  def cache_key(self, state: state.State) -> object:
+    return (state.rewind.staged,)
 
   @override
   def render(self, state: state.State) -> containers.AnyContainer:

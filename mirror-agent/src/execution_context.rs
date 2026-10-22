@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+use crate::web::WebProviderConfig;
 use crate::TaskManagerHandle;
 
 /// Live facilities available while an imperative agent executes tools.
@@ -20,6 +21,7 @@ use crate::TaskManagerHandle;
 pub struct ExecutionContext {
     approval_mode: watch::Receiver<AgentApprovalMode>,
     inference_config: watch::Receiver<Option<InferenceConfig>>,
+    web_provider: watch::Receiver<Option<WebProviderConfig>>,
     input: ExecutionContextInput,
     approval_hook: Option<ApprovalHook>,
     prompt_injection_policy: Option<String>,
@@ -31,6 +33,7 @@ pub struct ExecutionContext {
 pub(crate) struct ExecutionContextInput {
     approval_mode: watch::Sender<AgentApprovalMode>,
     inference_config: watch::Sender<Option<InferenceConfig>>,
+    web_provider: watch::Sender<Option<WebProviderConfig>>,
 }
 
 impl ExecutionContextInput {
@@ -40,6 +43,10 @@ impl ExecutionContextInput {
 
     pub(crate) fn set_approval_mode(&self, mode: AgentApprovalMode) {
         self.approval_mode.send_replace(mode);
+    }
+
+    pub(crate) fn set_web_provider(&self, provider: WebProviderConfig) {
+        self.web_provider.send_replace(Some(provider));
     }
 
     pub(crate) fn set_inference_config(&self, inference: Option<InferenceConfig>) {
@@ -57,14 +64,18 @@ impl ExecutionContext {
     ) -> Self {
         let (approval_mode, approval_mode_receiver) = watch::channel(approval_mode);
         let (inference_config, inference_config_receiver) = watch::channel(None);
+        let (web_provider, web_provider_receiver) = watch::channel(None);
         Self {
             approval_mode: approval_parent.map_or(approval_mode_receiver, |parent| {
                 parent.approval_mode.clone()
             }),
             inference_config: inference_config_receiver,
+            web_provider: approval_parent
+                .map_or(web_provider_receiver, |parent| parent.web_provider.clone()),
             input: ExecutionContextInput {
                 approval_mode,
                 inference_config,
+                web_provider,
             },
             approval_hook: approval_parent
                 .map_or(approval_hook, |parent| parent.approval_hook.clone()),
@@ -80,6 +91,17 @@ impl ExecutionContext {
 
     pub(crate) fn inference_config(&self) -> Option<InferenceConfig> {
         self.inference_config.borrow().clone()
+    }
+
+    /// The live web-provider override, or `None` for the assembly's default.
+    pub fn web_provider(&self) -> Option<WebProviderConfig> {
+        *self.web_provider.borrow()
+    }
+
+    pub(crate) fn with_web_provider(mut self, provider: Option<WebProviderConfig>) -> Self {
+        let (_, receiver) = watch::channel(provider.or(self.web_provider()));
+        self.web_provider = receiver;
+        self
     }
 
     pub fn approval_mode(&self) -> AgentApprovalMode {
@@ -99,16 +121,22 @@ impl ExecutionContext {
     }
 
     pub async fn request_approval(&self, call: &ToolCall) -> Result<bool, ExecutionContextError> {
-        Ok(self.approval_decision(call).await?.acknowledge())
+        Ok(self
+            .approval_decision(call, ApprovalKind::Ordinary)
+            .await?
+            .acknowledge())
     }
 
     pub(crate) async fn approval_decision(
         &self,
         call: &ToolCall,
+        kind: ApprovalKind,
     ) -> Result<ApprovalDecision, ExecutionContextError> {
         match &self.approval_hook {
-            Some(hook) => hook.decision(call).await,
-            None if self.approval_mode() == AgentApprovalMode::Auto => {
+            Some(hook) => hook.decision(call, kind).await,
+            None if kind == ApprovalKind::Ordinary
+                && self.approval_mode() == AgentApprovalMode::Auto =>
+            {
                 Ok(ApprovalDecision::new(true, ApprovalSource::Automatic))
             }
             None => Err(ExecutionContextError::Approval(
@@ -147,8 +175,15 @@ pub enum ExecutionContextError {
     Approval(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalKind {
+    Ordinary,
+    AlwaysAsk,
+}
+
 pub(crate) struct ApprovalRequest {
     pub call: ToolCall,
+    pub kind: ApprovalKind,
     pub response: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -189,14 +224,22 @@ impl ApprovalHook {
     }
 
     pub async fn approve(&self, call: &ToolCall) -> Result<bool, ExecutionContextError> {
-        Ok(self.decision(call).await?.acknowledge())
+        Ok(self
+            .decision(call, ApprovalKind::Ordinary)
+            .await?
+            .acknowledge())
     }
 
-    async fn decision(&self, call: &ToolCall) -> Result<ApprovalDecision, ExecutionContextError> {
+    async fn decision(
+        &self,
+        call: &ToolCall,
+        kind: ApprovalKind,
+    ) -> Result<ApprovalDecision, ExecutionContextError> {
         let (response, receiver) = oneshot::channel();
         self.requests
             .send(ApprovalRequest {
                 call: call.clone(),
+                kind,
                 response,
             })
             .map_err(|_| ExecutionContextError::Approval("approval channel closed".to_string()))?;

@@ -35,7 +35,7 @@ class ThemesExtension(extension.Extension[None, Choose, None]):
 
   @override
   def default_config(self) -> config.JsonObject:
-    return {'name': 'dark'}
+    return {'name': themes.AUTO}
 
   @override
   def slash_commands(self) -> Sequence[commands.CommandDef]:
@@ -77,6 +77,9 @@ class ThemesExtension(extension.Extension[None, Choose, None]):
             'Themes',
             (
               selection.Choice(
+                themes.AUTO, 'Auto', 'Dark or Light to match the terminal'
+              ),
+              selection.Choice(
                 'dark', 'Dark', 'Mirror colors for dark backgrounds'
               ),
               selection.Choice(
@@ -104,7 +107,11 @@ class ThemesExtension(extension.Extension[None, Choose, None]):
         )
       )
       return
-    if effect.name not in (*themes.NAMES, *(item.id for item in available)):
+    if effect.name not in (
+      themes.AUTO,
+      *themes.NAMES,
+      *(item.id for item in available),
+    ):
       context.dispatch(
         actions.ShowText(
           'Usage: /themes [theme-id]. Open /themes to see available themes.',

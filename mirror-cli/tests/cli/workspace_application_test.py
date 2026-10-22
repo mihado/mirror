@@ -5,7 +5,7 @@ import base64
 from typing import override
 
 import pytest
-from prompt_toolkit import buffer, data_structures
+from prompt_toolkit import buffer, data_structures, utils
 from prompt_toolkit.application import application, current
 from prompt_toolkit.input import defaults
 from prompt_toolkit.key_binding import key_bindings, key_processor
@@ -16,10 +16,12 @@ from mirror.protocol import agent_pb2
 
 from mirror.cli import (
   actions,
+  retained,
   screen_selection,
   transcript,
   transcript_view,
   workspace_application,
+  workspace_tags,
 )
 
 
@@ -30,6 +32,15 @@ class _Output(base.DummyOutput):
     self.left = 0
     self.raw: list[str] = []
     self.text: list[str] = []
+    self.titles: list[str | None] = []
+
+  @override
+  def set_title(self, title: str) -> None:
+    self.titles.append(title)
+
+  @override
+  def clear_title(self) -> None:
+    self.titles.append(None)
 
   @override
   def get_size(self) -> data_structures.Size:
@@ -50,6 +61,41 @@ class _Output(base.DummyOutput):
   @override
   def quit_alternate_screen(self) -> None:
     self.left += 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_key_change_repaints_static_retained_layer() -> None:
+  label = 'before'
+  output = _Output()
+  rendered = asyncio.Event()
+  with defaults.create_pipe_input() as pipe:
+    app = workspace_application.WorkspaceApplication(
+      layout=layout.Layout(
+        retained.Layer(
+          containers.Window(controls.FormattedTextControl(lambda: label)),
+          animated=False,
+        )
+      ),
+      input=pipe,
+      output=output,
+      refresh_interval=0.01,
+      after_render=lambda _: rendered.set(),
+    )
+    app.refresh_key = lambda: label
+    running = asyncio.create_task(app.run_async())
+    try:
+      await asyncio.wait_for(rendered.wait(), 1)
+      assert 'before' in ''.join(output.text)
+      revision = app.ui_revision
+      rendered.clear()
+      output.text.clear()
+      label = 'AFTER'
+      await asyncio.wait_for(rendered.wait(), 1)
+      assert 'AFTER' in ''.join(output.text)
+      assert app.ui_revision is not revision
+    finally:
+      app.exit()
+      await asyncio.wait_for(running, 1)
 
 
 @pytest.mark.asyncio
@@ -119,6 +165,7 @@ async def test_workspace_handoff_keeps_one_application_and_terminal_screen() -> 
     run = asyncio.create_task(screen.run_async(pre_run=started.set))
     await asyncio.wait_for(started.wait(), 1)
     for name in ('alpha', 'beta'):
+      screen.set_workspace_title(name)
       view = workspace_application.WorkspaceApplication(
         layout=layout.Layout(
           containers.Window(controls.FormattedTextControl(name))
@@ -145,6 +192,51 @@ async def test_workspace_handoff_keeps_one_application_and_terminal_screen() -> 
         screen.finish_views()
         assert await asyncio.wait_for(selected, 1) is None
     assert output.left == 1
+    assert output.titles == ['Mirror · alpha', 'Mirror · beta', None]
+
+
+def test_set_workspace_title_tracks_metadata_without_repeating_writes() -> None:
+  output = _Output()
+  with defaults.create_pipe_input() as pipe:
+    screen = workspace_application.WorkspaceApplication(
+      input=pipe, output=output
+    )
+    tag = workspace_tags.DEFAULT_TAGS[1]
+    screen.set_workspace_title(
+      'alpha', status=actions.WorktreeAgentState.CREATING, tag=tag
+    )
+    screen.set_workspace_title(
+      '\x1b]0;injected\x07\x1b[31malpha\x1b[0m\n\x9d0;injected\x9c',
+      status=actions.WorktreeAgentState.RUNNING,
+      tag=tag,
+    )
+    screen.set_workspace_title(
+      'alpha', status=actions.WorktreeAgentState.ATTENTION, tag=tag
+    )
+    screen.set_workspace_title(
+      'alpha', status=actions.WorktreeAgentState.ATTENTION
+    )
+    screen.set_workspace_title(
+      'renamed', status=actions.WorktreeAgentState.FAILED
+    )
+    screen.set_workspace_title(
+      'renamed', status=actions.WorktreeAgentState.IDLE
+    )
+    assert output.titles == [
+      '● Mirror · ■ Blue · alpha',
+      '! Mirror · ■ Blue · alpha',
+      '! Mirror · alpha',
+      '× Mirror · renamed',
+      '○ Mirror · renamed',
+    ]
+    screen.set_workspace_title(
+      '界' * 80, tag=workspace_tags.WorkspaceTag('long', 'x' * 64)
+    )
+    bounded = output.titles[-1]
+    assert bounded is not None and len(bounded) <= 80
+    assert utils.get_cwidth(bounded) <= 80 and '界' in bounded
+    screen.set_workspace_title('\x1b[31m\n\x07')
+    assert output.titles[-1] == 'Mirror'
 
 
 @pytest.mark.asyncio

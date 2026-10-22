@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import os
 import pathlib
@@ -47,6 +48,59 @@ def mouse_pointer_sequence(
   else:
     return ''
   return f'\x1b]22;{shape if active else ""}\x1b\\'
+
+
+# Adapted and narrowed from https://github.com/reflection-oss/mirror/pull/7.
+def needs_local_clipboard(
+  platform: str, environment: Mapping[str, str]
+) -> bool:
+  """Bridge only direct local Apple Terminal sessions, which ignore OSC 52."""
+  return (
+    platform == 'darwin'
+    and environment.get('TERM_PROGRAM') == 'Apple_Terminal'
+    # A helper writes on the CLI host, not necessarily the attached client.
+    and not any(
+      environment.get(name)
+      for name in ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY', 'TMUX', 'STY')
+    )
+  )
+
+
+# Unlike pbcopy, explicit UTF-8 text does not reinterpret RTF/EPS source code.
+_MACOS_COPY = (
+  '/usr/bin/osascript',
+  '-l',
+  'JavaScript',
+  '-e',
+  "ObjC.import('AppKit');"
+  'const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;'
+  'const board = $.NSPasteboard.generalPasteboard;'
+  'board.clearContents;'
+  "board.setDataForType(data, 'public.utf8-plain-text');",
+)
+
+
+async def write_local_clipboard(
+  data: bytes, *, command: tuple[str, ...] = _MACOS_COPY
+) -> None:
+  """Best-effort stdin-only write, bounded and reaped on timeout or cancellation."""
+  process: asyncio.subprocess.Process | None = None
+  try:
+    async with asyncio.timeout(2):
+      process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+      )
+      await process.communicate(data)
+  except (OSError, TimeoutError):
+    pass
+  finally:
+    if process is not None and process.returncode is None:
+      with contextlib.suppress(ProcessLookupError):
+        process.kill()
+      await process.communicate()
 
 
 def editor_command(path: pathlib.Path) -> tuple[str, ...]:

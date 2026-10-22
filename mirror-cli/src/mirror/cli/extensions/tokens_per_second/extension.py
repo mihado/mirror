@@ -136,6 +136,12 @@ class TokensPerSecondExtension(extension.Extension[_State, None, None]):
         return current, ()
 
   @override
+  def cache_key(
+    self, global_state: state.State, extension_state: _State
+  ) -> object:
+    return (global_state.session.pending_switch, extension_state)
+
+  @override
   def render(
     self, global_state: state.State, extension_state: _State
   ) -> containers.AnyContainer | None:

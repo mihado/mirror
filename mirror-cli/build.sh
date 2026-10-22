@@ -59,7 +59,11 @@ if [[ -f "$source_dir/src/mirror/protocol.py" ]]; then
   exit 1
 fi
 case "$(uname -s):$(uname -m)" in
-  Darwin:arm64) platform=macosx_15_0_arm64 ;;
+  Darwin:arm64)
+    # Rust and its C dependencies must target the wheel's runtime floor, not the SDK/host.
+    export MACOSX_DEPLOYMENT_TARGET=14.0
+    platform=macosx_14_0_arm64
+    ;;
   Linux:aarch64) platform=linux_aarch64 ;;
   Linux:x86_64) platform=linux_x86_64 ;;
   *)
@@ -81,8 +85,30 @@ case "$flavor" in
     exit 2
     ;;
 esac
+check_macos_binary() {
+  [[ "$(uname -s)" == Darwin ]] || return 0
+  [[ "$(lipo -archs "$1")" == arm64 ]]
+  # Check the runtime floor, not the SDK version; signed RG may come from another job.
+  otool -l "$1" | awk '
+    $1 == "platform" { platform = $2 }
+    $1 == "minos" {
+      count++
+      split($2, version, ".")
+      if (platform != 1 || version[1] > 14 ||
+          (version[1] == 14 && (version[2] > 0 || version[3] > 0))) failed = 1
+    }
+    END { exit (count != 1 || failed) }
+  '
+  otool -L "$1" | awk '
+    NR > 1 && $1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\/Library\// {
+      print "error: binary requires a non-system library: " $1 > "/dev/stderr"
+      failed = 1
+    }
+    END { exit failed }
+  '
+}
 sign_macos_binary() {
-  if [[ "$platform" == macosx_15_0_arm64 && -n "${MIRROR_CODESIGN_IDENTITY:-}" ]]; then
+  if [[ "$platform" == macosx_14_0_arm64 && -n "${MIRROR_CODESIGN_IDENTITY:-}" ]]; then
     codesign --force --sign "$MIRROR_CODESIGN_IDENTITY" --options runtime --timestamp "$1"
     codesign --verify --strict "$1"
   fi
@@ -102,22 +128,13 @@ CARGO_PROFILE_RELEASE_STRIP=true cargo install ripgrep --version 14.1.0 --locked
   --root "$scratch/ripgrep" --message-format=json-render-diagnostics >"$scratch/ripgrep.jsonl"
 MIRROR_BUNDLED_RG="$scratch/ripgrep/bin/rg"
 export MIRROR_BUNDLED_RG
-# Homebrew ripgrep can link unbundled PCRE2; a working build host is not proof of portability.
-if [[ "$(uname -s)" == Darwin ]]; then
-  otool -L "$MIRROR_BUNDLED_RG" | awk '
-    NR > 1 && $1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\/Library\// {
-      print "error: ripgrep requires a non-system library: " $1 > "/dev/stderr"
-      failed = 1
-    }
-    END { exit failed }
-  '
-fi
 if [[ -n "${MIRROR_SIGNED_RG:-}" ]]; then
-  [[ "$platform" == macosx_15_0_arm64 && -z "${MIRROR_CODESIGN_IDENTITY:-}" ]]
+  [[ "$platform" == macosx_14_0_arm64 && -z "${MIRROR_CODESIGN_IDENTITY:-}" ]]
   cp "$MIRROR_SIGNED_RG" "$MIRROR_BUNDLED_RG"
   chmod 755 "$MIRROR_BUNDLED_RG"
   codesign --verify --strict "$MIRROR_BUNDLED_RG"
 fi
+check_macos_binary "$MIRROR_BUNDLED_RG"
 # The embedded bytes must already contain ripgrep's own signature.
 sign_macos_binary "$MIRROR_BUNDLED_RG"
 (
@@ -186,6 +203,7 @@ uv run --no-project --python 3.12 python "$source_dir/native_notices.py" \
   --cargo-json "$scratch/sandboxd.jsonl" --zig-runtime "$zig_package" \
   --rust-docs "$("${RUSTC:-rustc}" --print sysroot)/share/doc/rust"
 worker="$CARGO_TARGET_DIR/release/mirror-agent"
+check_macos_binary "$worker"
 sign_macos_binary "$worker"
 MIRROR_BUILD_RUST_WORKER="$worker" MIRROR_WHEEL_PLATFORM="$platform" MIRROR_BUILD_SANDBOXD="$sandboxd" \
   uv build --python 3.12 --wheel --out-dir "$scratch/wheels" "$source_dir"
@@ -203,7 +221,7 @@ uv pip install --python "$scratch/tools/$distribution/bin/python" \
 )
 cp "$scratch"/wheels/*.whl "$output/"
 native_output="${MIRROR_NATIVE_OUTPUT:-}"
-if [[ "$platform" == macosx_15_0_arm64 && -n "${MIRROR_CODESIGN_IDENTITY:-}" ]]; then
+if [[ "$platform" == macosx_14_0_arm64 && -n "${MIRROR_CODESIGN_IDENTITY:-}" ]]; then
   native_output="${native_output:-$output/native}"
 fi
 if [[ -n "$native_output" ]]; then

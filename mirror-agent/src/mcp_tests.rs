@@ -8,6 +8,7 @@ use axum::extract::Json;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use pretty_assertions::assert_eq;
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
 use serde_json::{json, Map, Value};
 
@@ -16,7 +17,9 @@ use super::{
     discover_mcp_connections, mcp_tools, valid_mcp_name, valid_mcp_server_name, valid_mcp_url,
     LocalMcpConnection, Mcp, McpAuthorization, McpClient, McpClientError, McpRouter, McpTool,
 };
-use crate::tools::{DirectToolExecutor, ToolDefinition, ToolError, ToolExecutor};
+use crate::tools::{
+    DirectToolExecutor, RemoteToolExecutor, ToolDefinition, ToolError, ToolExecutor,
+};
 use crate::{
     AgentApprovalMode, ApprovalDecision, ApprovalHook, ApprovalSource, ExecutionContext,
     TaskManagerHandle,
@@ -87,6 +90,25 @@ async fn original_names_cannot_bypass_the_router() {
         .expect("direct call");
     assert!(!output.success);
     assert_eq!(calls.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn remote_workspace_calls_use_the_mcp_router_not_the_shell() {
+    let calls = Arc::new(Calls::default());
+    let executor = RemoteToolExecutor::new(
+        mcp_tools(vec![tool(calls.clone())]).expect("tools"),
+        reqwest::Url::parse("http://127.0.0.1:1/exec").expect("URL"),
+    )
+    .expect("MCP does not need a reachable remote shell");
+    let output = executor.call_tool(
+        "mcp_call".into(),
+        r#"{"calls":[{"name":"mcp__issues__createIssue","arguments":{"title":"created through MCP"}}]}"#.into(),
+        context(AgentApprovalMode::Auto, None),
+    ).await.expect("MCP call");
+    let result: Value = serde_json::from_str(&output.content).expect("result");
+    assert_eq!(result["results"][0]["success"], true);
+    assert_eq!(result["results"][0]["content"], "created through MCP");
+    assert_eq!(calls.0.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
